@@ -4,4 +4,6 @@ Natalie Shell
 
 Eugenie Shi
 
+Amanda Kay
+
 Jonathan Rodríguez
