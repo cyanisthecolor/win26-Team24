@@ -1,0 +1,11 @@
+# secrets
+credentials.json
+token.json
+
+# local data
+extracted.db
+
+# python
+.venv/
+__pycache__/
+*.pyc
