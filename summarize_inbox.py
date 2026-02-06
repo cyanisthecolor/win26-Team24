@@ -48,6 +48,7 @@ def build_email_json(since_dt: datetime, top: int = 50):
     emails = fetch_messages_since(since_dt, top)
     with open('emails.json', 'w') as f:
         json.dump(emails, f, indent=2)
+    return emails
 
 
 def read_data_json(filepath="emails.json"):
@@ -64,10 +65,6 @@ def filter_emails(emails=None, output_file="filtered_emails.json"):
     """
     Uses OpenAI to filter emails and saves the 'high-signal' results to a JSON file.
     """
-    # 1. Load data if not provided
-    if not emails:
-        emails = read_data_json("emails.json")
-
     if not emails:
         print("No emails found to filter.")
         return []
