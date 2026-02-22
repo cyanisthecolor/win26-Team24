@@ -1,4 +1,3 @@
--- schema.sql (fresh schema; recommended if you're starting a new DB)
 
 PRAGMA foreign_keys = ON;
 
