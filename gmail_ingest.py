@@ -26,19 +26,21 @@ URL_RE = re.compile(
 import re
 
 DATE_KEYWORDS = [
-    "today", "tomorrow", "tonight",
+    "today", "tomorrow", "tonight", "yesterday",
+    "morning", "noon", "afternoon", "evening", "night", "now", 
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
     "week", "month", "year",
     "am", "pm",
-    "due", "deadline", "submit", "meeting", "call", "interview"
+    "due", "deadline", "submit", "meet", "meeting", "call", "interview"
 ]
 
+# Modify the `looks_like_real_date` function to ensure valid spans like "tomorrow" and "Feb 22nd" are not filtered out.
 def looks_like_real_date(raw: str) -> bool:
     s = (raw or "").lower().strip()
 
     # Too short → almost always garbage
-    if len(s) < 4:
+    if len(s) < 3:  # Reduced the minimum length to 3
         return False
 
     # Pure stopword-ish junk often shows up
@@ -51,6 +53,10 @@ def looks_like_real_date(raw: str) -> bool:
 
     # If it contains a known date word, keep it
     if any(k in s for k in DATE_KEYWORDS):
+        return True
+
+    # Allow relative terms like "tomorrow" explicitly
+    if s in {"tomorrow", "today", "tonight", "yesterday"}:
         return True
 
     return False
@@ -145,52 +151,82 @@ def extract_urls(text: str) -> List[str]:
     return out
 
 
-def extract_dates(text: str, base_dt: datetime) -> List[Tuple[str, datetime]]:
-    # Avoid huge email blobs causing slow parsing
-    text = (text or "")[:5000]
+# Modify the `extract_dates` function to improve `search_dates` settings for better handling of relative terms.
+def extract_dates(text: str, base_dt: datetime) -> List[Tuple[str, datetime, datetime]]:
+    """
+    Extract date-like spans from text and resolve them to absolute dates.
+
+    Returns a list of tuples: (raw_span, resolved_date_utc, resolved_date_local).
+    """
+    text = (text or "")[:10000]  # Truncate to avoid performance issues
 
     settings = {
         "RELATIVE_BASE": base_dt,
-        "PREFER_DATES_FROM": "future",
+        "PREFER_DATES_FROM": "current_period",  # Prefer dates close to base_dt
         "SKIP_TOKENS": ["http", "https", "www"],
+        "RETURN_AS_TIMEZONE_AWARE": True,
+        "STRICT_PARSING": False,  # Relax strict parsing to allow more flexible date recognition
     }
 
-    # Force English to avoid slow language autodetection
     try:
         results = search_dates(text, languages=["en"], settings=settings) or []
-    except Exception:
+        print(f"Raw search_dates output: {results}")  # Debug log
+    except Exception as e:
+        print(f"Error during date parsing: {e}")
         return []
 
-    out: List[Tuple[str, datetime]] = []
+    out: List[Tuple[str, datetime, datetime]] = []
     for raw, dt in results:
         raw = (raw or "").strip()
+        print(f"Raw span identified: {raw}, Parsed datetime: {dt}")  # Debug log
 
         # Drop extremely long spans (usually false positives / whole sentences)
-        if len(raw) > 40:
+        if len(raw) > 50:
+            print(f"Skipping raw span due to length: {raw}")
             continue
 
-        # Filter out nonsense spans
+        # Filter out invalid spans
         if not looks_like_real_date(raw):
+            print(f"Skipping raw span due to invalidity: {raw}")
             continue
 
+        # Ensure timezone-aware datetimes
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=base_dt.tzinfo)
 
-        out.append((raw, dt.astimezone(timezone.utc)))
+        # Post-process to adjust dates based on base_dt
+        if dt.year > base_dt.year + 1:  # If the year is far in the future
+            dt = dt.replace(year=base_dt.year)
+            print(f"Adjusted future date to current year: {dt}")
+
+        # Convert to UTC and local timezone
+        resolved_date_utc = dt.astimezone(timezone.utc)
+        resolved_date_local = dt.astimezone(base_dt.tzinfo)
+
+        print(f"Resolved date: raw_span={raw}, UTC={resolved_date_utc}, Local={resolved_date_local}")
+        out.append((raw, resolved_date_utc, resolved_date_local))
 
     return out
 
 
+# Ensure the `insert_extractions` function handles all extracted dates properly.
 def insert_extractions(conn: sqlite3.Connection, message_id: int, text: str, sent_at_utc: str) -> None:
     base_dt = datetime.fromisoformat(sent_at_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
 
     for url in extract_urls(text):
         conn.execute("INSERT INTO extracted_links(message_id, url) VALUES(?, ?)", (message_id, url))
 
-    for raw, dt_utc in extract_dates(text, base_dt):
+    for raw, resolved_date_utc, resolved_date_local in extract_dates(text, base_dt):
+        print(f"Inserting into database: raw_span={raw}, resolved_date_utc={resolved_date_utc}, resolved_date_local={resolved_date_local}")
         conn.execute(
-            "INSERT INTO extracted_dates(message_id, raw_span, parsed_at_utc, confidence) VALUES(?, ?, ?, ?)",
-            (message_id, raw, dt_utc.isoformat(timespec="seconds").replace("+00:00", "Z"), None),
+            "INSERT INTO extracted_dates(message_id, raw_span, parsed_at_utc, resolved_date, confidence) VALUES(?, ?, ?, ?, ?)",
+            (
+                message_id,
+                raw,
+                resolved_date_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
+                resolved_date_local.isoformat(timespec="seconds"),
+                None,
+            ),
         )
 
 
@@ -291,8 +327,10 @@ def extract_attachment_metas(payload: Dict) -> List[Tuple[str, str, str]]:
     return out
 
 
+# Modify the `list_message_ids_since` function to ensure it retrieves the correct emails.
 def list_message_ids_since(service, user_id: str, after_seconds: int, max_pages: int = 25) -> List[str]:
-    q = "in:inbox newer_than:1d"
+    # Adjust the Gmail query to ensure it retrieves emails from the correct time range
+    q = f"in:inbox after:{after_seconds}"
     ids = []
     page_token = None
 
@@ -313,6 +351,7 @@ def list_message_ids_since(service, user_id: str, after_seconds: int, max_pages:
     return ids
 
 
+# Ensure the `ingest_gmail` function uses the correct `after_seconds` value.
 def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me") -> None:
     conn = open_sqlite_rw(out_db_path)
     service = gmail_auth()
@@ -320,7 +359,8 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me") -
     last_ms = get_last_cursor(conn, source)
     last_dt = datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc) if last_ms else datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-    after_seconds = max(0, int(last_dt.timestamp()) - 120)
+    # Adjust the `after_seconds` calculation to ensure it retrieves recent emails
+    after_seconds = max(0, int(last_dt.timestamp()))
 
     msg_ids = list_message_ids_since(service, user_id=user_id, after_seconds=after_seconds)
     if not msg_ids:
@@ -350,6 +390,9 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me") -
             body_text = extract_best_text(payload)
             combined = (f"Subject: {subject}\n" if subject else "") + body_text
 
+            if not combined.strip():
+                continue
+
             conv_id = upsert_conversation(conn, source, thread_id, display_name=subject)
             msg_id_db = insert_message(conn, source, internal_ms, conv_id, sender, sent_at_utc, combined)
 
@@ -369,6 +412,42 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me") -
         raise
     finally:
         conn.close()
+
+
+def process_email(
+    conn: sqlite3.Connection,
+    source: str,
+    thread_key: str,
+    source_rowid: int,
+    sender: Optional[str],
+    sent_at_utc: str,
+    text: str,
+    subject: Optional[str] = None,
+):
+    """
+    Process an email: insert the message and extract dates/links.
+    """
+    # Upsert the conversation
+    conversation_id = upsert_conversation(conn, source=source, thread_key=thread_key, display_name=subject)
+
+    # Insert the message
+    message_id = insert_message(
+        conn,
+        source=source,
+        source_rowid=source_rowid,
+        conversation_id=conversation_id,
+        sender=sender,
+        sent_at_utc=sent_at_utc,
+        text=text,
+    )
+
+    if message_id is None:
+        print(f"Message already exists: source={source}, source_rowid={source_rowid}")
+        return
+
+    # Extract and insert dates/links
+    insert_extractions(conn, message_id=message_id, text=text, sent_at_utc=sent_at_utc)
+    print(f"Processed email: message_id={message_id}")
 
 
 if __name__ == "__main__":
