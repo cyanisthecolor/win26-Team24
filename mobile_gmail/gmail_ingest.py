@@ -2,8 +2,9 @@ import base64
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+from email.message import EmailMessage
+from typing import Dict, Iterable, List, Optional, Tuple, TypedDict, NotRequired
 
 from dateparser.search import search_dates
 
@@ -14,7 +15,13 @@ from googleapiclient.discovery import build
 from flask import Flask, request, jsonify
 import logging
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = [ 
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",
+];
+
+CALENDARS = ["primary"]
 
 URL_RE = re.compile(
     r"""(?xi)
@@ -333,7 +340,7 @@ def fetch_db_snapshot(db_path: str, limit: int = 20) -> Dict[str, List[Dict]]:
         conn.close()
 
 
-def gmail_auth(creds_path: str = "credentials.json", token_path: str = "token.json"):
+def google_credentials(creds_path: str = "credentials.json", token_path: str = "token.json"):
     creds = None
     if os.path.exists(token_path):
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
@@ -348,7 +355,15 @@ def gmail_auth(creds_path: str = "credentials.json", token_path: str = "token.js
         with open(token_path, "w") as f:
             f.write(creds.to_json())
 
-    return build("gmail", "v1", credentials=creds)
+    return creds
+
+
+def gmail_auth(creds_path: str = "credentials.json", token_path: str = "token.json"):
+    return build("gmail", "v1", credentials=google_credentials(creds_path, token_path))
+
+
+def get_calendar(creds_path: str = "credentials.json", token_path: str = "token.json"):
+  return build("calendar", "v3", credentials=google_credentials(creds_path, token_path))
 
 
 def header_map(headers: List[Dict[str, str]]) -> Dict[str, str]:
@@ -557,6 +572,198 @@ def process_email(
     # Extract and insert dates/links
     insert_extractions(conn, message_id=message_id, text=text, sent_at_utc=sent_at_utc)
     logger.info(f"Processed email: message_id={message_id}")
+
+
+def get_range(calendar, start: datetime, end: Optional[datetime] = None):
+    events = []
+
+    if end is not None:
+        for id in CALENDARS:
+            events += calendar.events().list(
+                calendarId=id,
+                timeMin=start.isoformat(),
+                timeMax=end.isoformat(),
+                singleEvents=True,
+                orderBy="startTime"
+            ).execute().get("items", [])
+    else:
+        for id in CALENDARS:
+            events += calendar.events().list(
+                calendarId=id,
+                timeMin=start.isoformat(),
+                singleEvents=True,
+                orderBy="startTime"
+            ).execute().get("items", [])
+
+    return events
+
+
+def get_this_month(calendar):
+    now = datetime.now(timezone.utc)
+    return get_range(calendar, now, now+timedelta(days=30))
+
+
+def get_new_events(calendar, updated_after: datetime):
+    """
+    Return events created or modified after `updated_after`.
+    """
+    events = []
+
+    for id in CALENDARS:
+        events += calendar.events().list(
+            calendarId=id,
+            updatedMin=updated_after.isoformat(),
+            singleEvents=True,
+            showDeleted=False,
+            orderBy="updated"
+        ).execute().get("items", [])
+
+    return events
+
+
+def ingest_calendar_events(out_db_path: str, source: str = "gcal") -> Dict[str, int]:
+    conn = open_sqlite_rw(out_db_path)
+    calendar = get_calendar()
+
+    last_cursor = get_last_cursor(conn, source)
+    last_dt = (
+        datetime.fromtimestamp(last_cursor / 1000, tz=timezone.utc)
+        if last_cursor
+        else datetime(1970, 1, 1, tzinfo=timezone.utc)
+    )
+
+    events = get_new_events(calendar, last_dt)
+    if not events:
+        logger.info("No new calendar events to ingest.")
+        conn.close()
+        return {"processed": 0, "inserted": 0}
+
+    inserted = 0
+    max_updated_ms = last_cursor
+
+    conn.execute("BEGIN;")
+    try:
+        for e in events:
+            event_id = e.get("id")
+            updated = e.get("updated")
+            if not event_id or not updated:
+                continue
+
+            updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            updated_ms = int(updated_dt.timestamp() * 1000)
+
+            if updated_ms <= last_cursor:
+                continue
+
+            max_updated_ms = max(max_updated_ms, updated_ms)
+
+            start_raw = e.get("start", {})
+            end_raw = e.get("end", {})
+
+            start = start_raw.get("dateTime") or start_raw.get("date")
+            end = end_raw.get("dateTime") or end_raw.get("date")
+            if not start or not end:
+                continue
+
+            summary = e.get("summary")
+            description = e.get("description")
+            location = e.get("location")
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO events(start_utc, end_utc, summary, description, location)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (
+                        start,
+                        end,
+                        summary,
+                        description,
+                        location,
+                    ),
+                )
+                inserted += 1
+            except sqlite3.IntegrityError:
+                continue
+
+        set_last_cursor(conn, source, max_updated_ms)
+        conn.execute("COMMIT;")
+        logger.info(f"Calendar ingestion complete. processed={len(events)} inserted={inserted}")
+        return {"processed": len(events), "inserted": inserted}
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.close()
+
+
+class Event(TypedDict):
+    start: datetime
+    end: datetime
+    summary: str
+    description: str
+    location: NotRequired[str]
+    attendees: NotRequired[list[Person]]
+
+class Person(TypedDict):
+    email: str
+    optional: NotRequired[bool]
+
+def make_event(calendar, calendarId: str, event: Event):
+    return calendar.events().insert(
+        calendarId=calendarId,
+        body=event | {
+            "start": {
+                "dateTime": event["start"].isoformat(),
+                "timeZone": str(event["start"].tzinfo), 
+            },
+            "end": {
+                "dateTime": event["end"].isoformat(),
+                "timeZone": str(event["end"].tzinfo), 
+            },
+        },
+    ).execute()
+
+
+class Email(TypedDict):
+    Subject: str
+    To: str | list[str]
+    # TODO: add cc, bcc, etc
+    Content: str
+
+
+def send_email(gmail, message: Email):
+    email = EmailMessage()
+    email.set_content(message["Content"])
+    email["From"] = "me"
+    email["To"] = ", ".join(message["To"]) if isinstance(message["To"], list) else message["To"]
+    email["Subject"] = message["Subject"]
+
+    create_message = { "raw": base64.urlsafe_b64encode(email.as_bytes()).decode(), }
+    return gmail.users().messages().send(userId="me", body=create_message).execute()
+
+
+@app.route('/ingest_calendar', methods=['POST'])
+def ingest_calendar():
+    """API endpoint to trigger Google Calendar ingestion."""
+    try:
+        db_path = request.json.get('db_path', 'extracted.db')
+        logger.info(f"Starting Calendar ingestion for database: {db_path}")
+
+        ingest_stats = ingest_calendar_events(db_path)
+        summary = get_db_summary(db_path)
+
+        logger.info("Calendar ingestion completed successfully.")
+        return jsonify({
+            "status": "success",
+            "message": "Calendar events ingested successfully.",
+            "ingest": ingest_stats,
+            "summary": summary,
+        })
+    except Exception as e:
+        logger.error(f"Error during Calendar ingestion: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route('/ingest', methods=['POST'])
