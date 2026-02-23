@@ -81,7 +81,12 @@ function timeAgo(ts) {
 function formatDate(dateStr) {
   const d = new Date(dateStr);
   if (Number.isNaN(d.getTime())) return dateStr;
-  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+  return d.toLocaleDateString('en-US', {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'UTC',
+  });
 }
 
 function priorityColor(p) {
@@ -347,6 +352,7 @@ function CalendarTab({ ingestDates = [] }) {
             const end = new Date(e.end_utc);
 
             const dateStr = start.toISOString().slice(0, 10);
+            console.log(`${dateStr} => ${formatDate(dateStr)}`);
             const timeStr = start.toLocaleTimeString('en-US', {
               hour: 'numeric',
               minute: '2-digit'
