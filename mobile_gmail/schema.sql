@@ -34,6 +34,19 @@ CREATE TABLE IF NOT EXISTS messages (
   UNIQUE(source, source_msg_key)
 );
 
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+  -- Core fields
+  start_utc TEXT NOT NULL,
+  end_utc   TEXT NOT NULL,
+
+  -- Optional
+  summary     TEXT,
+  description TEXT,
+  location    TEXT
+);
+
 CREATE TABLE IF NOT EXISTS extracted_dates (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -68,3 +81,6 @@ CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation
 CREATE INDEX IF NOT EXISTS idx_extracted_dates_message_id ON extracted_dates(message_id);
 CREATE INDEX IF NOT EXISTS idx_extracted_links_message_id ON extracted_links(message_id);
 CREATE INDEX IF NOT EXISTS idx_extracted_attachments_message_id ON extracted_attachments(message_id);
+
+CREATE INDEX IF NOT EXISTS idx_events_start_utc ON events(start_utc);
+CREATE INDEX IF NOT EXISTS idx_events_end_utc ON events(end_utc);
