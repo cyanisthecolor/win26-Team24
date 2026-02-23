@@ -1,10 +1,15 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView,
   Switch, TextInput, Animated, Dimensions, StatusBar,
-  SafeAreaView, Modal,
+  SafeAreaView, Modal, ActivityIndicator
 } from 'react-native';
+import * as AuthSession from 'expo-auth-session';
+import * as WebBrowser from 'expo-web-browser';
 import DATA from './data.json';
+
+// Initialize WebBrowser for Auth
+WebBrowser.maybeCompleteAuthSession();
 
 const { width } = Dimensions.get('window');
 
@@ -13,6 +18,11 @@ const C = {
   accent: '#4F8EF7', accentSoft: '#1E2F4A', green: '#3DD68C', greenSoft: '#1A3028',
   red: '#F75C5C', redSoft: '#3D1A1A', yellow: '#F7C948', yellowSoft: '#382E10',
   textPrimary: '#EDF0F7', textSecondary: '#7A8099', textMuted: '#4A5068',
+};
+
+const discovery = {
+  authorizationEndpoint: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
+  tokenEndpoint: 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
 };
 
 function timeAgo(iso) {
@@ -451,14 +461,75 @@ function ThreadsTab() {
   );
 }
 
+// ─── Dashboard: Connections Tab ────────────────────────────────────────────────
+function ConnectionsTab({ onMicrosoftConnect, isMicrosoftConnected, isLoading }) {
+  return (
+    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
+      <View style={s.dashHeader}>
+        <View>
+          <Text style={s.dashTitle}>Connect Apps</Text>
+          <Text style={s.dashSubtitle}>Manage your third-party integrations</Text>
+        </View>
+      </View>
+
+      <View style={{ gap: 12 }}>
+        {/* Microsoft Button */}
+        <TouchableOpacity 
+          style={[s.authCard, isMicrosoftConnected && s.authCardConnected]} 
+          onPress={onMicrosoftConnect}
+          disabled={isLoading}
+        >
+          <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+            <Text style={{ fontSize: 24, marginRight: 16 }}>📧</Text>
+            <View>
+              <Text style={s.authCardTitle}>Microsoft Outlook</Text>
+              <Text style={s.authCardStatus}>
+                {isMicrosoftConnected ? 'Connected' : 'Tap to sign in'}
+              </Text>
+            </View>
+          </View>
+          {isLoading ? (
+            <ActivityIndicator color={C.accent} />
+          ) : (
+            <View style={[s.authBadge, isMicrosoftConnected && s.authBadgeConnected]}>
+              <Text style={s.authBadgeText}>{isMicrosoftConnected ? '✓' : 'Connect'}</Text>
+            </View>
+          )}
+        </TouchableOpacity>
+
+        {/* Google Button (Placeholder) */}
+        <TouchableOpacity style={s.authCard} activeOpacity={0.7}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+            <Text style={{ fontSize: 24, marginRight: 16 }}>✉️</Text>
+            <View>
+              <Text style={s.authCardTitle}>Google Gmail</Text>
+              <Text style={s.authCardStatus}>Tap to sign in</Text>
+            </View>
+          </View>
+          <View style={s.authBadge}>
+            <Text style={s.authBadgeText}>Connect</Text>
+          </View>
+        </TouchableOpacity>
+      </View>
+      
+      <InfoBox 
+        icon="ℹ️" 
+        text="Connecting these apps allows the assistant to pull in your latest threads and calendar events." 
+        style={{ marginTop: 24 }} 
+      />
+    </ScrollView>
+  );
+}
+
 // ─── Dashboard Shell ──────────────────────────────────────────────────────────
 const TABS = [
   { key: 'notifications', label: 'Inbox', icon: '🔔' },
   { key: 'calendar', label: 'Calendar', icon: '📅' },
   { key: 'threads', label: 'Threads', icon: '💬' },
+  { key: 'connections', label: 'Connect', icon: '🔗' },
 ];
 
-function Dashboard() {
+function Dashboard({ msAuthProps }) {
   const [tab, setTab] = useState('notifications');
   const unreadCount = DATA.notifications.filter(n => !n.read).length;
   return (
@@ -468,6 +539,7 @@ function Dashboard() {
         {tab === 'notifications' && <NotificationsTab />}
         {tab === 'calendar' && <CalendarTab />}
         {tab === 'threads' && <ThreadsTab />}
+        {tab === 'connections' && <ConnectionsTab {...msAuthProps} />}
       </View>
       <View style={s.tabBar}>
         {TABS.map(t => {
@@ -495,12 +567,35 @@ export default function App() {
   const [step, setStep] = useState(0);
   const fade = useRef(new Animated.Value(1)).current;
 
+  // Onboarding States
   const [selectedApps, setSelectedApps] = useState(['gmail', 'calendar']);
   const [contacts, setContacts] = useState(['Natalie', 'Eugenie', 'Jonathan', 'Amanda']);
   const [contactInput, setContactInput] = useState('');
   const [privacyValues, setPrivacyValues] = useState(Object.fromEntries(PRIVACY_SETTINGS.map(p => [p.id, p.default])));
   const [notifEnabled, setNotifEnabled] = useState(true);
   const [leadTime, setLeadTime] = useState('1 hour');
+
+  // Auth States
+  const [microsoftToken, setMicrosoftToken] = useState(null);
+
+  const [request, response, promptAsync] = AuthSession.useAuthRequest(
+    {
+      clientId: 'fde8d6d4-cb6f-4ad5-862f-0ab740a0bec8',
+      scopes: ['openid', 'profile', 'email', 'User.Read', 'Mail.Read'],
+      redirectUri: AuthSession.makeRedirectUri({ scheme: 'team24app' }),
+      responseType: AuthSession.ResponseType.Token,
+      usePKCE: false,
+    },
+    discovery
+  );
+
+  useEffect(() => {
+    if (response?.type === 'success') {
+      const { access_token } = response.params;
+      setMicrosoftToken(access_token);
+      console.log("Microsoft Connected!");
+    }
+  }, [response]);
 
   function transition(fn) {
     Animated.sequence([
@@ -528,7 +623,13 @@ export default function App() {
     }
   }
 
-  if (done) return <Dashboard />;
+  const msAuthProps = {
+    onMicrosoftConnect: () => promptAsync(),
+    isMicrosoftConnected: !!microsoftToken,
+    isLoading: !request && !microsoftToken
+  };
+
+  if (done) return <Dashboard msAuthProps={msAuthProps} />;
 
   return (
     <SafeAreaView style={s.root}>
@@ -560,13 +661,10 @@ export default function App() {
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
   progressBar: { flexDirection: 'row', paddingHorizontal: 24, paddingTop: 16, paddingBottom: 4 },
   progressSeg: { flex: 1, height: 3, borderRadius: 2 },
-
-  // Onboarding
   welcomeGlow: { position: 'absolute', top: -80, left: -60, width: 300, height: 300, borderRadius: 150, backgroundColor: C.accent, opacity: 0.06 },
   welcomeTitle: { fontSize: 36, fontWeight: '800', color: C.textPrimary, lineHeight: 44, marginBottom: 16, letterSpacing: -0.5 },
   welcomeBody: { fontSize: 15, color: C.textSecondary, lineHeight: 24, marginBottom: 32 },
@@ -591,13 +689,9 @@ const s = StyleSheet.create({
   doneGlow: { position: 'absolute', top: -60, width: 280, height: 280, borderRadius: 140, backgroundColor: C.green, opacity: 0.07 },
   doneTitle: { fontSize: 32, fontWeight: '800', color: C.textPrimary, marginBottom: 12 },
   doneSummaryCard: { width: '100%', backgroundColor: C.surface, borderRadius: 16, padding: 20, borderWidth: 1, borderColor: C.border },
-
-  // Nav
   navRow: { flexDirection: 'row', paddingHorizontal: 24, paddingBottom: 24, paddingTop: 12, gap: 12 },
   backBtn: { paddingVertical: 14, paddingHorizontal: 20, borderRadius: 14, borderWidth: 1, borderColor: C.border },
   nextBtn: { flex: 1, backgroundColor: C.accent, borderRadius: 14, paddingVertical: 14, alignItems: 'center' },
-
-  // Dashboard
   dashHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 20, paddingTop: 8 },
   dashTitle: { fontSize: 26, fontWeight: '800', color: C.textPrimary, letterSpacing: -0.3 },
   dashSubtitle: { fontSize: 13, color: C.textMuted, marginTop: 2 },
@@ -628,4 +722,11 @@ const s = StyleSheet.create({
   modalSheet: { backgroundColor: C.surface, borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, paddingBottom: 40, borderTopWidth: 1, borderColor: C.border },
   modalTitle: { fontSize: 18, fontWeight: '800', color: C.textPrimary, flex: 1, marginRight: 8 },
   modalRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 10 },
+  authCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.surface, borderRadius: 16, padding: 18, borderWidth: 1, borderColor: C.border },
+  authCardConnected: { borderColor: C.green, backgroundColor: C.greenSoft },
+  authCardTitle: { fontSize: 15, fontWeight: '700', color: C.textPrimary },
+  authCardStatus: { fontSize: 12, color: C.textSecondary, marginTop: 2 },
+  authBadge: { backgroundColor: C.accent, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 6 },
+  authBadgeConnected: { backgroundColor: C.green },
+  authBadgeText: { fontSize: 12, fontWeight: '700', color: '#fff' },
 });
