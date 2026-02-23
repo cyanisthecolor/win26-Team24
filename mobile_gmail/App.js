@@ -332,39 +332,83 @@ function NotificationsTab() {
   );
 }
 
-// ─── Dashboard: Calendar Tab ──────────────────────────────────────────────────
+
 function CalendarTab({ ingestDates = [] }) {
   const [selected, setSelected] = useState(null);
+  const [dbEvents, setDbEvents] = useState([]);
+
+  useEffect(() => {
+    fetch('http://localhost:5000/calendar/events')
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'success') {
+          const mapped = data.events.map(e => {
+            const start = new Date(e.start_utc);
+            const end = new Date(e.end_utc);
+
+            const dateStr = start.toISOString().slice(0, 10);
+            const timeStr = start.toLocaleTimeString('en-US', {
+              hour: 'numeric',
+              minute: '2-digit'
+            });
+
+            const durationMinutes = Math.round((end - start) / 60000);
+            const duration =
+              durationMinutes > 0
+                ? `${durationMinutes} min`
+                : null;
+
+            return {
+              id: `cal-${e.id}`,
+              title: e.summary,
+              date: dateStr,
+              time: timeStr,
+              duration,
+              attendees: [],
+              source: 'Google Calendar',
+              sourceIcon: '📅',
+              videoLink: null,
+              notes: e.description,
+            };
+          });
+
+          setDbEvents(mapped);
+        }
+      })
+      .catch(err => console.error(err));
+  }, []);
 
   const ingestEvents = ingestDates
     .filter(d => {
       const raw = `${d.raw_span || ''}`.toLowerCase();
       const iso = d.resolved_date || d.parsed_at_utc || '';
-      // Drop noisy relative dates like "tomorrow" and the unwanted Feb 22 entries
       if (raw.includes('tomorrow')) return false;
       if (iso.startsWith('2026-02-22')) return false;
       return true;
     })
     .map(d => {
-    const iso = d.resolved_date || d.parsed_at_utc || '';
-    const dt = iso ? new Date(iso) : null;
-    const dateStr = dt ? dt.toISOString().slice(0, 10) : 'Unknown date';
-    const timeStr = dt ? dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : '';
-    return {
-      id: `ing-${d.id}`,
-      title: d.raw_span,
-      date: dateStr,
-      time: timeStr,
-      duration: null,
-      attendees: [],
-      source: 'Gmail',
-      sourceIcon: '✉️',
-      videoLink: null,
-      notes: `From message ${d.message_id}`,
-    };
-  });
+      const iso = d.resolved_date || d.parsed_at_utc || '';
+      const dt = iso ? new Date(iso) : null;
+      const dateStr = dt ? dt.toISOString().slice(0, 10) : 'Unknown date';
+      const timeStr = dt
+        ? dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
+        : '';
 
-  const grouped = [...DATA.events, ...ingestEvents].reduce((acc, e) => {
+      return {
+        id: `ing-${d.id}`,
+        title: d.raw_span,
+        date: dateStr,
+        time: timeStr,
+        duration: null,
+        attendees: [],
+        source: 'Gmail',
+        sourceIcon: '✉️',
+        videoLink: null,
+        notes: `From message ${d.message_id}`,
+      };
+    });
+
+  const grouped = [...dbEvents, ...ingestEvents].reduce((acc, e) => {
     if (!acc[e.date]) acc[e.date] = [];
     acc[e.date].push(e);
     return acc;
@@ -375,7 +419,7 @@ function CalendarTab({ ingestDates = [] }) {
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Calendar</Text>
-          <Text style={s.dashSubtitle}>{DATA.events.length} upcoming events</Text>
+          <Text style={s.dashSubtitle}>{dbEvents.length} upcoming events</Text>
         </View>
       </View>
 
@@ -386,16 +430,15 @@ function CalendarTab({ ingestDates = [] }) {
             <TouchableOpacity key={e.id} style={s.eventCard} onPress={() => setSelected(e)} activeOpacity={0.8}>
               <View style={{ width: 56, alignItems: 'flex-end' }}>
                 <Text style={{ fontSize: 12, fontWeight: '700', color: C.textPrimary }}>{e.time}</Text>
-                {e.duration && <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{e.duration}</Text>}
+                {e.duration && (
+                  <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{e.duration}</Text>
+                )}
               </View>
               <View style={{ width: 2, height: 40, backgroundColor: C.accent, borderRadius: 2, opacity: 0.5 }} />
               <View style={{ flex: 1 }}>
-                <Text style={{ fontSize: 14, fontWeight: '600', color: C.textPrimary, marginBottom: 6 }}>{e.title}</Text>
-                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
-                  {e.attendees.map(a => (
-                    <View key={a} style={s.attendeeChip}><Text style={{ fontSize: 11, color: C.textSecondary, fontWeight: '500' }}>{a}</Text></View>
-                  ))}
-                </View>
+                <Text style={{ fontSize: 14, fontWeight: '600', color: C.textPrimary, marginBottom: 6 }}>
+                  {e.title}
+                </Text>
               </View>
               <Text style={{ fontSize: 18 }}>{e.sourceIcon}</Text>
             </TouchableOpacity>
@@ -409,31 +452,30 @@ function CalendarTab({ ingestDates = [] }) {
             {selected && <>
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
                 <Text style={s.modalTitle}>{selected.title}</Text>
-                <TouchableOpacity onPress={() => setSelected(null)} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+                <TouchableOpacity onPress={() => setSelected(null)}>
                   <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
                 </TouchableOpacity>
               </View>
+
               {[
                 ['🕐', `${selected.time}${selected.duration ? ` · ${selected.duration}` : ''}`],
                 ['📅', formatDate(selected.date)],
                 [selected.sourceIcon, selected.source],
-                selected.attendees.length > 0 ? ['👥', selected.attendees.join(', ')] : null,
-              ].filter(Boolean).map(([icon, text]) => (
+              ].map(([icon, text]) => (
                 <View key={text} style={s.modalRow}>
                   <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>{icon}</Text>
                   <Text style={{ fontSize: 14, color: C.textSecondary, flex: 1 }}>{text}</Text>
                 </View>
               ))}
-              {selected.videoLink && (
-                <View style={[s.modalRow, { backgroundColor: C.accentSoft, borderRadius: 10, padding: 10, marginTop: 4 }]}>
-                  <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>🔗</Text>
-                  <Text style={{ fontSize: 13, color: C.accent, flex: 1 }} numberOfLines={1}>{selected.videoLink}</Text>
-                </View>
-              )}
+
               {selected.notes && (
                 <View style={{ marginTop: 16, backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12 }}>
-                  <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 4 }}>NOTES</Text>
-                  <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>{selected.notes}</Text>
+                  <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 4 }}>
+                    NOTES
+                  </Text>
+                  <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>
+                    {selected.notes}
+                  </Text>
                 </View>
               )}
             </>}
