@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from calendar_oauth import get_this_month, get_calendar;
+from google import get_this_month, get_calendar;
 from ask import ask;
 
 def main():

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 from datetime import datetime, timezone, timedelta 
+from email.message import EmailMessage
 from typing import TypedDict, NotRequired
+import base64
 import os
 
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -9,10 +11,19 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = [ 
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",
+];
 CALENDARS = ["primary"]
 
-def get_calendar():
+CREDS = None;
+
+def get_creds():
+    global CREDS;
+    if CREDS: return CREDS;
+
     creds = None;
 
     if os.path.exists("token.json"):
@@ -31,7 +42,31 @@ def get_calendar():
         with open("token.json", "w") as token:
             token.write(creds.to_json());
 
-    return build("calendar", "v3", credentials=creds);
+    CREDS = creds;
+    return creds;
+
+def get_gmail(): return build("gmail", "v1", credentials=get_creds());
+
+
+class Email(TypedDict):
+    Subject: str
+    To: str | list[str]
+    # TODO: add cc, bcc, etc
+    Content: str
+
+def send_email(gmail, message: Email):
+    email = EmailMessage()
+    email.set_content(message["Content"]);
+    email["From"] = "me";
+    email["To"] = ", ".join(message["To"]) if isinstance(message["To"], list) else message["To"];
+    email["Subject"] = message["Subject"];
+
+    create_message = { "raw": base64.urlsafe_b64encode(email.as_bytes()).decode(), };
+    sent = gmail.users().messages().send(userId="me", body=create_message).execute();
+
+    print("Message Id:", sent["id"])
+
+def get_calendar(): return build("calendar", "v3", credentials=get_creds());
 
 def get_range(calendar, start: datetime, end: datetime):
     events = [];
@@ -99,5 +134,12 @@ def main():
         "end": end_time,
     };
     make_event(calendar, CALENDARS[0], event);
+
+    email = {
+        "Subject": "CS 194 Final Project",
+        "To": ["jrrod@stanford.edu"], 
+        "Content": "Hey, can you work on our team's project right now?"
+    };
+    send_email(get_gmail(), email);
 
 if __name__ == "__main__": main()
