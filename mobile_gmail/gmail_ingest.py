@@ -13,6 +13,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import logging
 
 SCOPES = [ 
@@ -48,6 +49,8 @@ logger = logging.getLogger(__name__)
 
 # Flask app for API integration
 app = Flask(__name__)
+
+CORS(app)
 
 # Modify the `looks_like_real_date` function to ensure valid spans like "tomorrow" and "Feb 22nd" are not filtered out.
 def looks_like_real_date(raw: str) -> bool:
@@ -763,6 +766,39 @@ def ingest_calendar():
         })
     except Exception as e:
         logger.error(f"Error during Calendar ingestion: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/calendar/events', methods=['GET'])
+def get_calendar_events():
+    """Update from Google Calendar, then return events from local DB."""
+    try:
+        db_path = request.args.get('db_path', 'extracted.db')
+        logger.info(f"Updating Calendar before read. DB: {db_path}")
+
+        ingest_stats = ingest_calendar_events(db_path)
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT id, summary, description, start_utc, end_utc, location
+            FROM events
+            ORDER BY start_utc ASC
+        """)
+
+        rows = [dict(row) for row in cur.fetchall()]
+        conn.close()
+
+        return jsonify({
+            "status": "success",
+            "updated": ingest_stats,
+            "events": rows
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching calendar events: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
