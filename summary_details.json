@@ -1,0 +1,21 @@
+{
+    "emails": {
+        "summary": "Natalie is reaching out to reconnect and suggesting dinner next weekend, while also seeking advice for her upcoming Stanford interview.",
+        "to_dos": [
+            {
+                "who": "You",
+                "what": "Respond to Natalie about dinner availability next weekend."
+            },
+            {
+                "who": "You",
+                "what": "Provide suggestions for Stanford interview topics."
+            }
+        ],
+        "req_replies": [
+            {
+                "email": "Natalie Anne Shell",
+                "response": "Confirm dinner plans and provide interview suggestions."
+            }
+        ]
+    }
+}

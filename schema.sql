@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS messages (
   is_from_me INTEGER NOT NULL,
   sent_at_utc TEXT NOT NULL,
   text TEXT,
+  category TEXT,
 
   UNIQUE(source, source_msg_key)
 );

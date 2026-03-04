@@ -1,0 +1,164 @@
+[
+    {
+        "@odata.etag": "W/\"CQAAABYAAACyAPf8olJySaLpATimnwJaAAAGc5YK\"",
+        "id": "AQMkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoARgAAA6v8dZveFHhFhRBnrLYojhAHALIA9-yiUnJJoukBOKafAloAAAIBDAAAALIA9-yiUnJJoukBOKafAloAAAAGdChlAAAA",
+        "createdDateTime": "2026-03-04T17:21:32Z",
+        "lastModifiedDateTime": "2026-03-04T17:21:33Z",
+        "changeKey": "CQAAABYAAACyAPf8olJySaLpATimnwJaAAAGc5YK",
+        "categories": [],
+        "receivedDateTime": "2026-03-04T17:21:33Z",
+        "sentDateTime": "2026-03-04T17:21:18Z",
+        "hasAttachments": false,
+        "internetMessageId": "<CAGErgyuzsKtAVH0XUa5ms3DB+FA2-xShjBUyHq_BytX0o68ymQ@mail.gmail.com>",
+        "subject": "Hang out",
+        "bodyPreview": "Hi,\r\nI really want to spend time with you on Friday, just to hang out. I haven't heard back yet. Can you please let me know if you are free on Friday? Please email me back.\r\n\r\nWarmest regards,\r\nScammer",
+        "importance": "normal",
+        "parentFolderId": "AQMkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoALgAAA6v8dZveFHhFhRBnrLYojhABALIA9-yiUnJJoukBOKafAloAAAIBDAAAAA==",
+        "conversationId": "AQQkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoAEADzRoU9qFPlTqjPMg3Pj0MS",
+        "conversationIndex": "AQHcq/tY80aFPahT5U6ozzINz49DEg==",
+        "isDeliveryReceiptRequested": null,
+        "isReadReceiptRequested": false,
+        "isRead": false,
+        "isDraft": false,
+        "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoARgAAA6v8dZveFHhFhRBnrLYojhAHALIA9%2FyiUnJJoukBOKafAloAAAIBDAAAALIA9%2FyiUnJJoukBOKafAloAAAAGdChlAAAA&exvsurl=1&viewmodel=ReadMessageItem",
+        "inferenceClassification": "focused",
+        "body": {
+            "contentType": "html",
+            "content": "<html><head>\r\n<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body><div dir=\"ltr\">Hi,&nbsp;<br>I really want to spend time with you on Friday, just to hang out. I haven't heard back yet. Can you please let me know if you are free on Friday? Please email me back.<br><br>Warmest regards,&nbsp;<br>Scammer&nbsp;</div></body></html>"
+        },
+        "sender": {
+            "emailAddress": {
+                "name": "Sketchy Scammer",
+                "address": "natalieshell03@gmail.com"
+            }
+        },
+        "from": {
+            "emailAddress": {
+                "name": "Sketchy Scammer",
+                "address": "natalieshell03@gmail.com"
+            }
+        },
+        "toRecipients": [
+            {
+                "emailAddress": {
+                    "name": "win26_group24@outlook.com",
+                    "address": "win26_group24@outlook.com"
+                }
+            }
+        ],
+        "ccRecipients": [],
+        "bccRecipients": [],
+        "replyTo": [],
+        "flag": {
+            "flagStatus": "notFlagged"
+        }
+    },
+    {
+        "@odata.etag": "W/\"CQAAABYAAACyAPf8olJySaLpATimnwJaAAAGc44v\"",
+        "id": "AQMkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoARgAAA6v8dZveFHhFhRBnrLYojhAHALIA9-yiUnJJoukBOKafAloAAAIBDAAAALIA9-yiUnJJoukBOKafAloAAAAGdChcAAAA",
+        "createdDateTime": "2026-03-04T13:07:51Z",
+        "lastModifiedDateTime": "2026-03-04T16:23:13Z",
+        "changeKey": "CQAAABYAAACyAPf8olJySaLpATimnwJaAAAGc44v",
+        "categories": [],
+        "receivedDateTime": "2026-03-04T13:07:51Z",
+        "sentDateTime": "2026-03-04T13:07:42Z",
+        "hasAttachments": false,
+        "internetMessageId": "<PH0PR02MB7237DFD485A439C22A2ED532FC7CA@PH0PR02MB7237.namprd02.prod.outlook.com>",
+        "subject": "Pictures for yearbook! ",
+        "bodyPreview": "Hello Natalie,\r\n\r\nClient ID: Info\r\n\r\nAs a 2026 graduate, we want to ensure you are included in the graduating class records and yearbook! There are now less than 2 weeks left to be photographed, with the final deadline approaching on Friday, March 13.",
+        "importance": "normal",
+        "parentFolderId": "AQMkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoALgAAA6v8dZveFHhFhRBnrLYojhABALIA9-yiUnJJoukBOKafAloAAAIBDAAAAA==",
+        "conversationId": "AQQkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoAEAASNnNzAFgGiUO2TNuZCwZ31A==",
+        "conversationIndex": "AQHcq9fFEjZzc1gGiUO2TNuZCwZ31A==",
+        "isDeliveryReceiptRequested": null,
+        "isReadReceiptRequested": false,
+        "isRead": true,
+        "isDraft": false,
+        "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoARgAAA6v8dZveFHhFhRBnrLYojhAHALIA9%2FyiUnJJoukBOKafAloAAAIBDAAAALIA9%2FyiUnJJoukBOKafAloAAAAGdChcAAAA&exvsurl=1&viewmodel=ReadMessageItem",
+        "inferenceClassification": "focused",
+        "body": {
+            "contentType": "html",
+            "content": "<html><head>\r\n<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body><table class=\"block_margin\" cellspacing=\"0\" cellpadding=\"0\" style=\"text-align:left; width:100%; table-layout:fixed; color:rgb(0,0,0); box-sizing:border-box; border-collapse:collapse; border-spacing:0px\"><tbody><tr><td class=\"block_margin\" data-ogsb=\"rgb(255, 255, 255)\" data-ogab=\"#ffffff\" style=\"text-align:left; background-color:rgb(255,255,255); padding:4px\"><table class=\"text text--padding-vertical\" cellspacing=\"0\" cellpadding=\"0\" style=\"text-align:left; width:100%; table-layout:fixed; box-sizing:border-box; border-collapse:collapse; border-spacing:0px\"><tbody><tr><td class=\"text_content-cell content-padding-horizontal\" data-ogsc=\"rgb(68, 68, 68)\" data-ogsb=\"rgb(255, 255, 255)\" data-ogab=\"#ffffff\" style=\"text-align:left; line-height:1.2; background-color:rgb(255,255,255); padding:10px 40px; vertical-align:top; color:rgb(68,68,68)\"><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(0,0,0)\">Hello Natalie,</span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(0,0,0)\"><b>Client ID:</b>&nbsp;</span><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:16px; color:rgb(0,0,0)\">Info</span></p></td></tr></tbody></table></td></tr></tbody></table><table class=\"block_margin\" cellspacing=\"0\" cellpadding=\"0\" style=\"text-align:left; width:100%; table-layout:fixed; color:rgb(0,0,0); box-sizing:border-box; border-collapse:collapse; border-spacing:0px\"><tbody><tr><td class=\"block_margin\" data-ogsb=\"rgb(255, 255, 255)\" data-ogab=\"#ffffff\" style=\"text-align:left; background-color:rgb(255,255,255); padding:4px\"><table class=\"text text--padding-vertical\" id=\"table_0\" cellspacing=\"0\" cellpadding=\"0\" style=\"text-align:left; width:100%; table-layout:fixed; box-sizing:border-box; border-collapse:collapse; border-spacing:0px\"><tbody><tr><td class=\"text_content-cell content-padding-horizontal\" data-ogsc=\"rgb(68, 68, 68)\" data-ogsb=\"rgb(255, 255, 255)\" data-ogab=\"#ffffff\" style=\"text-align:left; line-height:1.2; background-color:rgb(255,255,255); padding:10px 40px; vertical-align:top; color:rgb(68,68,68)\"><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(0,0,0)\">As a 2026 graduate, we want to ensure you are included in the graduating class records and yearbook! </span><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(0,0,0); background-color:rgb(252,250,213)\">There are now <b>less than 2 weeks left</b>&nbsp;to be photographed, with the final deadline approaching on <b>Friday, March 13.</b></span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Trebuchet MS&quot;,Verdana,Helvetica,sans-serif; font-size:16px\"><br></span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(0,0,0)\">Due to the high volume of graduating seniors, appointment slots are limited and fill up quickly. We encourage you to schedule your session immediately to ensure you capture this milestone while availability remains. <b>Senior portraits are being held at the bookstore, on the lower level.</b></span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Trebuchet MS&quot;,Verdana,Helvetica,sans-serif; font-size:16px\"><br></span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(0,0,0)\"><b>It is <i>free</i>&nbsp;to be included in the yearbook.</b>&nbsp;Digital proofs will be provided within 5–7 business days if you wish to purchase your images for personal use or LinkedIn. When you book your appointment, you will also have the option to purchase the 2026 <i>Quad </i>Yearbook.</span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Trebuchet MS&quot;,Verdana,Helvetica,sans-serif; font-size:16px\"><br></span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(0,0,0)\">Please visit the official scheduling portal </span><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(40,79,161)\"><b><u><a href=\"https://urldefense.com/v3/__https://jocrm5cab.cc.rs6.net/tn.jsp?f=001zgU29xKrNzguD9Psz9Fvb72MDSH--iZGzJHZWdGOl8C1yaZk0-xfzfWHRXX08oKuvUnijhQcBzvGy5QiluWeaAV7oX-QCgav3MI7qrTQpF_WfXHKwzQ7GRbxczGEJu3eGTgigBXs7I3nJ5M6jW5BfY3oM9Xr93vY3QAWWreS9vg=&amp;c=16TTAYXxcBrk9vZxW028Ad7Q73R0ISFpfB3ux-ScJ0-BxNP7Ke0pqg==&amp;ch=yDWbk6dUA2JHnZBpGNk6UzUEuCGwOLF6BD1def3PtcegeAK4BFAD7Q==__;!!G92We9drHetJ8EofZw!a7cSWn3KPsJjmP91YN7cGfg8LHeS6LHq1ag0EuNaNMXNwRMzV19gpjaLHsAOqT76PrJY6IXL81RdPNNY2OUN$\" target=\"_blank\" title=\"https://urldefense.com/v3/__https://jocrm5cab.cc.rs6.net/tn.jsp?f=001zgU29xKrNzguD9Psz9Fvb72MDSH--iZGzJHZWdGOl8C1yaZk0-xfzfWHRXX08oKuvUnijhQcBzvGy5QiluWeaAV7oX-QCgav3MI7qrTQpF_WfXHKwzQ7GRbxczGEJu3eGTgigBXs7I3nJ5M6jW5BfY3oM9Xr93vY3QAWWreS9vg=&amp;c=16TTAYXxcBrk9vZxW028Ad7Q73R0ISFpfB3ux-ScJ0-BxNP7Ke0pqg==&amp;ch=yDWbk6dUA2JHnZBpGNk6UzUEuCGwOLF6BD1def3PtcegeAK4BFAD7Q==__;!!G92We9drHetJ8EofZw!a7cSWn3KPsJjmP91YN7cGfg8LHeS6LHq1ag0EuNaNMXNwRMzV19gpjaLHsAOqT76PrJY6IXL81RdPNNY2OUN$\" rel=\"noopener noreferrer\" data-ogsc=\"rgb(40, 79, 161)\" data-outlook-id=\"428bb741-dc11-4c88-a734-a51161876afa\" style=\"color:rgb(40,79,161); margin-top:0px; margin-bottom:0px\">here</a></u></b></span><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(0,0,0)\">&nbsp;and use your Client ID to log in to view available appointment times.</span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Trebuchet MS&quot;,Verdana,Helvetica,sans-serif; font-size:16px\"><br></span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(0,0,0)\">Best regards,</span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Trebuchet MS&quot;,Verdana,Helvetica,sans-serif; font-size:16px\"><br></span></p><p class=\"text_content-cell content-padding-horizontal\" style=\"text-align:left; line-height:1.2; margin:0px\"><span style=\"font-family:&quot;Times New Roman&quot;,Times,serif; font-size:17px; color:rgb(0,0,0)\"><i>The Stanford Daily</i></span></p></td></tr></tbody></table></td></tr></tbody></table><div id=\"ms-outlook-mobile-signature\" dir=\"ltr\" style=\"color:inherit; background-color:inherit\"></div></body></html>"
+        },
+        "sender": {
+            "emailAddress": {
+                "name": "Natalie Anne Shell",
+                "address": "natalie1@stanford.edu"
+            }
+        },
+        "from": {
+            "emailAddress": {
+                "name": "Natalie Anne Shell",
+                "address": "natalie1@stanford.edu"
+            }
+        },
+        "toRecipients": [
+            {
+                "emailAddress": {
+                    "name": "win26_group24@outlook.com",
+                    "address": "win26_group24@outlook.com"
+                }
+            }
+        ],
+        "ccRecipients": [],
+        "bccRecipients": [],
+        "replyTo": [],
+        "flag": {
+            "flagStatus": "notFlagged"
+        }
+    },
+    {
+        "@odata.etag": "W/\"CQAAABYAAACyAPf8olJySaLpATimnwJaAAAGc36T\"",
+        "id": "AQMkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoARgAAA6v8dZveFHhFhRBnrLYojhAHALIA9-yiUnJJoukBOKafAloAAAIBDAAAALIA9-yiUnJJoukBOKafAloAAAAGdChaAAAA",
+        "createdDateTime": "2026-03-04T13:05:50Z",
+        "lastModifiedDateTime": "2026-03-04T13:05:52Z",
+        "changeKey": "CQAAABYAAACyAPf8olJySaLpATimnwJaAAAGc36T",
+        "categories": [],
+        "receivedDateTime": "2026-03-04T13:05:50Z",
+        "sentDateTime": "2026-03-04T13:05:45Z",
+        "hasAttachments": false,
+        "internetMessageId": "<PH0PR02MB7237947AC89D1762B0858C26FC7CA@PH0PR02MB7237.namprd02.prod.outlook.com>",
+        "subject": "Stanford Interview Prep ",
+        "bodyPreview": "Hi Natalie!\r\n\r\nI have my Stanford Interview on Friday, and I'm wondering if there are any suggestions that you have for what to talk about during the interview, specifically with regards to Stanford itself, like Stanford programs, community, culture, etc.",
+        "importance": "normal",
+        "parentFolderId": "AQMkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoALgAAA6v8dZveFHhFhRBnrLYojhABALIA9-yiUnJJoukBOKafAloAAAIBDAAAAA==",
+        "conversationId": "AQQkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoAEABkKEj9JQ5jQpAQFvAZXQHm",
+        "conversationIndex": "AQHcq9eKZChI/SUOY0KQEBbwGV0B5g==",
+        "isDeliveryReceiptRequested": null,
+        "isReadReceiptRequested": false,
+        "isRead": true,
+        "isDraft": false,
+        "webLink": "https://outlook.live.com/owa/?ItemID=AQMkADAwATNiZmYAZS1hYzNhLTRiYgA5LTAwAi0wMAoARgAAA6v8dZveFHhFhRBnrLYojhAHALIA9%2FyiUnJJoukBOKafAloAAAIBDAAAALIA9%2FyiUnJJoukBOKafAloAAAAGdChaAAAA&exvsurl=1&viewmodel=ReadMessageItem",
+        "inferenceClassification": "focused",
+        "body": {
+            "contentType": "html",
+            "content": "<html><head>\r\n<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body><div dir=\"ltr\" style=\"font-family:arial,sans-serif; font-size:16px; color:rgb(0,0,0)\">Hi Natalie!</div><div dir=\"ltr\" class=\"gmail_default\" style=\"text-align:left; text-indent:0px; font-family:arial,sans-serif; font-size:16px; color:rgb(0,0,0)\"><br></div><div dir=\"ltr\" class=\"gmail_default\" style=\"text-align:left; text-indent:0px; font-family:arial,sans-serif; font-size:16px; color:rgb(0,0,0)\">I have my Stanford Interview on Friday, and I'm wondering if there are any suggestions that you have for what to talk about during the interview, specifically with regards to Stanford itself, like Stanford programs, community, culture, etc.</div><div dir=\"ltr\" class=\"gmail_default\" style=\"text-align:left; text-indent:0px; font-family:arial,sans-serif; font-size:16px; color:rgb(0,0,0)\"><br></div><div dir=\"ltr\" class=\"gmail_default\" style=\"text-align:left; text-indent:0px; font-family:arial,sans-serif; font-size:16px; color:rgb(0,0,0)\">Are there any specific&nbsp;aspects of Stanford that you find make it unique, compared to other schools? What are some of your favorite experiences at Stanford? I would greatly appreciate any tips or suggestions that you have.</div><div dir=\"ltr\" class=\"gmail_default\" style=\"text-align:left; text-indent:0px; font-family:arial,sans-serif; font-size:16px; color:rgb(0,0,0)\"><br></div><div dir=\"ltr\" class=\"gmail_default\" style=\"text-align:left; text-indent:0px; font-family:arial,sans-serif; font-size:16px; color:rgb(0,0,0)\">Thank you so much!</div><div dir=\"ltr\" class=\"gmail_default\" style=\"text-align:left; text-indent:0px; font-family:arial,sans-serif; font-size:16px; color:rgb(0,0,0)\"><br></div><div dir=\"ltr\" class=\"gmail_default\" style=\"text-align:left; text-indent:0px; font-family:arial,sans-serif; font-size:16px; color:rgb(0,0,0)\">Warmest&nbsp;regards,</div><div style=\"font-family:arial,sans-serif; font-size:16px; color:rgb(0,0,0)\">Jane Doe&nbsp;</div><div id=\"ms-outlook-mobile-signature\" dir=\"ltr\" style=\"color:inherit; background-color:inherit\"></div></body></html>"
+        },
+        "sender": {
+            "emailAddress": {
+                "name": "Natalie Anne Shell",
+                "address": "natalie1@stanford.edu"
+            }
+        },
+        "from": {
+            "emailAddress": {
+                "name": "Natalie Anne Shell",
+                "address": "natalie1@stanford.edu"
+            }
+        },
+        "toRecipients": [
+            {
+                "emailAddress": {
+                    "name": "win26_group24@outlook.com",
+                    "address": "win26_group24@outlook.com"
+                }
+            }
+        ],
+        "ccRecipients": [],
+        "bccRecipients": [],
+        "replyTo": [],
+        "flag": {
+            "flagStatus": "notFlagged"
+        }
+    }
+]
