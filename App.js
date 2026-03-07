@@ -51,13 +51,13 @@ const PRIVACY_SETTINGS = [
   { id: 'encrypt', label: 'End-to-end encryption', desc: 'All synced data is encrypted at rest and in transit.', icon: '🔐', default: true, locked: true },
   { id: 'ssn', label: 'Block sensitive identifiers', desc: 'Automatically redact SSNs, credit cards, and ID numbers.', icon: '🛡️', default: true, locked: false },
   { id: 'health', label: 'Block personal health info', desc: 'Hide medical or health-related data from summaries.', icon: '🏥', default: false, locked: false },
-  // this one is interesting - we're protecting OTHER people's data too, not just the user's
+
   { id: 'counterpart', label: 'Respect counterpart privacy', desc: "Don't surface other people's private info in your context panel.", icon: '👥', default: true, locked: false },
   { id: 'multiphone', label: 'No cross-device data transfer', desc: 'Data stays on each device. No syncing between your phones.', icon: '📵', default: true, locked: false },
 ];
 
 // notification lead time options - 1 hour feels like the sweet spot default
-const NOTIF_TIMINGS = ['30 min', '1 hour', '3 hours', '1 day'];
+const NOTIF_TIMINGS = ['5 min', '30 min', '1 hour', '3 hours', '1 day'];
 
 // step names for the onboarding flow - order matters here
 const ONBOARDING_STEPS = ['welcome', 'connect', 'whitelist', 'privacy', 'notifications', 'done'];
@@ -65,7 +65,6 @@ const ONBOARDING_STEPS = ['welcome', 'connect', 'whitelist', 'privacy', 'notific
 // ─── Shared Components ────────────────────────────────────────────────────────
 
 // progress bar at the top - fills left to right as user moves through steps
-// not counting the 'done' screen as a step visually which feels right
 function ProgressBar({ step, total }) {
   return (
     <View style={s.progressBar}>
@@ -334,7 +333,7 @@ function NotificationsTab() {
         {unread.map(n => <Card key={n.id} n={n} />)}
       </>}
       {read.length > 0 && <>
-        <Text style={[s.groupLabel, { marginTop: 16 }]}>EARLIER</Text>
+        <Text style={[s.groupLabel, { marginTop: 16 }]}>READ</Text>
         {read.map(n => <Card key={n.id} n={n} />)}
       </>}
     </ScrollView>
@@ -512,7 +511,7 @@ function ThreadsTab() {
               <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>OPEN ITEMS</Text>
               {selected.openItems.map(item => (
                 <View key={item} style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginBottom: 8 }}>
-                  {/* dot bullet - simple and clean */}
+                  {/* dot bullet */}
                   <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: C.accent, marginTop: 6 }} />
                   <Text style={{ flex: 1, fontSize: 13, color: C.textPrimary, lineHeight: 20 }}>{item}</Text>
                 </View>
