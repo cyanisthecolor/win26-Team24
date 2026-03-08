@@ -290,10 +290,10 @@ function DoneScreen({ connectedCount, contactCount }) {
 }
 
 // ─── Dashboard: Notifications Tab ─────────────────────────────────────────────
-function NotificationsTab({ notifications, setNotifications, ingestMessages = [], ingestDates = [] }) {
+function NotificationsTab({ notifications, setNotifications, ingestMessages = [], ingestDates = [], isDeleted, onMoveToJunk }) {
   const notifs = notifications;
-  const unread = notifs.filter(n => !n.read);
-  const read = notifs.filter(n => n.read);
+  const unread = notifs.filter(n => !n.read && !isDeleted(`notif-${n.id}`));
+  const read = notifs.filter(n => n.read && !isDeleted(`notif-${n.id}`));
 
   const dateMessageIds = React.useMemo(() => {
     const ids = new Set();
@@ -315,13 +315,15 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
       .slice(0, 8)
       .map(m => ({
         id: `ing-msg-${m.id}`,
+        junkKey: `gmail-${m.id}`,
         title: (m.subject || 'Gmail Message').trim(),
         body: (m.snippet || '').trim(),
         source: 'Gmail',
         sourceIcon: '✉️',
         timestamp: m.sent_at_utc ? new Date(m.sent_at_utc).getTime() : Date.now(),
-      }));
-  }, [ingestMessages, dateMessageIds]);
+      }))
+      .filter(n => !isDeleted(n.junkKey));
+  }, [ingestMessages, dateMessageIds, isDeleted]);
 
   function markRead(id) { setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n)); }
   function markAll() { setNotifications(p => p.map(n => ({ ...n, read: true }))); }
@@ -335,6 +337,9 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
             <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
               <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
               {!n.read && <View style={s.unreadDot} />}
+              <TouchableOpacity onPress={() => onMoveToJunk({ key: `notif-${n.id}`, from: 'Inbox', title: n.title, subtitle: n.body, timestamp: n.timestamp })}>
+                <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
+              </TouchableOpacity>
             </View>
             <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }} numberOfLines={2}>{n.body}</Text>
             <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>
@@ -378,7 +383,12 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
             <View style={{ flexDirection: 'row', gap: 12 }}>
               <View style={s.notifBubble}><Text style={{ fontSize: 18 }}>{n.sourceIcon}</Text></View>
               <View style={{ flex: 1 }}>
-                <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
+                  <TouchableOpacity onPress={() => onMoveToJunk({ key: n.junkKey, from: 'Inbox', title: n.title, subtitle: n.body, timestamp: n.timestamp })}>
+                    <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
+                  </TouchableOpacity>
+                </View>
                 {!!n.body && <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20, marginTop: 4 }} numberOfLines={2}>{n.body}</Text>}
                 <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>{n.source} · {timeAgo(n.timestamp)}</Text>
               </View>
@@ -391,14 +401,14 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
 }
 
 // ─── Dashboard: Calendar Tab ──────────────────────────────────────────────────
-function CalendarTab({ ingestDates = [], ingestMessages = [] }) {
+function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveToJunk }) {
   const [selected, setSelected] = useState(null);
 
   const msgById = React.useMemo(() => {
     const m = {};
     (ingestMessages || []).forEach(msg => { m[msg.id] = msg; });
     return m;
-  }, [ingestMessages]);
+  }, [ingestMessages, isDeleted]);
 
   const seenByMessage = new Set();
   const ingestEvents = (ingestDates || [])
@@ -424,6 +434,7 @@ function CalendarTab({ ingestDates = [], ingestMessages = [] }) {
 
       return {
         id: `ing-${d.id}`,
+        junkKey: `cal-${d.id}`,
         title,
         date: dateStr,
         time: timeStr,
@@ -437,7 +448,7 @@ function CalendarTab({ ingestDates = [], ingestMessages = [] }) {
     })
     .filter(Boolean);
 
-  const grouped = [...ingestEvents].reduce((acc, e) => {
+  const grouped = [...ingestEvents.filter(e => !isDeleted(e.junkKey))].reduce((acc, e) => {
     if (!acc[e.date]) acc[e.date] = [];
     acc[e.date].push(e);
     return acc;
@@ -476,7 +487,12 @@ function CalendarTab({ ingestDates = [], ingestMessages = [] }) {
                   ))}
                 </View>
               </View>
-              <Text style={{ fontSize: 18 }}>{e.sourceIcon}</Text>
+              <View style={{ alignItems: 'center', gap: 8 }}>
+                <Text style={{ fontSize: 18 }}>{e.sourceIcon}</Text>
+                <TouchableOpacity onPress={() => onMoveToJunk({ key: e.junkKey, from: 'Calendar', title: e.title, subtitle: e.notes, timestamp: Date.now() })}>
+                  <Text style={{ color: C.textMuted, fontSize: 18, fontWeight: '700' }}>×</Text>
+                </TouchableOpacity>
+              </View>
             </TouchableOpacity>
           ))}
         </View>
@@ -524,9 +540,9 @@ function CalendarTab({ ingestDates = [], ingestMessages = [] }) {
 }
 
 // ─── Dashboard: TODO Tab (links & attachments) ───────────────────────────────
-function TodoTab({ ingestLinks = [], ingestAttachments = [] }) {
-  const links = ingestLinks.slice(0, 3);
-  const attachments = ingestAttachments.slice(0, 20);
+function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveToJunk }) {
+  const links = ingestLinks.filter(l => !isDeleted(`link-${l.id}`)).slice(0, 3);
+  const attachments = ingestAttachments.filter(a => !isDeleted(`att-${a.id}`)).slice(0, 20);
   const openLink = (url) => {
     const target = url?.startsWith('http') ? url : `http://${url}`;
     Linking.openURL(target).catch(() => Alert.alert('Unable to open link', target));
@@ -551,7 +567,12 @@ function TodoTab({ ingestLinks = [], ingestAttachments = [] }) {
         return (
         <TouchableOpacity key={`l-${l.id}`} style={s.notifCard} activeOpacity={0.8} onPress={() => openLink(l.url)}>
           <View style={{ flex: 1 }}>
-            <Text style={s.notifTitle} numberOfLines={1}>{friendly}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <Text style={s.notifTitle} numberOfLines={1}>{friendly}</Text>
+              <TouchableOpacity onPress={() => onMoveToJunk({ key: `link-${l.id}`, from: 'Links & Attachments', title: friendly, subtitle: l.url, timestamp: Date.now() })}>
+                <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
+              </TouchableOpacity>
+            </View>
             <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }} numberOfLines={1}>{l.url}</Text>
           </View>
         </TouchableOpacity>
@@ -563,7 +584,12 @@ function TodoTab({ ingestLinks = [], ingestAttachments = [] }) {
       {attachments.map(a => (
         <TouchableOpacity key={`a-${a.id}`} style={s.notifCard} activeOpacity={0.8} onPress={() => openAttachment(a)}>
           <View style={{ flex: 1 }}>
-            <Text style={s.notifTitle} numberOfLines={1}>{a.filename || 'Attachment'}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <Text style={s.notifTitle} numberOfLines={1}>{a.filename || 'Attachment'}</Text>
+              <TouchableOpacity onPress={() => onMoveToJunk({ key: `att-${a.id}`, from: 'Links & Attachments', title: a.filename || 'Attachment', subtitle: a.mime_type || '', timestamp: Date.now() })}>
+                <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
+              </TouchableOpacity>
+            </View>
             <Text style={{ fontSize: 12, color: C.textSecondary }} numberOfLines={1}>{a.mime_type || ''}</Text>
             <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>Msg {a.message_id}</Text>
           </View>
@@ -575,7 +601,7 @@ function TodoTab({ ingestLinks = [], ingestAttachments = [] }) {
 }
 
 // ─── Dashboard: Threads Tab ───────────────────────────────────────────────────
-function ThreadsTab({ ingestMessages = [] }) {
+function ThreadsTab({ ingestMessages = [], isDeleted, onMoveToJunk }) {
   const [selected, setSelected] = useState(null);
 
   const threads = React.useMemo(() => {
@@ -617,7 +643,7 @@ function ThreadsTab({ ingestMessages = [] }) {
       });
     });
 
-    return out.sort((a, b) => b.timestamp - a.timestamp);
+    return out.sort((a, b) => b.timestamp - a.timestamp).filter(t => !isDeleted(`thread-${t.id}`));
   }, [ingestMessages]);
 
   return (
@@ -650,6 +676,9 @@ function ThreadsTab({ ingestMessages = [] }) {
               </View>
             </View>
           </View>
+          <TouchableOpacity onPress={() => onMoveToJunk({ key: `thread-${t.id}`, from: 'Threads', title: t.contact, subtitle: t.latestSubject, timestamp: t.timestamp })}>
+            <Text style={{ color: C.textMuted, fontSize: 18, fontWeight: '700' }}>×</Text>
+          </TouchableOpacity>
         </TouchableOpacity>
       ))}
 
@@ -687,18 +716,52 @@ function ThreadsTab({ ingestMessages = [] }) {
   );
 }
 
+function JunkTab({ deletedItems = [] }) {
+  return (
+    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
+      <View style={s.dashHeader}>
+        <View>
+          <Text style={s.dashTitle}>Junk</Text>
+          <Text style={s.dashSubtitle}>{deletedItems.length} deleted items</Text>
+        </View>
+      </View>
+      {deletedItems.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13 }}>Nothing deleted yet.</Text>}
+      {deletedItems.map(item => (
+        <View key={item.key} style={s.notifCard}>
+          <Text style={s.notifTitle} numberOfLines={1}>{item.title}</Text>
+          {!!item.subtitle && <Text style={{ fontSize: 12, color: C.textSecondary, marginTop: 4 }} numberOfLines={2}>{item.subtitle}</Text>}
+          <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>{item.from} · {timeAgo(item.timestamp || item.deletedAt)}</Text>
+        </View>
+      ))}
+    </ScrollView>
+  );
+}
+
 // ─── Dashboard Shell ──────────────────────────────────────────────────────────
 const TABS = [
   { key: 'notifications', label: 'Inbox', icon: '🔔' },
   { key: 'threads', label: 'Threads', icon: '🧵' },
   { key: 'calendar', label: 'Calendar', icon: '📅' },
   { key: 'todo', label: 'Links & Attachments', icon: '📌' },
+  { key: 'junk', label: 'Junk', icon: '🗑️' },
 ];
 
 function Dashboard({ ingestData }) {
   const [notifItems, setNotifItems] = useState(DATA.notifications);
+  const [deletedMap, setDeletedMap] = useState({});
+  const [deletedItems, setDeletedItems] = useState([]);
   const [tab, setTab] = useState('notifications');
   const unreadCount = notifItems.filter(n => !n.read).length;
+
+  const isDeleted = (key) => !!deletedMap[key];
+  const onMoveToJunk = (item) => {
+    if (!item?.key) return;
+    setDeletedMap(prev => (prev[item.key] ? prev : { ...prev, [item.key]: true }));
+    setDeletedItems(prev => (prev.some(i => i.key === item.key)
+      ? prev
+      : [{ ...item, deletedAt: Date.now() }, ...prev]));
+  };
+
   return (
     <SafeAreaView style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
@@ -709,11 +772,14 @@ function Dashboard({ ingestData }) {
             setNotifications={setNotifItems}
             ingestMessages={ingestData.messages}
             ingestDates={ingestData.dates}
+            isDeleted={isDeleted}
+            onMoveToJunk={onMoveToJunk}
           />
         )}
-        {tab === 'threads' && <ThreadsTab ingestMessages={ingestData.messages} />}
-        {tab === 'calendar' && <CalendarTab ingestDates={ingestData.dates} ingestMessages={ingestData.messages} />}
-        {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} />}
+        {tab === 'threads' && <ThreadsTab ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
+        {tab === 'calendar' && <CalendarTab ingestDates={ingestData.dates} ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
+        {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
+        {tab === 'junk' && <JunkTab deletedItems={deletedItems} />}
       </View>
       <View style={s.tabBar}>
         {TABS.map(t => {
