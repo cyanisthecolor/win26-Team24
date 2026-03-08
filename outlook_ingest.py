@@ -1,89 +1,47 @@
-"""Simple Outlook ingestion script
-
-This module fetches messages from a Microsoft Outlook inbox via the Graph
-API, classifies each message into one of four categories, and writes the
-non-spam results into the same SQLite database that the Gmail ingestion
-code uses.
-
-The categories are:
-
-  * Work
-  * Social
-  * Opportunity / Invite
-  * Spam (discarded)
-
-"""
-
 import os
+import openai
 import sqlite3
 import requests
 import json
 import argparse
 import sys
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-# bring in OpenAI summarization helper if available (summarize_inbox already sets the key)
-try:
-    from summarize_inbox import _call_openai_with_instruction  # type: ignore
-except ImportError:
-    _call_openai_with_instruction = None  # not required for basic ingestion
+from outlook_manager import ACCESS_TOKEN  
+from outlook_manager import API_KEY 
+
+openai.api_key = API_KEY
+_call_openai_with_instruction = None
 
 # for classification of individual messages
-
-def classify_message(subject: str, body: str) -> Dict[str, str]:
+def classify_message(subject: str, body: str, model: str = 'gpt-4o-mini') -> Dict[str, str]:
     """Use OpenAI to classify a single email into priority/category/phrase/description."""
-    if not _call_openai_with_instruction:
-        return {"priority": "LOW", "category": "WORK", "phrase": subject or "", "description": body[:150]}
-    prompt = (
+    system = (
         "Provide a JSON object with keys: 'priority' (HIGH, MEDIUM, LOW), "
         "'category' (WORK, SOCIAL, OPPORTUNITY, SPAM), 'phrase' (short summary), "
         "and 'description' (one sentence explaining the email). \n" 
-        f"Subject: {subject}\nBody: {body}\n"
         "Return only the JSON."
     )
+
+    user = "Subject: {subject}\nBody: {body}\n".format(subject=subject, body=body)
+
     try:
-        resp = _call_openai_with_instruction(prompt, "", model='gpt-4o-mini')
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.1,
+            max_tokens=400,
+        )
+        resp = resp['choices'][0]['message']['content'].strip()
         return json.loads(resp)
     except Exception:
         return {"priority": "LOW", "category": "WORK", "phrase": subject or "", "description": body[:150]}
 
-try:
-    from outlook_manager import ACCESS_TOKEN  
-    from outlook_manager import API_KEY  
-except Exception:  # pragma: no cover
-    ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
-    API_KEY = os.getenv("API_KEY")
 GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/messages"
-
-
-# classification -----------------------------------------------------------
-
-def categorize_email(subject: str, sender: str, body: str) -> str:
-    """Return one of the four categories for a message.
-
-    A very simple heuristic is used; it is expected that a real system would
-    be much smarter (machine learning, manual rules, etc.).  The only
-    important requirement for this exercise is that spam messages are
-    detected so they can be dropped.
-    """
-
-    text = " ".join([subject or "", sender or "", body or ""]).lower()
-
-    if any(word in text for word in ["unsubscribe", "sale", "buy now", "free", "newsletter"]):
-        return "Spam"
-
-    if any(word in text for word in ["invite", "opportunity", "offer", "webinar", "meeting"]):
-        return "Opportunity / Invite"
-
-    if any(word in text for word in ["facebook", "twitter", "instagram", "linkedin", "social"]):
-        return "Social"
-
-    # everything else defaults to work
-    return "Work"
-
-
-# helpers
 
 
 def _ensure_category_column(conn: sqlite3.Connection) -> None:
@@ -93,7 +51,7 @@ def _ensure_category_column(conn: sqlite3.Connection) -> None:
     try:
         conn.execute("ALTER TABLE messages ADD COLUMN category TEXT")
         conn.commit()
-    except sqlite3.OperationalError as exc:  # column already exists
+    except sqlite3.OperationalError as exc:
         if "duplicate column name" in str(exc).lower():
             return
         raise
@@ -133,8 +91,7 @@ def _fetch_all_messages() -> List[Dict]:
 
 # ingestion
 
-
-def ingest_all(db_path: str = "extracted.db", quiet: bool = False) -> None:
+def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quiet: bool = False) -> None:
     """Fetch every mail message, classify it and insert into the database.
 
     Spam messages are skipped; everything else is stored in the shared
@@ -164,11 +121,11 @@ def ingest_all(db_path: str = "extracted.db", quiet: bool = False) -> None:
                 category TEXT
             )
         """)
-        # ensure category column exists
+
         try:
             conn.execute("ALTER TABLE messages ADD COLUMN category TEXT")
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass 
         
         if not quiet:
             print("fetching messages from Outlook...")
@@ -176,64 +133,84 @@ def ingest_all(db_path: str = "extracted.db", quiet: bool = False) -> None:
         if not quiet:
             print(f"retrieved {len(messages)} messages")
 
+        json_items = []
+
         for msg in messages:
             subj = msg.get("subject", "")
             sender = msg.get("from", {}).get("emailAddress", {}).get("address", "")
+            sender_obj = msg.get("from", {}).get("emailAddress", {})
+            sender_name = sender_obj.get("name", "Unknown")
             body = msg.get("body", {}).get("content", "")
-            category = categorize_email(subj, sender, body)
-            if category == "Spam":
+            read_status = msg.get("isRead", False)
+            ai_summary = classify_message(subj, body)
+
+
+            if ai_summary["category"] == "Spam":
                 continue
 
             thread_key = msg.get("conversationId") or msg.get("id")
-            
-            # ensure conversation exists
-            try:
-                cursor = conn.execute(
-                    "INSERT INTO conversations (source, thread_key, display_name) VALUES (?, ?, ?)",
-                    ("outlook", thread_key, subj)
-                )
-                conv_id = cursor.lastrowid
-            except sqlite3.IntegrityError:
-                conv_id = conn.execute(
-                    "SELECT id FROM conversations WHERE source = ? AND thread_key = ?",
-                    ("outlook", thread_key)
-                ).fetchone()[0]
+
+            cursor = conn.execute(
+                "INSERT INTO conversations (source, thread_key, display_name) VALUES (?, ?, ?)",
+                ("outlook", thread_key, subj)
+            )
+            conv_id = cursor.lastrowid
+
 
             sent_at_utc = msg.get("sentDateTime") or msg.get("receivedDateTime")
 
-            try:
-                rowid = int(datetime.fromisoformat(sent_at_utc.rstrip("Z")).timestamp())
-            except Exception:
-                rowid = 0
+            rowid = int(datetime.fromisoformat(sent_at_utc.rstrip("Z")).timestamp())
 
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO messages
-                    (source, source_msg_key, source_rowid, conversation_id,
-                     sender, is_from_me, sent_at_utc, text, category)
-                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
-                """,
-                (
-                    "outlook",
-                    msg.get("id"),
-                    rowid,
-                    conv_id,
-                    sender,
+            new_id = f"todo_{cursor.lastrowid}"
+
+            if json_path:
+                json_entry = {
+                    "id": new_id,
+                    "title": (ai_summary["phrase"][:57] + "...") if len(ai_summary["phrase"]) > 60 else ai_summary["phrase"],
+                    "phrase": f"{ai_summary['phrase']} ({sender_name})",
+                    "description": ai_summary["description"],
+                    "body": f"From {sender_name}: {ai_summary['description']}",
+                    "date": sent_at_utc[:10] if sent_at_utc else "",
+                    "timestamp": sent_at_utc,
+                    "notes": f"From: {sender_name} | Subject: {subj}",
+                    "source": "Outlook",
+                    "sourceIcon": "📧",
+                    "priority": ai_summary["priority"].upper(),
+                    "category": ai_summary["category"].upper(),
+                    "read": read_status
+                }
+                json_items.append(json_entry)
+
+            conn.execute("""
+                    INSERT INTO messages (
+                        source, source_msg_key, conversation_id, sender, 
+                        sent_at_utc, text, category, priority, summary_phrase, description
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    "outlook", 
+                    msg.get("id"), 
+                    conv_id, 
+                    sender, 
                     sent_at_utc,
-                    body,
-                    category,
-                ),
-            )
+                    body, 
+                    ai_summary["category"], 
+                    ai_summary["priority"], 
+                    ai_summary["phrase"], 
+                    ai_summary["description"]
+                ))
 
         conn.commit()
         conn.close()
+
+        if json_path:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump({"notifications": json_items}, f, indent=2)
+
         if not quiet:
             print("ingestion complete")
     except Exception as e:
         if not quiet:
             print(f"ingest_all error: {e}", file=sys.stderr)
-
-
 
 def _export_threads_to_datafile(messages: List[Dict], data_path: str = "mobile_gmail/data.json") -> None:
     """Replace the `threads` key in a local JSON file with a simplified
@@ -318,6 +295,8 @@ if __name__ == "__main__":
     try:
         if args.token:
             ACCESS_TOKEN = args.token
+        
+        print(ACCESS_TOKEN)
         # Fetch only inbox emails
         headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
         inbox_url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
