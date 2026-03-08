@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
   conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
   sender TEXT,
+  sender_name TEXT,
   is_from_me INTEGER NOT NULL,
   sent_at_utc TEXT NOT NULL,
   text TEXT,

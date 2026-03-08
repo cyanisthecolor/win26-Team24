@@ -1,8 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView,
-  Switch, TextInput, Animated, StatusBar, Modal, Alert, Linking,
+  Switch, TextInput, Animated, StatusBar, Modal, Alert, Linking, Platform,
 } from 'react-native';
+import Constants from 'expo-constants';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 const C = {
@@ -64,6 +65,9 @@ const DATA = {
   ],
 };
 
+// Set this to your backend URL if auto-detection fails (e.g., real device on LAN)
+const BASE_URL_OVERRIDE = '';
+
 const NOTIF_TIMINGS = ['30 min', '1 hour', '3 hours', '1 day'];
 const ONBOARDING_STEPS = ['welcome', 'connect', 'whitelist', 'privacy', 'notifications', 'done'];
 
@@ -94,6 +98,16 @@ function priorityBg(p) {
   if (p === 'high') return '#2C0F17';
   if (p === 'medium') return '#2B2810';
   return C.surfaceAlt;
+}
+
+function getBaseUrl() {
+  if (BASE_URL_OVERRIDE) return BASE_URL_OVERRIDE;
+  // Prefer Expo host when available (useful for real devices on LAN)
+  const host = Constants.expoConfig?.hostUri?.split(':')[0] || Constants.expoGoConfig?.debuggerHost?.split(':')[0];
+  if (host) return `http://${host}:5001`;
+  // Emulators and local dev fallbacks
+  if (Platform.OS === 'android') return 'http://10.0.2.2:5001';
+  return 'http://localhost:5001';
 }
 
 // ─── Shared Components ────────────────────────────────────────────────────────
@@ -276,13 +290,41 @@ function DoneScreen({ connectedCount, contactCount }) {
 }
 
 // ─── Dashboard: Notifications Tab ─────────────────────────────────────────────
-function NotificationsTab() {
-  const [notifs, setNotifs] = useState(DATA.notifications);
+function NotificationsTab({ notifications, setNotifications, ingestMessages = [], ingestDates = [] }) {
+  const notifs = notifications;
   const unread = notifs.filter(n => !n.read);
   const read = notifs.filter(n => n.read);
 
-  function markRead(id) { setNotifs(p => p.map(n => n.id === id ? { ...n, read: true } : n)); }
-  function markAll() { setNotifs(p => p.map(n => ({ ...n, read: true }))); }
+  const dateMessageIds = React.useMemo(() => {
+    const ids = new Set();
+    (ingestDates || []).forEach(d => {
+      if (d?.message_id) ids.add(d.message_id);
+    });
+    return ids;
+  }, [ingestDates]);
+
+  const inboxFromGmail = React.useMemo(() => {
+    const actionRe = /(verify your device|security alert|action required|please verify|confirm|password|login|sign-in|urgent)/i;
+    return (ingestMessages || [])
+      .filter(m => {
+        const subject = `${m?.subject || ''}`;
+        const snippet = `${m?.snippet || ''}`;
+        const isActionLike = actionRe.test(subject) || actionRe.test(snippet);
+        return !dateMessageIds.has(m?.id) || isActionLike;
+      })
+      .slice(0, 8)
+      .map(m => ({
+        id: `ing-msg-${m.id}`,
+        title: (m.subject || 'Gmail Message').trim(),
+        body: (m.snippet || '').trim(),
+        source: 'Gmail',
+        sourceIcon: '✉️',
+        timestamp: m.sent_at_utc ? new Date(m.sent_at_utc).getTime() : Date.now(),
+      }));
+  }, [ingestMessages, dateMessageIds]);
+
+  function markRead(id) { setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n)); }
+  function markAll() { setNotifications(p => p.map(n => ({ ...n, read: true }))); }
 
   function Card({ n }) {
     return (
@@ -312,7 +354,7 @@ function NotificationsTab() {
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Notifications</Text>
-          <Text style={s.dashSubtitle}>{unread.length} unread · {notifs.length} total</Text>
+          <Text style={s.dashSubtitle}>{unread.length} unread · {notifs.length + inboxFromGmail.length} total</Text>
         </View>
         {unread.length > 0 && (
           <TouchableOpacity onPress={markAll} style={s.markAllBtn}>
@@ -328,61 +370,98 @@ function NotificationsTab() {
         <Text style={[s.groupLabel, { marginTop: 16 }]}>EARLIER</Text>
         {read.map(n => <Card key={n.id} n={n} />)}
       </>}
+
+      {inboxFromGmail.length > 0 && <>
+        <Text style={[s.groupLabel, { marginTop: 16 }]}>FROM GMAIL</Text>
+        {inboxFromGmail.map(n => (
+          <View key={n.id} style={s.notifCard}>
+            <View style={{ flexDirection: 'row', gap: 12 }}>
+              <View style={s.notifBubble}><Text style={{ fontSize: 18 }}>{n.sourceIcon}</Text></View>
+              <View style={{ flex: 1 }}>
+                <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
+                {!!n.body && <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20, marginTop: 4 }} numberOfLines={2}>{n.body}</Text>}
+                <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>{n.source} · {timeAgo(n.timestamp)}</Text>
+              </View>
+            </View>
+          </View>
+        ))}
+      </>}
     </ScrollView>
   );
 }
 
 // ─── Dashboard: Calendar Tab ──────────────────────────────────────────────────
-function CalendarTab({ ingestDates = [] }) {
+function CalendarTab({ ingestDates = [], ingestMessages = [] }) {
   const [selected, setSelected] = useState(null);
 
-  const ingestEvents = ingestDates
-    .filter(d => {
-      const raw = `${d.raw_span || ''}`.toLowerCase();
-      const iso = d.resolved_date || d.parsed_at_utc || '';
-      // Drop noisy relative dates like "tomorrow" and the unwanted Feb 22 entries
-      if (raw.includes('tomorrow')) return false;
-      if (iso.startsWith('2026-02-22')) return false;
-      return true;
-    })
-    .map(d => {
-    const iso = d.resolved_date || d.parsed_at_utc || '';
-    const dt = iso ? new Date(iso) : null;
-    const dateStr = dt ? dt.toISOString().slice(0, 10) : 'Unknown date';
-    const timeStr = dt ? dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : '';
-    return {
-      id: `ing-${d.id}`,
-      title: d.raw_span,
-      date: dateStr,
-      time: timeStr,
-      duration: null,
-      attendees: [],
-      source: 'Gmail',
-      sourceIcon: '✉️',
-      videoLink: null,
-      notes: `From message ${d.message_id}`,
-    };
-  });
+  const msgById = React.useMemo(() => {
+    const m = {};
+    (ingestMessages || []).forEach(msg => { m[msg.id] = msg; });
+    return m;
+  }, [ingestMessages]);
 
-  const grouped = [...DATA.events, ...ingestEvents].reduce((acc, e) => {
+  const seenByMessage = new Set();
+  const ingestEvents = (ingestDates || [])
+    .filter(d => d && (d.resolved_date || d.parsed_at_utc))
+    .map(d => {
+      // Enforce one event per message_id; always use resolved_date when present.
+      if (!d.message_id || seenByMessage.has(d.message_id)) return null;
+      seenByMessage.add(d.message_id);
+
+      const isoRaw = d.resolved_date || d.parsed_at_utc || '';
+      const dt = new Date(isoRaw);
+      const dateStr = Number.isNaN(dt.getTime())
+        ? (isoRaw.includes('T') ? isoRaw.split('T')[0] : isoRaw.slice(0, 10))
+        : dt.toISOString().slice(0, 10);
+      const timeStr = Number.isNaN(dt.getTime())
+        ? ''
+        : dt.toISOString().slice(11, 16);
+
+      const msg = msgById[d.message_id];
+      const title = (msg?.subject && msg.subject.trim()) || (msg?.snippet && msg.snippet.trim()) || (d.raw_span && d.raw_span.trim()) || 'Event';
+      const rawNote = d.raw_span && d.raw_span.trim();
+      const note = (msg?.snippet && msg.snippet.trim()) || rawNote || `From message ${d.message_id}`;
+
+      return {
+        id: `ing-${d.id}`,
+        title,
+        date: dateStr,
+        time: timeStr,
+        duration: null,
+        attendees: [],
+        source: 'Gmail',
+        sourceIcon: '✉️',
+        videoLink: null,
+        notes: note,
+      };
+    })
+    .filter(Boolean);
+
+  const grouped = [...ingestEvents].reduce((acc, e) => {
     if (!acc[e.date]) acc[e.date] = [];
     acc[e.date].push(e);
     return acc;
   }, {});
+
+  const sortedDates = Object.keys(grouped).sort((a, b) => new Date(b) - new Date(a));
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Calendar</Text>
-          <Text style={s.dashSubtitle}>{DATA.events.length} upcoming events</Text>
+          <Text style={s.dashSubtitle}>{ingestEvents.length} events from extracted dates</Text>
         </View>
       </View>
 
-      {Object.entries(grouped).map(([date, events]) => (
+      {ingestEvents.length === 0 && (
+        <Text style={{ color: C.textMuted, fontSize: 13, marginBottom: 12 }}>No extracted dates yet.</Text>
+      )}
+
+      {sortedDates.map(date => (
         <View key={date} style={{ marginBottom: 6 }}>
           <Text style={s.calDateLabel}>{formatDate(date)}</Text>
-          {events.map(e => (
+          {grouped[date].map(e => (
             <TouchableOpacity key={e.id} style={s.eventCard} onPress={() => setSelected(e)} activeOpacity={0.8}>
               <View style={{ width: 56, alignItems: 'flex-end' }}>
                 <Text style={{ fontSize: 12, fontWeight: '700', color: C.textPrimary }}>{e.time}</Text>
@@ -460,21 +539,24 @@ function TodoTab({ ingestLinks = [], ingestAttachments = [] }) {
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
       <View style={s.dashHeader}>
         <View>
-          <Text style={s.dashTitle}>TODO</Text>
+          <Text style={s.dashTitle}>Links & Attachments</Text>
           <Text style={s.dashSubtitle}>{links.length} links · {attachments.length} attachments</Text>
         </View>
       </View>
 
       <Text style={s.groupLabel}>Links</Text>
       {links.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13, marginBottom: 12 }}>No links yet.</Text>}
-      {links.map(l => (
+      {links.map((l, idx) => {
+        const friendly = ['Williams Sonoma Main Website', 'Williams Sonoma User Pravacy', 'Williams Sonoma Email Option'][idx] || l.url;
+        return (
         <TouchableOpacity key={`l-${l.id}`} style={s.notifCard} activeOpacity={0.8} onPress={() => openLink(l.url)}>
           <View style={{ flex: 1 }}>
-            <Text style={s.notifTitle} numberOfLines={1}>{l.url}</Text>
-            <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>Msg {l.message_id}</Text>
+            <Text style={s.notifTitle} numberOfLines={1}>{friendly}</Text>
+            <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }} numberOfLines={1}>{l.url}</Text>
           </View>
         </TouchableOpacity>
-      ))}
+        );
+      })}
 
       <Text style={[s.groupLabel, { marginTop: 16 }]}>Attachments</Text>
       {attachments.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13 }}>No attachments yet.</Text>}
@@ -493,42 +575,81 @@ function TodoTab({ ingestLinks = [], ingestAttachments = [] }) {
 }
 
 // ─── Dashboard: Threads Tab ───────────────────────────────────────────────────
-function ThreadsTab() {
+function ThreadsTab({ ingestMessages = [] }) {
   const [selected, setSelected] = useState(null);
+
+  const threads = React.useMemo(() => {
+    const bySender = new Map();
+
+    (ingestMessages || []).forEach((msg) => {
+      const rawSender = `${msg?.sender_name || msg?.sender || ''}`.trim();
+      let sender = rawSender;
+      if (!sender) sender = 'Unknown Sender';
+      if (sender.includes('<')) sender = sender.split('<')[0].trim() || sender;
+
+      const ts = msg?.sent_at_utc ? new Date(msg.sent_at_utc).getTime() : 0;
+      const item = {
+        id: msg.id,
+        subject: msg.subject || 'No subject',
+        snippet: msg.snippet || '',
+        sentAt: msg.sent_at_utc || null,
+        ts,
+      };
+
+      if (!bySender.has(sender)) bySender.set(sender, []);
+      bySender.get(sender).push(item);
+    });
+
+    const out = [];
+    bySender.forEach((items, sender) => {
+      const sorted = items.sort((a, b) => b.ts - a.ts);
+      const latest = sorted[0];
+      out.push({
+        id: `th-${sender}`,
+        contact: sender,
+        source: 'Gmail',
+        sourceIcon: '✉️',
+        timestamp: latest?.ts || 0,
+        latestSubject: latest?.subject || 'No subject',
+        latestSnippet: latest?.snippet || '',
+        count: sorted.length,
+        messages: sorted,
+      });
+    });
+
+    return out.sort((a, b) => b.timestamp - a.timestamp);
+  }, [ingestMessages]);
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Threads</Text>
-          <Text style={s.dashSubtitle}>{DATA.threads.filter(t => t.unread > 0).length} need attention</Text>
+          <Text style={s.dashSubtitle}>{threads.length} senders grouped by latest email</Text>
         </View>
       </View>
 
-      {DATA.threads.map(t => (
+      {threads.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13 }}>No threads yet.</Text>}
+
+      {threads.map(t => (
         <TouchableOpacity key={t.id} style={s.threadCard} onPress={() => setSelected(t)} activeOpacity={0.8}>
-          <View style={[s.avatar, { backgroundColor: t.avatarColor }]}>
-            <Text style={{ fontSize: 16, fontWeight: '800', color: '#fff' }}>{t.avatar}</Text>
+          <View style={[s.avatar, { backgroundColor: '#334155' }]}> 
+            <Text style={{ fontSize: 16, fontWeight: '800', color: '#fff' }}>{(t.contact || '?').slice(0, 1).toUpperCase()}</Text>
           </View>
           <View style={{ flex: 1, marginLeft: 12 }}>
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
               <Text style={{ fontSize: 15, fontWeight: '700', color: C.textPrimary }}>{t.contact}</Text>
               <Text style={{ fontSize: 11, color: C.textMuted }}>{timeAgo(t.timestamp)}</Text>
             </View>
-            <Text style={{ fontSize: 13, color: C.textSecondary }} numberOfLines={1}>{t.lastMessage}</Text>
+            <Text style={{ fontSize: 13, color: C.textSecondary }} numberOfLines={1}>{t.latestSubject}</Text>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 6 }}>
               <Text style={{ fontSize: 12 }}>{t.sourceIcon}</Text>
               <Text style={{ fontSize: 11, color: C.textMuted }}>{t.source}</Text>
-              {t.openItems.length > 0 && (
-                <View style={s.openBadge}>
-                  <Text style={{ fontSize: 10, color: C.yellow, fontWeight: '700' }}>{t.openItems.length} open</Text>
-                </View>
-              )}
+              <View style={s.openBadge}>
+                <Text style={{ fontSize: 10, color: C.yellow, fontWeight: '700' }}>{t.count} msgs</Text>
+              </View>
             </View>
           </View>
-          {t.unread > 0 && (
-            <View style={s.unreadBadge}><Text style={{ fontSize: 11, color: '#fff', fontWeight: '800' }}>{t.unread}</Text></View>
-          )}
         </TouchableOpacity>
       ))}
 
@@ -538,8 +659,8 @@ function ThreadsTab() {
             {selected && <>
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-                  <View style={[s.avatar, { backgroundColor: selected.avatarColor }]}>
-                    <Text style={{ fontSize: 16, fontWeight: '800', color: '#fff' }}>{selected.avatar}</Text>
+                  <View style={[s.avatar, { backgroundColor: '#334155' }]}> 
+                    <Text style={{ fontSize: 16, fontWeight: '800', color: '#fff' }}>{(selected.contact || '?').slice(0, 1).toUpperCase()}</Text>
                   </View>
                   <View>
                     <Text style={s.modalTitle}>{selected.contact}</Text>
@@ -550,22 +671,12 @@ function ThreadsTab() {
                   <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
                 </TouchableOpacity>
               </View>
-              <View style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12, marginBottom: 14 }}>
-                <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 6 }}>SUMMARY</Text>
-                <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>{selected.summary}</Text>
-              </View>
-              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>OPEN ITEMS</Text>
-              {selected.openItems.map(item => (
-                <View key={item} style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginBottom: 8 }}>
-                  <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: C.accent, marginTop: 6 }} />
-                  <Text style={{ flex: 1, fontSize: 13, color: C.textPrimary, lineHeight: 20 }}>{item}</Text>
-                </View>
-              ))}
-              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginTop: 14, marginBottom: 8 }}>RELATED DATES</Text>
-              {selected.relatedDates.map(d => (
-                <View key={d} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <Text style={{ fontSize: 14 }}>📅</Text>
-                  <Text style={{ fontSize: 13, color: C.textSecondary }}>{d}</Text>
+              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>RECENT EMAILS</Text>
+              {selected.messages.slice(0, 8).map(m => (
+                <View key={`m-${m.id}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8 }}>
+                  <Text style={{ fontSize: 13, color: C.textPrimary, fontWeight: '700' }} numberOfLines={1}>{m.subject}</Text>
+                  {!!m.snippet && <Text style={{ fontSize: 12, color: C.textSecondary, marginTop: 4 }} numberOfLines={2}>{m.snippet}</Text>}
+                  <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>{m.sentAt ? new Date(m.sentAt).toLocaleString() : ''}</Text>
                 </View>
               ))}
             </>}
@@ -579,19 +690,29 @@ function ThreadsTab() {
 // ─── Dashboard Shell ──────────────────────────────────────────────────────────
 const TABS = [
   { key: 'notifications', label: 'Inbox', icon: '🔔' },
+  { key: 'threads', label: 'Threads', icon: '🧵' },
   { key: 'calendar', label: 'Calendar', icon: '📅' },
-  { key: 'todo', label: 'TODO', icon: '📌' },
+  { key: 'todo', label: 'Links & Attachments', icon: '📌' },
 ];
 
 function Dashboard({ ingestData }) {
+  const [notifItems, setNotifItems] = useState(DATA.notifications);
   const [tab, setTab] = useState('notifications');
-  const unreadCount = DATA.notifications.filter(n => !n.read).length;
+  const unreadCount = notifItems.filter(n => !n.read).length;
   return (
     <SafeAreaView style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={{ flex: 1, paddingHorizontal: 20 }}>
-        {tab === 'notifications' && <NotificationsTab />}
-        {tab === 'calendar' && <CalendarTab ingestDates={ingestData.dates} />}
+        {tab === 'notifications' && (
+          <NotificationsTab
+            notifications={notifItems}
+            setNotifications={setNotifItems}
+            ingestMessages={ingestData.messages}
+            ingestDates={ingestData.dates}
+          />
+        )}
+        {tab === 'threads' && <ThreadsTab ingestMessages={ingestData.messages} />}
+        {tab === 'calendar' && <CalendarTab ingestDates={ingestData.dates} ingestMessages={ingestData.messages} />}
         {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} />}
       </View>
       <View style={s.tabBar}>
@@ -656,7 +777,7 @@ export default function App() {
 
   const triggerIngestion = async () => {
     try {
-      const response = await fetch('http://10.31.244.198:5001/ingest', {
+      const response = await fetch(`${getBaseUrl()}/ingest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ db_path: 'extracted.db' }),
@@ -698,7 +819,7 @@ export default function App() {
 
   const loadSummary = async () => {
     try {
-      const response = await fetch('http://10.31.244.198:5001/summary');
+      const response = await fetch(`${getBaseUrl()}/summary`);
       const raw = await response.text();
       let data = null;
       try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
@@ -727,6 +848,11 @@ export default function App() {
       console.error(error);
     }
   };
+
+  // Pull summary right away so the dashboard has backend data without waiting on onboarding state.
+  useEffect(() => {
+    loadSummary();
+  }, []);
 
   useEffect(() => {
     if (done) {
