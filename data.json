@@ -1,0 +1,208 @@
+{
+  "notifications": [
+    {
+      "id": "n1",
+      "type": "deadline",
+      "title": "Slide deck due Friday",
+      "body": "Natalie mentioned in Gmail: 'Can you send the final slide deck by Friday EOD?'",
+      "source": "Gmail",
+      "sourceIcon": "✉️",
+      "timestamp": "2026-02-20T09:00:00Z",
+      "read": false,
+      "priority": "high",
+      "linkedContact": "Natalie"
+    },
+    {
+      "id": "n2",
+      "type": "reply",
+      "title": "Awaiting your reply",
+      "body": "Jonathan hasn't heard back about the Slack thread from 2 days ago re: sprint planning.",
+      "source": "Slack",
+      "sourceIcon": "⚡",
+      "timestamp": "2026-02-19T14:30:00Z",
+      "read": false,
+      "priority": "medium",
+      "linkedContact": "Jonathan"
+    },
+    {
+      "id": "n3",
+      "type": "event",
+      "title": "Team standup in 30 min",
+      "body": "Daily standup at 10:00 AM with Eugenie. Video link in calendar invite.",
+      "source": "Google Calendar",
+      "sourceIcon": "📅",
+      "timestamp": "2026-02-21T09:30:00Z",
+      "read": false,
+      "priority": "high",
+      "linkedContact": "Eugenie"
+    },
+    {
+      "id": "n4",
+      "type": "commitment",
+      "title": "You said you'd review the PRD",
+      "body": "Amanda is waiting — you committed to reviewing the PRD by end of this week in WhatsApp.",
+      "source": "WhatsApp",
+      "sourceIcon": "💬",
+      "timestamp": "2026-02-18T11:00:00Z",
+      "read": true,
+      "priority": "medium",
+      "linkedContact": "Amanda"
+    },
+    {
+      "id": "n5",
+      "type": "deadline",
+      "title": "Customer discovery write-up",
+      "body": "Natalie: 'Don't forget the customer discovery summary is due before Monday's class.'",
+      "source": "Slack",
+      "sourceIcon": "⚡",
+      "timestamp": "2026-02-21T08:00:00Z",
+      "read": false,
+      "priority": "high",
+      "linkedContact": "Natalie"
+    },
+    {
+      "id": "n6",
+      "type": "reply",
+      "title": "Follow up with Eugenie",
+      "body": "Eugenie asked about the user interview schedule 3 days ago. No response yet.",
+      "source": "Gmail",
+      "sourceIcon": "✉️",
+      "timestamp": "2026-02-17T16:00:00Z",
+      "read": true,
+      "priority": "low",
+      "linkedContact": "Eugenie"
+    }
+  ],
+  "events": [
+    {
+      "id": "e1",
+      "title": "Team standup",
+      "date": "2026-02-21",
+      "time": "10:00 AM",
+      "duration": "30 min",
+      "attendees": ["Natalie", "Eugenie", "Jonathan", "Amanda"],
+      "source": "Google Calendar",
+      "sourceIcon": "📅",
+      "videoLink": "https://meet.google.com/abc-defg-hij",
+      "notes": "Sprint 3 kickoff discussion on the agenda"
+    },
+    {
+      "id": "e2",
+      "title": "PRD review with Amanda",
+      "date": "2026-02-21",
+      "time": "2:00 PM",
+      "duration": "1 hour",
+      "attendees": ["Amanda"],
+      "source": "Gmail",
+      "sourceIcon": "✉️",
+      "videoLink": null,
+      "notes": "Review functional requirements section. Amanda flagged privacy section needs updates."
+    },
+    {
+      "id": "e3",
+      "title": "Customer discovery debrief",
+      "date": "2026-02-22",
+      "time": "11:00 AM",
+      "duration": "45 min",
+      "attendees": ["Natalie", "Jonathan"],
+      "source": "Slack",
+      "sourceIcon": "⚡",
+      "videoLink": "https://zoom.us/j/123456789",
+      "notes": "Natalie and Jonathan to present findings from their customer discovery sessions."
+    },
+    {
+      "id": "e4",
+      "title": "Eugenie 1:1 check-in",
+      "date": "2026-02-23",
+      "time": "3:00 PM",
+      "duration": "30 min",
+      "attendees": ["Eugenie"],
+      "source": "Google Calendar",
+      "sourceIcon": "📅",
+      "videoLink": null,
+      "notes": "Discuss user interview scheduling and persona refinement."
+    },
+    {
+      "id": "e5",
+      "title": "Full team sync — milestone review",
+      "date": "2026-02-24",
+      "time": "1:00 PM",
+      "duration": "1 hour",
+      "attendees": ["Natalie", "Eugenie", "Jonathan", "Amanda"],
+      "source": "Google Calendar",
+      "sourceIcon": "📅",
+      "videoLink": "https://meet.google.com/xyz-uvwx-yz",
+      "notes": "Review March 2026 success metrics. Prep demo for stakeholders."
+    },
+    {
+      "id": "e6",
+      "title": "Deadline: Slide deck to Natalie",
+      "date": "2026-02-28",
+      "time": "5:00 PM",
+      "duration": null,
+      "attendees": ["Natalie"],
+      "source": "Gmail",
+      "sourceIcon": "✉️",
+      "videoLink": null,
+      "notes": "Final slide deck for the product presentation. Natalie needs it by EOD."
+    }
+  ],
+  "threads": [
+    {
+      "id": "t1",
+      "contact": "Natalie",
+      "avatar": "N",
+      "avatarColor": "#7C3AED",
+      "lastMessage": "Don't forget the customer discovery summary is due before Monday!",
+      "timestamp": "2026-02-21T08:00:00Z",
+      "source": "Slack",
+      "sourceIcon": "⚡",
+      "unread": 2,
+      "summary": "Natalie has been coordinating the customer discovery write-ups. She needs all summaries before Monday's class and flagged the slide deck deadline for Friday.",
+      "openItems": ["Send slide deck by Friday", "Submit customer discovery summary before Monday"],
+      "relatedDates": ["Feb 21 — Customer discovery due", "Feb 28 — Slide deck due"]
+    },
+    {
+      "id": "t2",
+      "contact": "Jonathan",
+      "avatar": "J",
+      "avatarColor": "#0EA5E9",
+      "lastMessage": "Hey, did you get a chance to look at the sprint planning doc?",
+      "timestamp": "2026-02-19T14:30:00Z",
+      "source": "Slack",
+      "sourceIcon": "⚡",
+      "unread": 1,
+      "summary": "Jonathan has been asking about sprint planning and wants confirmation on task assignments. The thread has been open for 2 days without a reply.",
+      "openItems": ["Reply to Jonathan about sprint planning", "Confirm task assignments"],
+      "relatedDates": ["Feb 22 — Customer discovery debrief"]
+    },
+    {
+      "id": "t3",
+      "contact": "Eugenie",
+      "avatar": "E",
+      "avatarColor": "#10B981",
+      "lastMessage": "Let me know when you want to schedule the user interviews.",
+      "timestamp": "2026-02-17T16:00:00Z",
+      "source": "Gmail",
+      "sourceIcon": "✉️",
+      "unread": 0,
+      "summary": "Eugenie is leading user interview scheduling and persona refinement. She asked about scheduling 3 days ago and is waiting for a response.",
+      "openItems": ["Schedule user interviews with Eugenie", "Share persona draft for review"],
+      "relatedDates": ["Feb 23 — 1:1 check-in with Eugenie"]
+    },
+    {
+      "id": "t4",
+      "contact": "Amanda",
+      "avatar": "A",
+      "avatarColor": "#F59E0B",
+      "lastMessage": "Reviewed the overview section — the privacy part needs more detail.",
+      "timestamp": "2026-02-18T11:00:00Z",
+      "source": "WhatsApp",
+      "sourceIcon": "💬",
+      "unread": 0,
+      "summary": "Amanda has been reviewing the PRD and flagged that the privacy section needs more detail. You committed to reviewing her feedback before the end of the week.",
+      "openItems": ["Review Amanda's PRD feedback", "Update privacy section"],
+      "relatedDates": ["Feb 21 — PRD review meeting at 2:00 PM"]
+    }
+  ]
+}
