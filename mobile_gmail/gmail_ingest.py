@@ -88,6 +88,9 @@ def looks_like_real_date(raw: str) -> bool:
 def open_sqlite_rw(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys = ON;")
+    with open("schema.sql", 'r') as f:
+        schema_sql = f.read()
+        conn.executescript(schema_sql)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -626,6 +629,7 @@ def get_new_events(calendar, updated_after: datetime):
 
 def ingest_calendar_events(out_db_path: str, source: str = "gcal") -> Dict[str, int]:
     conn = open_sqlite_rw(out_db_path)
+
     calendar = get_calendar()
 
     last_cursor = get_last_cursor(conn, source)
@@ -769,7 +773,84 @@ def ingest_calendar():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route('/calendar/events', methods=['GET'])
+@app.route('/calendar/events', methods=['GET', 'POST'])
+def calendar_events():
+    """GET: Update from Google Calendar, then return events from local DB.
+    POST: Add a new event to the local DB."""
+    if request.method == 'POST':
+        return add_calendar_event()
+    return get_calendar_events()
+
+
+def _parse_time_to_hour_min(time_str: str) -> Tuple[int, int]:
+    """Parse '10:00 AM' or '10:00' to (hour, minute)."""
+    if not time_str:
+        return 9, 0
+    m = re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)?", str(time_str).strip(), re.I)
+    if not m:
+        return 9, 0
+    h, min_val = int(m.group(1)), int(m.group(2))
+    ampm = (m.group(3) or "").upper()
+    if ampm == "PM" and h < 12:
+        h += 12
+    if ampm == "AM" and h == 12:
+        h = 0
+    return h, min_val
+
+
+def add_calendar_event():
+    """Insert a new event into the local events table."""
+    try:
+        data = request.json or {}
+        summary = (data.get('summary') or data.get('title') or '').strip()
+        if not summary:
+            return jsonify({"status": "error", "message": "Title is required"}), 400
+
+        date_str = (data.get('date') or '').strip()
+        if not date_str:
+            return jsonify({"status": "error", "message": "Date is required"}), 400
+
+        time_str = data.get('time') or '09:00 AM'
+        h, min_val = _parse_time_to_hour_min(time_str)
+        duration_min = int(data.get('duration_minutes') or data.get('duration') or 60)
+
+        try:
+            y, mo, d = map(int, date_str.split('-'))
+        except (ValueError, AttributeError):
+            return jsonify({"status": "error", "message": "Invalid date format (use YYYY-MM-DD)"}), 400
+
+        start_dt = datetime(y, mo, d, h, min_val, 0, tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(minutes=duration_min)
+        start_utc = start_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+00:00'
+        end_utc = end_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+00:00'
+
+        description = (data.get('description') or data.get('notes') or '').strip() or None
+        location = (data.get('location') or '').strip() or None
+
+        db_path = data.get('db_path', 'extracted.db')
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            INSERT INTO events(start_utc, end_utc, summary, description, location)
+            VALUES(?, ?, ?, ?, ?)
+            """,
+            (start_utc, end_utc, summary, description, location),
+        )
+        row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Added calendar event id={row_id} summary={summary}")
+        return jsonify({
+            "status": "success",
+            "message": "Event added",
+            "id": row_id,
+        })
+    except Exception as e:
+        logger.error(f"Error adding calendar event: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 def get_calendar_events():
     """Update from Google Calendar, then return events from local DB."""
     try:
@@ -800,6 +881,23 @@ def get_calendar_events():
     except Exception as e:
         logger.error(f"Error fetching calendar events: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# @app.route('/gmail/extracted', methods=['GET'])
+# def get_extracted_events():
+#   """Get extracted events from the database."""
+# 
+# CREATE TABLE IF NOT EXISTS extracted_dates (
+#   id INTEGER PRIMARY KEY AUTOINCREMENT,
+#   message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+#   raw_span TEXT NOT NULL,
+#   parsed_at_utc TEXT NOT NULL,
+#   confidence REAL,
+#   created_at TEXT NOT NULL DEFAULT (datetime('now')),
+# 
+#   -- Resolved absolute date from raw_span
+#   resolved_date TEXT
+# );
 
 
 @app.route('/ingest', methods=['POST'])
