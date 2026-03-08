@@ -1,8 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView,
-  Switch, TextInput, Animated, StatusBar, Modal, Alert, Linking,
+  Switch, TextInput, Animated, StatusBar, Modal, Alert, Linking, Platform,
 } from 'react-native';
+import DateTimePicker from '@react-native-community/datetimepicker';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 const C = {
@@ -338,51 +339,146 @@ function NotificationsTab() {
 }
 
 
-function CalendarTab({ ingestDates = [] }) {
+function toDateLocal(date) {
+  const d = new Date(date);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function toTimeLocal(date) {
+  const d = new Date(date);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function parseEventTime(dateStr, timeStr) {
+  if (!dateStr || dateStr === 'Unknown date') return null;
+  const [y, m, d] = dateStr.split('-').map(Number);
+  if (!timeStr) return new Date(y, (m || 1) - 1, d || 1);
+  const match = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (!match) return new Date(y, (m || 1) - 1, d || 1);
+  let [, h, min, ampm] = match;
+  h = parseInt(h, 10);
+  min = parseInt(min, 10);
+  if (ampm.toUpperCase() === 'PM' && h < 12) h += 12;
+  if (ampm.toUpperCase() === 'AM' && h === 12) h = 0;
+  return new Date(y, (m || 1) - 1, d || 1, h, min, 0);
+}
+
+const CALENDAR_API = 'http://localhost:5001';
+
+const webPickerInputStyle = {
+  flex: 1,
+  backgroundColor: C.surfaceAlt,
+  border: `1px solid ${C.border}`,
+  borderRadius: 12,
+  padding: '12px 14px',
+  color: C.textPrimary,
+  fontSize: 14,
+  cursor: 'pointer',
+  minHeight: 48,
+  boxSizing: 'border-box',
+};
+
+function mapCalendarEvent(e) {
+  const start = new Date(e.start_utc);
+  const end = new Date(e.end_utc);
+  const dateStr = start.toISOString().slice(0, 10);
+  const timeStr = start.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  const durationMinutes = Math.round((end - start) / 60000);
+  const duration = durationMinutes > 0
+    ? durationMinutes >= 60
+      ? `${Math.floor(durationMinutes / 60)} hr${durationMinutes % 60 ? ` ${durationMinutes % 60} min` : ''}`
+      : `${durationMinutes} min`
+    : null;
+  return {
+    id: `cal-${e.id}`,
+    title: e.summary,
+    date: dateStr,
+    time: timeStr,
+    duration,
+    attendees: [],
+    source: 'Google Calendar',
+    sourceIcon: '📅',
+    videoLink: null,
+    notes: e.description,
+  };
+}
+
+function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar }) {
   const [selected, setSelected] = useState(null);
-  const [dbEvents, setDbEvents] = useState([]);
+  const [pastExpanded, setPastExpanded] = useState(false);
+  const [addModalVisible, setAddModalVisible] = useState(false);
+  const [addTitle, setAddTitle] = useState('');
+  const [addStartDate, setAddStartDate] = useState(() => {
+    const d = new Date();
+    d.setMinutes(0);
+    d.setSeconds(0);
+    return d;
+  });
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [showTimePicker, setShowTimePicker] = useState(false);
+  const [addDurationHours, setAddDurationHours] = useState('1');
+  const [addDurationMinutes, setAddDurationMinutes] = useState('0');
+  const [addDurationSeconds, setAddDurationSeconds] = useState('0');
+  const [addNotes, setAddNotes] = useState('');
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState(null);
 
-  useEffect(() => {
-    fetch('http://localhost:5000/calendar/events')
-      .then(res => res.json())
-      .then(data => {
-        if (data.status === 'success') {
-          const mapped = data.events.map(e => {
-            const start = new Date(e.start_utc);
-            const end = new Date(e.end_utc);
+  const handleAddEvent = async () => {
+    if (!addTitle.trim()) {
+      setAddError('Title is required');
+      return;
+    }
+    setAdding(true);
+    setAddError(null);
+    try {
+      const dateStr = addStartDate.toISOString().slice(0, 10);
+      const timeStr = addStartDate.toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      });
+      const h = Math.max(0, parseInt(addDurationHours, 10) || 0);
+      const m = Math.min(59, Math.max(0, parseInt(addDurationMinutes, 10) || 0));
+      const s = Math.min(59, Math.max(0, parseInt(addDurationSeconds, 10) || 0));
+      const durationMinutes = Math.round(h * 60 + m + s / 60) || 60;
 
-            const dateStr = start.toISOString().slice(0, 10);
-            console.log(`${dateStr} => ${formatDate(dateStr)}`);
-            const timeStr = start.toLocaleTimeString('en-US', {
-              hour: 'numeric',
-              minute: '2-digit'
-            });
-
-            const durationMinutes = Math.round((end - start) / 60000);
-            const duration =
-              durationMinutes > 0
-                ? `${durationMinutes} min`
-                : null;
-
-            return {
-              id: `cal-${e.id}`,
-              title: e.summary,
-              date: dateStr,
-              time: timeStr,
-              duration,
-              attendees: [],
-              source: 'Google Calendar',
-              sourceIcon: '📅',
-              videoLink: null,
-              notes: e.description,
-            };
-          });
-
-          setDbEvents(mapped);
-        }
-      })
-      .catch(err => console.error(err));
-  }, []);
+      const res = await fetch(`${CALENDAR_API}/calendar/events`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: addTitle.trim(),
+          date: dateStr,
+          time: timeStr,
+          duration_minutes: durationMinutes,
+          notes: addNotes.trim() || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (data.status === 'success') {
+        setAddModalVisible(false);
+        setShowDatePicker(false);
+        setShowTimePicker(false);
+        setAddTitle('');
+        const next = new Date();
+        next.setMinutes(0);
+        next.setSeconds(0);
+        setAddStartDate(next);
+        setAddDurationHours('1');
+        setAddDurationMinutes('0');
+        setAddDurationSeconds('0');
+        setAddNotes('');
+        onRefreshCalendar?.();
+      } else {
+        setAddError(data.message || 'Failed to add event');
+      }
+    } catch (err) {
+      setAddError(err.message || 'Network error');
+    } finally {
+      setAdding(false);
+    }
+  };
 
   const ingestEvents = ingestDates
     .filter(d => {
@@ -414,43 +510,129 @@ function CalendarTab({ ingestDates = [] }) {
       };
     });
 
-  const grouped = [...dbEvents, ...ingestEvents].reduce((acc, e) => {
-    if (!acc[e.date]) acc[e.date] = [];
-    acc[e.date].push(e);
-    return acc;
-  }, {});
+  const allEvents = [...calendarEvents, ...ingestEvents];
+  const now = new Date();
+
+  const { upcoming, past } = allEvents.reduce(
+    (acc, e) => {
+      const eventTime = parseEventTime(e.date, e.time);
+      if (eventTime && eventTime < now) {
+        acc.past.push(e);
+      } else {
+        acc.upcoming.push(e);
+      }
+      return acc;
+    },
+    { upcoming: [], past: [] }
+  );
+
+  const sortByDateDesc = (a, b) => {
+    const da = parseEventTime(a.date, a.time)?.getTime() ?? 0;
+    const db = parseEventTime(b.date, b.time)?.getTime() ?? 0;
+    return db - da;
+  };
+  const sortByDateAsc = (a, b) => {
+    const da = parseEventTime(a.date, a.time)?.getTime() ?? 0;
+    const db = parseEventTime(b.date, b.time)?.getTime() ?? 0;
+    return da - db;
+  };
+
+  const upcomingSorted = [...upcoming].sort(sortByDateAsc);
+  const pastSorted = [...past].sort(sortByDateDesc);
+
+  const groupByDate = (events) =>
+    events.reduce((acc, e) => {
+      if (!acc[e.date]) acc[e.date] = [];
+      acc[e.date].push(e);
+      return acc;
+    }, {});
+
+  const upcomingGrouped = groupByDate(upcomingSorted);
+  const pastGrouped = groupByDate(pastSorted);
+
+  const sortedUpcomingDates = Object.keys(upcomingGrouped).sort();
+  const sortedPastDates = Object.keys(pastGrouped).sort().reverse();
+
+  function EventCard({ e }) {
+    return (
+      <TouchableOpacity style={s.eventCard} onPress={() => setSelected(e)} activeOpacity={0.8}>
+        <View style={{ width: 56, alignItems: 'flex-end' }}>
+          <Text style={{ fontSize: 12, fontWeight: '700', color: C.textPrimary }}>{e.time}</Text>
+          {e.duration && (
+            <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{e.duration}</Text>
+          )}
+        </View>
+        <View style={{ width: 2, height: 40, backgroundColor: C.accent, borderRadius: 2, opacity: 0.5 }} />
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontSize: 14, fontWeight: '600', color: C.textPrimary, marginBottom: 6 }}>
+            {e.title}
+          </Text>
+        </View>
+        <Text style={{ fontSize: 18 }}>{e.sourceIcon}</Text>
+      </TouchableOpacity>
+    );
+  }
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Calendar</Text>
-          <Text style={s.dashSubtitle}>{dbEvents.length} upcoming events</Text>
+          <Text style={s.dashSubtitle}>{upcoming.length} upcoming · {past.length} past</Text>
         </View>
+        <TouchableOpacity
+          style={[s.addEventBtn, adding && { opacity: 0.6 }]}
+          onPress={() => setAddModalVisible(true)}
+          disabled={adding}
+        >
+          <Text style={s.addEventBtnText}>+ Add</Text>
+        </TouchableOpacity>
       </View>
 
-      {Object.entries(grouped).map(([date, events]) => (
+      {sortedUpcomingDates.map((date) => (
         <View key={date} style={{ marginBottom: 6 }}>
           <Text style={s.calDateLabel}>{formatDate(date)}</Text>
-          {events.map(e => (
-            <TouchableOpacity key={e.id} style={s.eventCard} onPress={() => setSelected(e)} activeOpacity={0.8}>
-              <View style={{ width: 56, alignItems: 'flex-end' }}>
-                <Text style={{ fontSize: 12, fontWeight: '700', color: C.textPrimary }}>{e.time}</Text>
-                {e.duration && (
-                  <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{e.duration}</Text>
-                )}
-              </View>
-              <View style={{ width: 2, height: 40, backgroundColor: C.accent, borderRadius: 2, opacity: 0.5 }} />
-              <View style={{ flex: 1 }}>
-                <Text style={{ fontSize: 14, fontWeight: '600', color: C.textPrimary, marginBottom: 6 }}>
-                  {e.title}
-                </Text>
-              </View>
-              <Text style={{ fontSize: 18 }}>{e.sourceIcon}</Text>
-            </TouchableOpacity>
+          {upcomingGrouped[date].map((e) => (
+            <EventCard key={e.id} e={e} />
           ))}
         </View>
       ))}
+
+      {past.length > 0 && (
+        <View style={{ marginTop: 16 }}>
+          <TouchableOpacity
+            style={[s.eventCard, { opacity: 0.85 }]}
+            onPress={() => setPastExpanded(!pastExpanded)}
+            activeOpacity={0.8}
+          >
+            <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+              <Text style={{ fontSize: 20 }}>📂</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontSize: 14, fontWeight: '600', color: C.textPrimary }}>
+                  Past events
+                </Text>
+                <Text style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>
+                  {past.length} event{past.length !== 1 ? 's' : ''} · Tap to {pastExpanded ? 'collapse' : 'expand'}
+                </Text>
+              </View>
+              <Text style={{ fontSize: 18, color: C.textMuted }}>{pastExpanded ? '▼' : '▶'}</Text>
+            </View>
+          </TouchableOpacity>
+
+          {pastExpanded && (
+            <View style={{ marginTop: 4, marginLeft: 12, paddingLeft: 12, borderLeftWidth: 3, borderLeftColor: C.border }}>
+              {sortedPastDates.map((date) => (
+                <View key={date} style={{ marginBottom: 6, marginTop: 8 }}>
+                  <Text style={[s.calDateLabel, { opacity: 0.8 }]}>{formatDate(date)}</Text>
+                  {pastGrouped[date].map((e) => (
+                    <EventCard key={e.id} e={e} />
+                  ))}
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+      )}
 
       <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
         <View style={s.modalOverlay}>
@@ -485,6 +667,231 @@ function CalendarTab({ ingestDates = [] }) {
                 </View>
               )}
             </>}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={addModalVisible} transparent animationType="slide" onRequestClose={() => { if (!adding) { setAddModalVisible(false); setShowDatePicker(false); setShowTimePicker(false); } }}>
+        <View style={s.modalOverlay}>
+          <View style={s.modalSheet}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+              <Text style={s.modalTitle}>Add Event</Text>
+              <TouchableOpacity onPress={() => { if (!adding) { setAddModalVisible(false); setShowDatePicker(false); setShowTimePicker(false); } }} disabled={adding}>
+                <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
+              </TouchableOpacity>
+            </View>
+
+            {addError && (
+              <View style={{ backgroundColor: C.red + '22', borderRadius: 10, padding: 12, marginBottom: 16, borderWidth: 1, borderColor: C.red }}>
+                <Text style={{ fontSize: 13, color: C.red }}>{addError}</Text>
+              </View>
+            )}
+
+            <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 6 }}>TITLE</Text>
+            <TextInput
+              style={s.addEventInput}
+              placeholder="Event name"
+              placeholderTextColor={C.textMuted}
+              value={addTitle}
+              onChangeText={setAddTitle}
+              editable={!adding}
+            />
+
+            <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 6, marginTop: 14 }}>START DATE & TIME</Text>
+            {Platform.OS === 'web' ? (
+              <View style={{ flexDirection: 'row', gap: 12 }}>
+                <View style={{ flex: 1 }}>
+                  {React.createElement('input', {
+                    type: 'date',
+                    value: toDateLocal(addStartDate),
+                    onChange: (e) => {
+                      const v = e.target.value;
+                      if (v) {
+                        const [y, m, d] = v.split('-').map(Number);
+                        const next = new Date(addStartDate);
+                        next.setFullYear(y);
+                        next.setMonth(m - 1);
+                        next.setDate(d);
+                        setAddStartDate(next);
+                      }
+                    },
+                    onFocus: (e) => {
+                      try {
+                        e.target.showPicker?.();
+                      } catch (_) {}
+                    },
+                    disabled: adding,
+                    style: { ...webPickerInputStyle, width: '100%' },
+                  })}
+                </View>
+                <View style={{ flex: 1 }}>
+                  {React.createElement('input', {
+                    type: 'time',
+                    value: toTimeLocal(addStartDate),
+                    onChange: (e) => {
+                      const v = e.target.value;
+                      if (v) {
+                        const [h, m] = v.split(':').map(Number);
+                        const next = new Date(addStartDate);
+                        next.setHours(h);
+                        next.setMinutes(m);
+                        setAddStartDate(next);
+                      }
+                    },
+                    onFocus: (e) => {
+                      try {
+                        e.target.showPicker?.();
+                      } catch (_) {}
+                    },
+                    disabled: adding,
+                    style: { ...webPickerInputStyle, width: '100%' },
+                  })}
+                </View>
+              </View>
+            ) : (
+              <>
+                <View style={{ flexDirection: 'row', gap: 12 }}>
+                  <TouchableOpacity
+                    style={[s.addEventInput, { flex: 1 }]}
+                    onPress={() => { if (!adding) { setShowTimePicker(false); setShowDatePicker(true); } }}
+                    disabled={adding}
+                  >
+                    <Text style={{ color: C.textPrimary, fontSize: 14 }}>
+                      {addStartDate.toLocaleDateString('en-US', {
+                        weekday: 'short',
+                        month: 'short',
+                        day: 'numeric',
+                        year: 'numeric',
+                      })}
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[s.addEventInput, { flex: 1 }]}
+                    onPress={() => { if (!adding) { setShowDatePicker(false); setShowTimePicker(true); } }}
+                    disabled={adding}
+                  >
+                    <Text style={{ color: C.textPrimary, fontSize: 14 }}>
+                      {addStartDate.toLocaleTimeString('en-US', {
+                        hour: 'numeric',
+                        minute: '2-digit',
+                        hour12: true,
+                      })}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
+                {showDatePicker && (
+                  <View style={{ marginTop: 8 }}>
+                    <DateTimePicker
+                      value={addStartDate}
+                      mode="date"
+                      display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+                      onChange={(event, date) => {
+                        if (Platform.OS === 'android') setShowDatePicker(false);
+                        if (event.type === 'set' && date) setAddStartDate(date);
+                      }}
+                    />
+                    {Platform.OS === 'ios' && (
+                      <TouchableOpacity
+                        style={{ marginTop: 12, paddingVertical: 10, alignItems: 'center', backgroundColor: C.accent, borderRadius: 10 }}
+                        onPress={() => setShowDatePicker(false)}
+                      >
+                        <Text style={{ color: '#fff', fontWeight: '600', fontSize: 14 }}>Done</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                )}
+
+                {showTimePicker && (
+                  <View style={{ marginTop: 8 }}>
+                    <DateTimePicker
+                      value={addStartDate}
+                      mode="time"
+                      display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+                      onChange={(event, date) => {
+                        if (Platform.OS === 'android') setShowTimePicker(false);
+                        if (event.type === 'set' && date) setAddStartDate(date);
+                      }}
+                    />
+                    {Platform.OS === 'ios' && (
+                      <TouchableOpacity
+                        style={{ marginTop: 12, paddingVertical: 10, alignItems: 'center', backgroundColor: C.accent, borderRadius: 10 }}
+                        onPress={() => setShowTimePicker(false)}
+                      >
+                        <Text style={{ color: '#fff', fontWeight: '600', fontSize: 14 }}>Done</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                )}
+              </>
+            )}
+
+            <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 6, marginTop: 14 }}>DURATION</Text>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontSize: 10, color: C.textMuted, marginBottom: 4 }}>Hours</Text>
+                <TextInput
+                  style={s.addEventInput}
+                  placeholder="0"
+                  placeholderTextColor={C.textMuted}
+                  value={addDurationHours}
+                  onChangeText={(v) => setAddDurationHours(v.replace(/\D/g, '').slice(0, 3))}
+                  keyboardType="number-pad"
+                  editable={!adding}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontSize: 10, color: C.textMuted, marginBottom: 4 }}>Minutes (0–59)</Text>
+                <TextInput
+                  style={s.addEventInput}
+                  placeholder="0"
+                  placeholderTextColor={C.textMuted}
+                  value={addDurationMinutes}
+                  onChangeText={(v) => {
+                    const n = v.replace(/\D/g, '').slice(0, 2);
+                    const val = parseInt(n, 10);
+                    setAddDurationMinutes(isNaN(val) ? '' : String(Math.min(59, val)));
+                  }}
+                  keyboardType="number-pad"
+                  editable={!adding}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontSize: 10, color: C.textMuted, marginBottom: 4 }}>Seconds (0–59)</Text>
+                <TextInput
+                  style={s.addEventInput}
+                  placeholder="0"
+                  placeholderTextColor={C.textMuted}
+                  value={addDurationSeconds}
+                  onChangeText={(v) => {
+                    const n = v.replace(/\D/g, '').slice(0, 2);
+                    const val = parseInt(n, 10);
+                    setAddDurationSeconds(isNaN(val) ? '' : String(Math.min(59, val)));
+                  }}
+                  keyboardType="number-pad"
+                  editable={!adding}
+                />
+              </View>
+            </View>
+
+            <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 6, marginTop: 14 }}>NOTES (optional)</Text>
+            <TextInput
+              style={[s.addEventInput, { minHeight: 60, textAlignVertical: 'top' }]}
+              placeholder="Description or notes"
+              placeholderTextColor={C.textMuted}
+              value={addNotes}
+              onChangeText={setAddNotes}
+              multiline
+              editable={!adding}
+            />
+
+            <TouchableOpacity
+              style={[s.addEventSubmitBtn, adding && { opacity: 0.6 }]}
+              onPress={handleAddEvent}
+              disabled={adding}
+            >
+              <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>{adding ? 'Adding…' : 'Add Event'}</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
@@ -631,15 +1038,41 @@ const TABS = [
   { key: 'todo', label: 'TODO', icon: '📌' },
 ];
 
-function Dashboard({ ingestData }) {
+function Dashboard({ ingestData, loadSummary }) {
   const [tab, setTab] = useState('notifications');
+  const [calendarEvents, setCalendarEvents] = useState([]);
   const unreadCount = DATA.notifications.filter(n => !n.read).length;
+
+  const loadCalendarEvents = () => {
+    fetch(`${CALENDAR_API}/calendar/events`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'success') {
+          setCalendarEvents(data.events.map(mapCalendarEvent));
+        }
+      })
+      .catch(err => console.error(err));
+  };
+
+  useEffect(() => {
+    loadSummary?.();
+    if (tab === 'calendar') {
+      loadCalendarEvents();
+    }
+  }, [tab]);
+
   return (
     <SafeAreaView style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={{ flex: 1, paddingHorizontal: 20 }}>
         {tab === 'notifications' && <NotificationsTab />}
-        {tab === 'calendar' && <CalendarTab ingestDates={ingestData.dates} />}
+        {tab === 'calendar' && (
+          <CalendarTab
+            ingestDates={ingestData.dates}
+            calendarEvents={calendarEvents}
+            onRefreshCalendar={loadCalendarEvents}
+          />
+        )}
         {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} />}
       </View>
       <View style={s.tabBar}>
@@ -704,7 +1137,7 @@ export default function App() {
 
   const triggerIngestion = async () => {
     try {
-      const response = await fetch('http://10.31.244.198:5001/ingest', {
+      const response = await fetch(`${CALENDAR_API}/ingest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ db_path: 'extracted.db' }),
@@ -746,7 +1179,7 @@ export default function App() {
 
   const loadSummary = async () => {
     try {
-      const response = await fetch('http://10.31.244.198:5001/summary');
+      const response = await fetch(`${CALENDAR_API}/summary`);
       const raw = await response.text();
       let data = null;
       try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
@@ -778,13 +1211,17 @@ export default function App() {
 
   useEffect(() => {
     if (done) {
-      loadSummary();
+      fetch(`${CALENDAR_API}/ingest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ db_path: 'extracted.db' }),
+      }).catch(err => console.error(err));
     }
   }, [done]);
 
   if (done) return (
     <SafeAreaProvider>
-      <Dashboard ingestData={ingestData} />
+      <Dashboard ingestData={ingestData} loadSummary={loadSummary} />
     </SafeAreaProvider>
   );
 
@@ -879,6 +1316,10 @@ const s = StyleSheet.create({
   badge: { borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
   badgeText: { fontSize: 10, fontWeight: '800', letterSpacing: 0.5 },
   calDateLabel: { fontSize: 12, fontWeight: '700', color: C.textMuted, letterSpacing: 1, marginBottom: 8, marginTop: 8 },
+  addEventBtn: { backgroundColor: C.accent, borderRadius: 10, paddingVertical: 8, paddingHorizontal: 14, alignSelf: 'flex-end' },
+  addEventBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
+  addEventInput: { backgroundColor: C.surfaceAlt, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, color: C.textPrimary, fontSize: 14, borderWidth: 1, borderColor: C.border },
+  addEventSubmitBtn: { backgroundColor: C.accent, borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginTop: 20 },
   eventCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.surface, borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: C.border, gap: 12 },
   attendeeChip: { backgroundColor: C.surfaceAlt, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
   threadCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.surface, borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: C.border },
