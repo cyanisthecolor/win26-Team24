@@ -1,13 +1,15 @@
 import base64
+import json
 import os
 import re
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone, timedelta
-from email.message import EmailMessage
+import urllib.error
+import urllib.request
 from email.utils import parseaddr
-from typing import Dict, Iterable, List, Optional, Tuple, TypedDict, NotRequired
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from dateparser.search import search_dates
 
@@ -16,16 +18,9 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import logging
 
-SCOPES = [ 
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.readonly",
-];
-
-CALENDARS = ["primary"]
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 URL_RE = re.compile(
     r"""(?xi)
@@ -53,8 +48,82 @@ logger = logging.getLogger(__name__)
 # Flask app for API integration
 app = Flask(__name__)
 
-CORS(app)
 AUTO_INGEST_INTERVAL_SECONDS = int(os.environ.get("AUTO_INGEST_INTERVAL_SECONDS", "60"))
+
+
+def fallback_reply_suggestions(subject: str, body: str) -> List[str]:
+    text = f"{subject} {body}".lower()
+    if any(k in text for k in ["verify", "security", "password", "login", "sign-in"]):
+        return [
+            "Thanks for the heads-up. I verified this on my side.",
+            "I did not initiate this. Please lock the account and share next steps.",
+            "Received. I completed the verification successfully.",
+        ]
+    if any(k in text for k in ["meeting", "schedule", "calendar", "time"]):
+        return [
+            "Thanks! That time works for me.",
+            "Could we move this by 30 minutes due to a conflict?",
+            "Confirmed, I will join and come prepared.",
+        ]
+    return [
+        "Thanks for the update. I will follow up shortly.",
+        "Received — I reviewed this and will respond with details soon.",
+        "Got it. I will take care of this today.",
+    ]
+
+
+def ai_reply_suggestions(subject: str, body: str, sender_name: str = "") -> List[str]:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return fallback_reply_suggestions(subject, body)
+
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    url = f"{base_url.rstrip('/')}/chat/completions"
+
+    system_prompt = (
+        "You generate short, professional email reply suggestions. "
+        "Return strictly JSON array of 3 strings. No markdown, no extra keys."
+    )
+    user_prompt = (
+        f"Sender: {sender_name or 'Unknown'}\n"
+        f"Subject: {subject}\n"
+        f"Body: {body}\n\n"
+        "Write 3 concise reply options."
+    )
+
+    payload = {
+        "model": model,
+        "temperature": 0.4,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8")
+        parsed = json.loads(raw)
+        content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "[]")
+        suggestions = json.loads(content)
+        if isinstance(suggestions, list):
+            cleaned = [str(x).strip() for x in suggestions if str(x).strip()]
+            return cleaned[:3] if cleaned else fallback_reply_suggestions(subject, body)
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError, KeyError, IndexError, ValueError) as e:
+        logger.warning(f"AI suggestion API failed, using fallback: {e}")
+
+    return fallback_reply_suggestions(subject, body)
 
 # Modify the `looks_like_real_date` function to ensure valid spans like "tomorrow" and "Feb 22nd" are not filtered out.
 def looks_like_real_date(raw: str) -> bool:
@@ -92,9 +161,6 @@ def looks_like_real_date(raw: str) -> bool:
 def open_sqlite_rw(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys = ON;")
-    with open("schema.sql", 'r') as f:
-        schema_sql = f.read()
-        conn.executescript(schema_sql)
     conn.row_factory = sqlite3.Row
     ensure_messages_schema(conn)
     return conn
@@ -328,11 +394,9 @@ def fetch_db_snapshot(db_path: str, limit: int = 20) -> Dict[str, List[Dict]]:
     try:
         msgs = conn.execute(
             """
-            SELECT m.id, m.sender, m.sent_at_utc, m.text, substr(m.text, 1, 200) AS snippet,
-                   c.thread_key AS thread_id, m.source_msg_key AS gmail_message_id
-            FROM messages m
-            LEFT JOIN conversations c ON m.conversation_id = c.id
-            ORDER BY m.source_rowid DESC
+            SELECT id, sender, sender_name, sent_at_utc, text, substr(text, 1, 200) AS snippet
+            FROM messages
+            ORDER BY source_rowid DESC
             LIMIT ?
             """,
             (limit,),
@@ -401,9 +465,11 @@ def fetch_db_snapshot(db_path: str, limit: int = 20) -> Dict[str, List[Dict]]:
         conn.close()
 
 
-def google_credentials(creds_path: str = "credentials.json", token_path: str = "token.json", force_reauth: bool = False):
+def gmail_auth(creds_path: str = "credentials.json", token_path: str = "token.json", force_reauth: bool = False):
+    # Reauth only when explicitly requested.
     if force_reauth and os.path.exists(token_path):
         os.remove(token_path)
+
     creds = None
     if os.path.exists(token_path):
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
@@ -418,15 +484,7 @@ def google_credentials(creds_path: str = "credentials.json", token_path: str = "
         with open(token_path, "w") as f:
             f.write(creds.to_json())
 
-    return creds
-
-
-def gmail_auth(creds_path: str = "credentials.json", token_path: str = "token.json", force_reauth: bool = False):
-    return build("gmail", "v1", credentials=google_credentials(creds_path, token_path, force_reauth))
-
-
-def get_calendar(creds_path: str = "credentials.json", token_path: str = "token.json"):
-  return build("calendar", "v3", credentials=google_credentials(creds_path, token_path))
+    return build("gmail", "v1", credentials=creds)
 
 
 def header_map(headers: List[Dict[str, str]]) -> Dict[str, str]:
@@ -541,101 +599,7 @@ def list_message_ids_since(service, user_id: str, after_seconds: int, max_pages:
     return [], primary_q
 
 
-def fetch_emails_direct(out_db_path: str, source: str = "gmail", user_id: str = "me", max_messages: int = 100) -> Dict[str, int]:
-    """
-    Fetch emails directly using labelIds (no search query). More reliable than query-based fetch.
-    Uses INBOX label and paginates through messages.
-    """
-    conn = open_sqlite_rw(out_db_path)
-    service = gmail_auth()
-
-    msg_ids: List[str] = []
-    page_token = None
-    pages = 0
-    max_pages = max(1, (max_messages + 99) // 100)
-
-    while pages < max_pages:
-        resp = service.users().messages().list(
-            userId=user_id,
-            labelIds=["INBOX"],
-            maxResults=min(100, max_messages - len(msg_ids)),
-            pageToken=page_token,
-        ).execute()
-        batch = [m["id"] for m in resp.get("messages", []) or []]
-        msg_ids.extend(batch)
-        page_token = resp.get("nextPageToken")
-        pages += 1
-        if not page_token or len(batch) == 0:
-            break
-
-    if not msg_ids:
-        logger.info("No Gmail messages found in INBOX.")
-        conn.close()
-        return {"processed": 0, "inserted": 0}
-
-    conn.execute("BEGIN;")
-    inserted_count = 0
-    try:
-        for mid in msg_ids:
-            try:
-                msg = service.users().messages().get(userId=user_id, id=mid, format="full").execute()
-            except Exception as e:
-                logger.warning(f"Failed to get message {mid}: {e}")
-                continue
-
-            internal_ms = int(msg.get("internalDate", "0"))
-            if internal_ms <= 0:
-                continue
-
-            payload = msg.get("payload") or {}
-            headers = header_map(payload.get("headers", []) or [])
-            sender = headers.get("from")
-            subject = headers.get("subject") or ""
-
-            thread_id = msg.get("threadId") or mid
-            sent_at_utc = datetime.fromtimestamp(internal_ms / 1000, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-            body_text = extract_best_text(payload)
-            combined = (f"Subject: {subject}\n" if subject else "") + body_text
-
-            if not combined.strip():
-                combined = f"Subject: {subject}\n(no body)" if subject else "(no content)"
-
-            sender_name_hdr, sender_email_hdr = parseaddr(sender or "")
-            sender_name = (sender_name_hdr or "").strip() or (sender_email_hdr or "").strip() or (sender or "")
-
-            conv_id = upsert_conversation(conn, source, thread_id, display_name=subject)
-            msg_id_db = insert_message(
-                conn,
-                source=source,
-                source_msg_key=mid,
-                source_rowid=internal_ms,
-                conversation_id=conv_id,
-                sender=sender,
-                sender_name=sender_name,
-                sent_at_utc=sent_at_utc,
-                text=combined,
-            )
-
-            if msg_id_db is None:
-                continue
-
-            inserted_count += 1
-            insert_extractions(conn, msg_id_db, combined, sent_at_utc)
-
-            for filename, mime, attachment_id in extract_attachment_metas(payload):
-                insert_attachment_meta(conn, msg_id_db, filename, mime, attachment_id)
-
-        conn.execute("COMMIT;")
-        logger.info(f"fetch_emails_direct: processed={len(msg_ids)} inserted={inserted_count}")
-        return {"processed": len(msg_ids), "inserted": inserted_count}
-    except Exception:
-        conn.execute("ROLLBACK;")
-        raise
-    finally:
-        conn.close()
-
-
+# Ensure the `ingest_gmail` function uses the correct `after_seconds` value.
 def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me", reset_cursor_flag: bool = False, force_reauth: bool = False) -> Dict[str, int]:
     conn = open_sqlite_rw(out_db_path)
     service = gmail_auth(force_reauth=force_reauth)
@@ -793,486 +757,6 @@ def process_email(
     logger.info(f"Processed email: message_id={message_id}")
 
 
-def get_range(calendar, start: datetime, end: Optional[datetime] = None):
-    events = []
-
-    if end is not None:
-        for id in CALENDARS:
-            events += calendar.events().list(
-                calendarId=id,
-                timeMin=start.isoformat(),
-                timeMax=end.isoformat(),
-                singleEvents=True,
-                orderBy="startTime"
-            ).execute().get("items", [])
-    else:
-        for id in CALENDARS:
-            events += calendar.events().list(
-                calendarId=id,
-                timeMin=start.isoformat(),
-                singleEvents=True,
-                orderBy="startTime"
-            ).execute().get("items", [])
-
-    return events
-
-
-def get_this_month(calendar):
-    now = datetime.now(timezone.utc)
-    return get_range(calendar, now, now+timedelta(days=30))
-
-
-def get_new_events(calendar, updated_after: datetime):
-    """
-    Return events created or modified after `updated_after`.
-    """
-    events = []
-
-    for id in CALENDARS:
-        events += calendar.events().list(
-            calendarId=id,
-            updatedMin=updated_after.isoformat(),
-            singleEvents=True,
-            showDeleted=False,
-            orderBy="updated"
-        ).execute().get("items", [])
-
-    return events
-
-
-def ingest_calendar_events(out_db_path: str, source: str = "gcal") -> Dict[str, int]:
-    conn = open_sqlite_rw(out_db_path)
-    _ensure_events_duration_seconds_column(conn)
-
-    calendar = get_calendar()
-
-    last_cursor = get_last_cursor(conn, source)
-    last_dt = (
-        datetime.fromtimestamp(last_cursor / 1000, tz=timezone.utc)
-        if last_cursor
-        else datetime(1970, 1, 1, tzinfo=timezone.utc)
-    )
-
-    events = get_new_events(calendar, last_dt)
-    if not events:
-        logger.info("No new calendar events to ingest.")
-        conn.close()
-        return {"processed": 0, "inserted": 0}
-
-    inserted = 0
-    max_updated_ms = last_cursor
-
-    conn.execute("BEGIN;")
-    try:
-        for e in events:
-            event_id = e.get("id")
-            updated = e.get("updated")
-            if not event_id or not updated:
-                continue
-
-            updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
-            updated_ms = int(updated_dt.timestamp() * 1000)
-
-            if updated_ms <= last_cursor:
-                continue
-
-            max_updated_ms = max(max_updated_ms, updated_ms)
-
-            start_raw = e.get("start", {})
-            end_raw = e.get("end", {})
-
-            start = start_raw.get("dateTime") or start_raw.get("date")
-            end = end_raw.get("dateTime") or end_raw.get("date")
-            if not start or not end:
-                continue
-
-            summary = e.get("summary")
-            description = e.get("description")
-            location = e.get("location")
-
-            duration_seconds = None
-            try:
-                start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                duration_seconds = int((end_dt - start_dt).total_seconds())
-            except (ValueError, TypeError):
-                pass
-
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO events(start_utc, end_utc, summary, description, location, duration_seconds)
-                    VALUES(?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        start,
-                        end,
-                        summary,
-                        description,
-                        location,
-                        duration_seconds,
-                    ),
-                )
-                inserted += 1
-            except sqlite3.IntegrityError:
-                continue
-
-        set_last_cursor(conn, source, max_updated_ms)
-        conn.execute("COMMIT;")
-        logger.info(f"Calendar ingestion complete. processed={len(events)} inserted={inserted}")
-        return {"processed": len(events), "inserted": inserted}
-    except Exception:
-        conn.execute("ROLLBACK;")
-        raise
-    finally:
-        conn.close()
-
-
-class Event(TypedDict):
-    start: datetime
-    end: datetime
-    summary: str
-    description: str
-    location: NotRequired[str]
-    attendees: NotRequired[list[Person]]
-
-class Person(TypedDict):
-    email: str
-    optional: NotRequired[bool]
-
-def make_event(calendar, calendarId: str, event: Event):
-    return calendar.events().insert(
-        calendarId=calendarId,
-        body=event | {
-            "start": {
-                "dateTime": event["start"].isoformat(),
-                "timeZone": str(event["start"].tzinfo), 
-            },
-            "end": {
-                "dateTime": event["end"].isoformat(),
-                "timeZone": str(event["end"].tzinfo), 
-            },
-        },
-    ).execute()
-
-
-class Email(TypedDict):
-    Subject: str
-    To: str | list[str]
-    # TODO: add cc, bcc, etc
-    Content: str
-
-
-def send_email(gmail, message: Email, thread_id: Optional[str] = None):
-    email = EmailMessage()
-    email.set_content(message["Content"])
-    email["From"] = "me"
-    email["To"] = ", ".join(message["To"]) if isinstance(message["To"], list) else message["To"]
-    email["Subject"] = message["Subject"]
-
-    create_message = {"raw": base64.urlsafe_b64encode(email.as_bytes()).decode()}
-    if thread_id:
-        create_message["threadId"] = thread_id
-    return gmail.users().messages().send(userId="me", body=create_message).execute()
-
-
-def send_reply_in_thread(
-    gmail,
-    to_addr: str,
-    subject: str,
-    content: str,
-    thread_id: str,
-    gmail_message_id: str,
-) -> dict:
-    """
-    Send a reply in the same thread by fetching the original message's Message-ID
-    and setting In-Reply-To and References headers. Required for proper threading.
-    """
-    msg = gmail.users().messages().get(userId="me", id=gmail_message_id, format="full").execute()
-    payload = msg.get("payload") or {}
-    headers = header_map(payload.get("headers", []) or [])
-    orig_message_id = (headers.get("message-id") or headers.get("message_id") or "").strip()
-
-    email = EmailMessage()
-    email.set_content(content)
-    email["From"] = "me"
-    email["To"] = to_addr
-    email["Subject"] = subject
-    if orig_message_id:
-        email["In-Reply-To"] = orig_message_id
-        email["References"] = orig_message_id
-
-    create_message = {
-        "raw": base64.urlsafe_b64encode(email.as_bytes()).decode(),
-        "threadId": thread_id,
-    }
-    return gmail.users().messages().send(userId="me", body=create_message).execute()
-
-
-def extract_email_from_sender(sender: Optional[str]) -> str:
-    """Extract email address from 'Name <email@example.com>' or return as-is if plain email."""
-    if not sender or not sender.strip():
-        return ""
-    s = sender.strip()
-    m = re.search(r"<([^>]+)>", s)
-    if m:
-        return m.group(1).strip()
-    if "@" in s:
-        return s
-    return s
-
-
-@app.route('/send-email', methods=['POST'])
-def api_send_email():
-    """Send an email via Gmail API. Expects to (or reply_to/sender), subject, content in JSON body."""
-    try:
-        data = request.json or {}
-        to_addr = (data.get("to") or data.get("reply_to") or "").strip()
-        if not to_addr and data.get("sender"):
-            to_addr = extract_email_from_sender(data.get("sender"))
-        if not to_addr:
-            return jsonify({"status": "error", "message": "Recipient (to) is required"}), 400
-        subject = (data.get("subject") or "").strip()
-        content = (data.get("content") or data.get("body") or "").strip()
-        if not content:
-            return jsonify({"status": "error", "message": "Content is required"}), 400
-        if not subject:
-            subject = "(no subject)"
-        thread_id = (data.get("thread_id") or data.get("threadId") or "").strip() or None
-        gmail_msg_id = (data.get("gmail_message_id") or data.get("gmailMessageId") or "").strip() or None
-
-        gmail = gmail_auth()
-        if thread_id and gmail_msg_id:
-            send_reply_in_thread(gmail, to_addr, subject, content, thread_id, gmail_msg_id)
-        else:
-            send_email(gmail, {"To": to_addr, "Subject": subject, "Content": content}, thread_id=thread_id)
-        logger.info(f"Sent email to {to_addr} subject={subject[:50]}")
-        return jsonify({"status": "success", "message": "Email sent"})
-    except Exception as e:
-        logger.error(f"Error sending email: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/ingest_calendar', methods=['POST'])
-def ingest_calendar():
-    """API endpoint to trigger Google Calendar ingestion."""
-    try:
-        db_path = request.json.get('db_path', 'extracted.db')
-        logger.info(f"Starting Calendar ingestion for database: {db_path}")
-
-        ingest_stats = ingest_calendar_events(db_path)
-        summary = get_db_summary(db_path)
-
-        logger.info("Calendar ingestion completed successfully.")
-        return jsonify({
-            "status": "success",
-            "message": "Calendar events ingested successfully.",
-            "ingest": ingest_stats,
-            "summary": summary,
-        })
-    except Exception as e:
-        logger.error(f"Error during Calendar ingestion: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/calendar/events', methods=['GET', 'POST'])
-def calendar_events():
-    """GET: Update from Google Calendar, then return events from local DB.
-    POST: Add a new event to the local DB."""
-    if request.method == 'POST':
-        return add_calendar_event()
-    return get_calendar_events()
-
-
-@app.route('/calendar/events/<int:event_id>/remove', methods=['POST'])
-def remove_calendar_event(event_id: int):
-    """Mark an event as removed (soft delete)."""
-    try:
-        db_path = (request.json or {}).get('db_path', 'extracted.db')
-        conn = sqlite3.connect(db_path)
-        _ensure_events_removed_column(conn)
-        cur = conn.execute("UPDATE events SET removed = 1 WHERE id = ?", (event_id,))
-        conn.commit()
-        conn.close()
-        if cur.rowcount == 0:
-            return jsonify({"status": "error", "message": "Event not found"}), 404
-        logger.info(f"Marked calendar event id={event_id} as removed")
-        return jsonify({"status": "success", "message": "Event removed"})
-    except Exception as e:
-        logger.error(f"Error removing calendar event: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-def _parse_time_to_hour_min(time_str: str) -> Tuple[int, int]:
-    """Parse '10:00 AM' or '10:00' to (hour, minute)."""
-    if not time_str:
-        return 9, 0
-    m = re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)?", str(time_str).strip(), re.I)
-    if not m:
-        return 9, 0
-    h, min_val = int(m.group(1)), int(m.group(2))
-    ampm = (m.group(3) or "").upper()
-    if ampm == "PM" and h < 12:
-        h += 12
-    if ampm == "AM" and h == 12:
-        h = 0
-    return h, min_val
-
-
-def add_calendar_event():
-    """Insert a new event into the local events table.
-    Expects start_utc (ISO string, local time converted to UTC by client) or date+time."""
-    try:
-        data = request.json or {}
-        summary = (data.get('summary') or data.get('title') or '').strip()
-        if not summary:
-            return jsonify({"status": "error", "message": "Title is required"}), 400
-
-        duration_seconds = data.get('duration_seconds')
-        if duration_seconds is not None:
-            duration_seconds = int(duration_seconds)
-        else:
-            duration_min = int(data.get('duration_minutes') or data.get('duration') or 60)
-            duration_seconds = duration_min * 60
-
-        start_utc_raw = data.get('start_utc')
-        if start_utc_raw:
-            try:
-                start_dt = datetime.fromisoformat(start_utc_raw.replace('Z', '+00:00'))
-                if start_dt.tzinfo is None:
-                    start_dt = start_dt.replace(tzinfo=timezone.utc)
-                else:
-                    start_dt = start_dt.astimezone(timezone.utc)
-                start_utc = start_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+00:00'
-            except (ValueError, TypeError):
-                return jsonify({"status": "error", "message": "Invalid start_utc format"}), 400
-        else:
-            date_str = (data.get('date') or '').strip()
-            if not date_str:
-                return jsonify({"status": "error", "message": "Date or start_utc is required"}), 400
-            time_str = data.get('time') or '09:00 AM'
-            h, min_val = _parse_time_to_hour_min(time_str)
-            try:
-                y, mo, d = map(int, date_str.split('-'))
-            except (ValueError, AttributeError):
-                return jsonify({"status": "error", "message": "Invalid date format (use YYYY-MM-DD)"}), 400
-            start_dt = datetime(y, mo, d, h, min_val, 0, tzinfo=timezone.utc)
-            start_utc = start_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+00:00'
-
-        end_dt = start_dt + timedelta(seconds=duration_seconds)
-        end_utc = end_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+00:00'
-
-        description = (data.get('description') or data.get('notes') or '').strip() or None
-        location = (data.get('location') or '').strip() or None
-
-        db_path = data.get('db_path', 'extracted.db')
-        conn = sqlite3.connect(db_path)
-        _ensure_events_duration_seconds_column(conn)
-        conn.execute(
-            """
-            INSERT INTO events(start_utc, end_utc, summary, description, location, duration_seconds)
-            VALUES(?, ?, ?, ?, ?, ?)
-            """,
-            (start_utc, end_utc, summary, description, location, duration_seconds),
-        )
-        row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.commit()
-        conn.close()
-
-        logger.info(f"Added calendar event id={row_id} summary={summary}")
-        return jsonify({
-            "status": "success",
-            "message": "Event added",
-            "id": row_id,
-        })
-    except Exception as e:
-        logger.error(f"Error adding calendar event: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-def _ensure_events_removed_column(conn: sqlite3.Connection) -> None:
-    """Add removed column to events table if it doesn't exist (migration)."""
-    try:
-        conn.execute("ALTER TABLE events ADD COLUMN removed INTEGER NOT NULL DEFAULT 0")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
-
-
-def _ensure_events_duration_seconds_column(conn: sqlite3.Connection) -> None:
-    """Add duration_seconds column and backfill from start/end (migration)."""
-    try:
-        conn.execute("ALTER TABLE events ADD COLUMN duration_seconds INTEGER")
-        conn.commit()
-        # Backfill: compute duration from start_utc and end_utc for existing rows
-        rows = conn.execute(
-            "SELECT id, start_utc, end_utc FROM events WHERE duration_seconds IS NULL"
-        ).fetchall()
-        for row in rows:
-            try:
-                start_dt = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
-                end_dt = datetime.fromisoformat(row[2].replace("Z", "+00:00"))
-                secs = int((end_dt - start_dt).total_seconds())
-                conn.execute("UPDATE events SET duration_seconds = ? WHERE id = ?", (secs, row[0]))
-            except (ValueError, TypeError):
-                pass
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
-
-
-def get_calendar_events():
-    """Update from Google Calendar, then return events from local DB."""
-    try:
-        db_path = request.args.get('db_path', 'extracted.db')
-        logger.info(f"Updating Calendar before read. DB: {db_path}")
-
-        ingest_stats = ingest_calendar_events(db_path)
-
-        conn = sqlite3.connect(db_path)
-        _ensure_events_removed_column(conn)
-        _ensure_events_duration_seconds_column(conn)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        cur.execute("""
-            SELECT id, summary, description, start_utc, end_utc, location, duration_seconds
-            FROM events
-            WHERE COALESCE(removed, 0) = 0
-            ORDER BY start_utc ASC
-        """)
-
-        rows = [dict(row) for row in cur.fetchall()]
-        conn.close()
-
-        return jsonify({
-            "status": "success",
-            "updated": ingest_stats,
-            "events": rows
-        })
-
-    except Exception as e:
-        logger.error(f"Error fetching calendar events: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-# @app.route('/gmail/extracted', methods=['GET'])
-# def get_extracted_events():
-#   """Get extracted events from the database."""
-# 
-# CREATE TABLE IF NOT EXISTS extracted_dates (
-#   id INTEGER PRIMARY KEY AUTOINCREMENT,
-#   message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-#   raw_span TEXT NOT NULL,
-#   parsed_at_utc TEXT NOT NULL,
-#   confidence REAL,
-#   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-# 
-#   -- Resolved absolute date from raw_span
-#   resolved_date TEXT
-# );
-
-
 @app.route('/ingest', methods=['POST'])
 def ingest():
     """API endpoint to trigger Gmail ingestion."""
@@ -1280,7 +764,12 @@ def ingest():
         payload = request.json or {}
         db_path = payload.get('db_path', 'extracted.db')
         reset_flag = bool(payload.get('reset_cursor'))
-        force_reauth_flag = bool(payload.get('force_reauth')) if payload.get('force_reauth') is not None else False
+        # By default, reuse token and only force reauth when explicitly requested.
+        force_reauth_flag = payload.get('force_reauth')
+        if force_reauth_flag is None:
+            force_reauth_flag = False
+        else:
+            force_reauth_flag = bool(force_reauth_flag)
         logger.info(f"Starting Gmail ingestion for database: {db_path} reset_cursor={reset_flag} force_reauth={force_reauth_flag}")
         ingest_stats = ingest_gmail(db_path, reset_cursor_flag=reset_flag, force_reauth=force_reauth_flag)
         summary = get_db_summary(db_path)
@@ -1293,73 +782,6 @@ def ingest():
         })
     except Exception as e:
         logger.error(f"Error during Gmail ingestion: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/conversations/delete', methods=['POST'])
-def delete_conversation():
-    """Delete a conversation by thread_id (removes conversation + all messages) or by message_ids (single-email case)."""
-    try:
-        data = request.json or {}
-        db_path = data.get('db_path', 'extracted.db')
-        thread_id = (data.get('thread_id') or data.get('threadId') or "").strip() or None
-        message_ids = data.get('message_ids') or data.get('messageIds') or []
-
-        conn = sqlite3.connect(db_path)
-        try:
-            if thread_id:
-                cur = conn.execute(
-                    "DELETE FROM conversations WHERE thread_key = ? AND source = 'gmail'",
-                    (thread_id,),
-                )
-                deleted = cur.rowcount
-            elif message_ids:
-                ids = [int(x) for x in message_ids if x is not None]
-                if not ids:
-                    return jsonify({"status": "error", "message": "thread_id or message_ids required"}), 400
-                placeholders = ",".join("?" * len(ids))
-                cur = conn.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", ids)
-                deleted = cur.rowcount
-            else:
-                return jsonify({"status": "error", "message": "thread_id or message_ids required"}), 400
-            conn.commit()
-        finally:
-            conn.close()
-        logger.info(f"Deleted conversation/msgs: thread_id={thread_id} message_ids={message_ids} rows={deleted}")
-        return jsonify({"status": "success", "message": "Conversation deleted", "deleted": deleted})
-    except Exception as e:
-        logger.error(f"Error deleting conversation: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/emails', methods=['GET'])
-def get_emails():
-    """Return all emails from the ingestion DB with subject from conversation."""
-    try:
-        db_path = request.args.get('db_path', 'extracted.db')
-        limit = min(int(request.args.get('limit', 200)), 500)
-        conn = open_sqlite_rw(db_path)
-        try:
-            rows = conn.execute(
-                """
-                SELECT m.id, m.sender, m.sent_at_utc, m.text, m.is_from_me,
-                       substr(m.text, 1, 300) AS snippet,
-                       c.display_name AS subject,
-                       c.thread_key AS thread_id,
-                       m.source_msg_key AS gmail_message_id
-                FROM messages m
-                LEFT JOIN conversations c ON m.conversation_id = c.id
-                ORDER BY m.source_rowid DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-            emails = [dict(r) for r in rows]
-        finally:
-            conn.close()
-        return jsonify({"status": "success", "emails": emails})
-    except Exception as e:
-        logger.error(f"Error fetching emails: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -1379,6 +801,21 @@ def summary():
     except Exception as e:
         logger.error(f"Error during summary fetch: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/routes', methods=['GET'])
+def routes():
+    """Debug endpoint: list all registered Flask routes."""
+    rule_rows = []
+    for rule in app.url_map.iter_rules():
+        methods = sorted([m for m in rule.methods if m not in {"HEAD", "OPTIONS"}])
+        rule_rows.append({
+            "rule": str(rule),
+            "methods": methods,
+            "endpoint": rule.endpoint,
+        })
+    rule_rows.sort(key=lambda x: x["rule"])
+    return jsonify({"status": "success", "routes": rule_rows})
 
 
 @app.route('/lookup_message', methods=['GET'])
@@ -1427,7 +864,31 @@ def lookup_message():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/suggest_reply', methods=['POST'])
+@app.route('/suggest-reply', methods=['POST'])
+@app.route('/reply_suggestions', methods=['POST'])
+@app.route('/api/suggest_reply', methods=['POST'])
+def suggest_reply():
+    """Generate AI reply suggestions for a message payload."""
+    try:
+        payload = request.json or {}
+        subject = (payload.get('subject') or '').strip()
+        body = (payload.get('body') or '').strip()
+        sender_name = (payload.get('sender_name') or '').strip()
+
+        if not subject and not body:
+            return jsonify({"status": "error", "message": "subject or body is required"}), 400
+
+        suggestions = ai_reply_suggestions(subject, body, sender_name)
+        return jsonify({"status": "success", "suggestions": suggestions})
+    except Exception as e:
+        logger.error(f"Error during suggest_reply: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 if __name__ == "__main__":
+    # Run the Flask app for API integration on an alternate port to avoid conflicts
+    # Auto-trigger a one-time ingest on startup so auth prompts appear without manual POST.
     try:
         logger.info("Auto-start ingest on startup: force_reauth=False reset_cursor=False")
         ingest_gmail("extracted.db", reset_cursor_flag=False, force_reauth=False)
@@ -1436,4 +897,4 @@ if __name__ == "__main__":
 
     start_auto_ingest_worker("extracted.db", AUTO_INGEST_INTERVAL_SECONDS)
 
-    app.run(debug=True, host="0.0.0.0", port=5001)
+    app.run(debug=False, host="0.0.0.0", port=5001)
