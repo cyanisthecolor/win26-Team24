@@ -1526,9 +1526,9 @@ function JunkTab({ deletedItems = [] }) {
 // ─── Dashboard Shell ──────────────────────────────────────────────────────────
 const TABS = [
   { key: 'notifications', label: 'Inbox', icon: '🔔' },
-  { key: 'emails', label: 'Emails', icon: '✉️' },
   { key: 'threads', label: 'Threads', icon: '🧵' },
   { key: 'calendar', label: 'Calendar', icon: '📅' },
+  { key: 'emails', label: 'Emails', icon: '✉️' },
   { key: 'todo', label: 'Links & Attachments', icon: '📌' },
   { key: 'junk', label: 'Junk', icon: '🗑️' },
 ];
@@ -1575,12 +1575,9 @@ function Dashboard({ ingestData, loadSummary }) {
 
   useEffect(() => {
     loadSummary?.();
-    if (tab === 'calendar') {
-      loadCalendarEvents();
-    } else if (tab === 'emails') {
-      loadEmails();
-    }
-  }, [tab]);
+    loadCalendarEvents();
+    loadEmails();
+  }, []);
 
   return (
     <SafeAreaView style={s.root}>
