@@ -100,6 +100,69 @@ function priorityBg(p) {
   return C.surfaceAlt;
 }
 
+function localFallbackReplySuggestions(message) {
+  const text = `${message?.title || ''} ${message?.body || ''}`.toLowerCase();
+  if (text.includes('verify') || text.includes('security') || text.includes('password') || text.includes('login') || text.includes('sign-in')) {
+    return [
+      'Thanks for the heads-up. I verified this on my side.',
+      'I did not initiate this. Please lock the account and share next steps.',
+      'Received. I completed the verification successfully.',
+    ];
+  }
+  if (text.includes('meeting') || text.includes('schedule') || text.includes('calendar') || text.includes('time')) {
+    return [
+      'Thanks! That time works for me.',
+      'Could we move this by 30 minutes due to a conflict?',
+      'Confirmed, I will join and come prepared.',
+    ];
+  }
+  return [
+    'Thanks for the update. I will follow up shortly.',
+    'Received — I reviewed this and will respond with details soon.',
+    'Got it. I will take care of this today.',
+  ];
+}
+
+async function fetchReplySuggestions(message) {
+  const payload = {
+    subject: message?.title || '',
+    body: message?.body || '',
+    sender_name: message?.senderName || '',
+  };
+  const paths = ['/suggest_reply', '/suggest-reply', '/reply_suggestions', '/api/suggest_reply'];
+
+  let lastError = null;
+  for (const path of paths) {
+    const response = await fetch(`${getBaseUrl()}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    const raw = await response.text();
+    let data = null;
+    try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+
+    if (response.ok) {
+      const suggestions = Array.isArray(data?.suggestions) ? data.suggestions : [];
+      return suggestions.filter(Boolean);
+    }
+
+    if (response.status !== 404) {
+      const msg = data?.message || `HTTP ${response.status} ${response.statusText}`;
+      throw new Error(msg);
+    }
+
+    lastError = new Error(`HTTP ${response.status} ${response.statusText}`);
+  }
+
+  if (lastError && `${lastError.message}`.includes('404')) {
+    return localFallbackReplySuggestions(message);
+  }
+
+  throw lastError || new Error('AI suggestion endpoint not found');
+}
+
 function getBaseUrl() {
   if (BASE_URL_OVERRIDE) return BASE_URL_OVERRIDE;
   // Prefer Expo host when available (useful for real devices on LAN)
@@ -292,8 +355,11 @@ function DoneScreen({ connectedCount, contactCount }) {
 // ─── Dashboard: Notifications Tab ─────────────────────────────────────────────
 function NotificationsTab({ notifications, setNotifications, ingestMessages = [], ingestDates = [], isDeleted, onMoveToJunk }) {
   const notifs = notifications;
-  const unread = notifs.filter(n => !n.read && !isDeleted(`notif-${n.id}`));
-  const read = notifs.filter(n => n.read && !isDeleted(`notif-${n.id}`));
+  const [selectedMessage, setSelectedMessage] = useState(null);
+  const [replySuggestions, setReplySuggestions] = useState([]);
+  const [isLoadingSuggestions, setIsLoadingSuggestions] = useState(false);
+  const [suggestionsError, setSuggestionsError] = useState('');
+  const [gmailReadMap, setGmailReadMap] = useState({});
 
   const dateMessageIds = React.useMemo(() => {
     const ids = new Set();
@@ -316,8 +382,10 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
       .map(m => ({
         id: `ing-msg-${m.id}`,
         junkKey: `gmail-${m.id}`,
+        readKey: `gmail-${m.id}`,
         title: (m.subject || 'Gmail Message').trim(),
         body: (m.snippet || '').trim(),
+        senderName: (m.sender_name || m.sender || '').trim(),
         source: 'Gmail',
         sourceIcon: '✉️',
         timestamp: m.sent_at_utc ? new Date(m.sent_at_utc).getTime() : Date.now(),
@@ -325,12 +393,73 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
       .filter(n => !isDeleted(n.junkKey));
   }, [ingestMessages, dateMessageIds, isDeleted]);
 
+  const appInbox = React.useMemo(() => {
+    return (notifs || [])
+      .filter(n => !isDeleted(`notif-${n.id}`))
+      .map(n => ({
+        ...n,
+        readKey: `notif-${n.id}`,
+      }));
+  }, [notifs, isDeleted]);
+
+  const unreadApp = appInbox.filter(n => !n.read);
+  const readApp = appInbox.filter(n => n.read);
+  const unreadGmail = inboxFromGmail.filter(n => !gmailReadMap[n.readKey]);
+  const readGmail = inboxFromGmail.filter(n => !!gmailReadMap[n.readKey]);
+  const unreadCount = unreadApp.length + unreadGmail.length;
+  const totalCount = appInbox.length + inboxFromGmail.length;
+
   function markRead(id) { setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n)); }
-  function markAll() { setNotifications(p => p.map(n => ({ ...n, read: true }))); }
+  function markAll() {
+    setNotifications(p => p.map(n => ({ ...n, read: true })));
+    setGmailReadMap(prev => {
+      const next = { ...prev };
+      inboxFromGmail.forEach((item) => {
+        next[item.readKey] = true;
+      });
+      return next;
+    });
+  }
+
+  async function openMessage(message, readKey) {
+    if (readKey?.startsWith('notif-')) {
+      markRead(readKey.replace('notif-', ''));
+    }
+    if (readKey?.startsWith('gmail-')) {
+      setGmailReadMap(prev => ({ ...prev, [readKey]: true }));
+    }
+
+    setSelectedMessage(message);
+    setReplySuggestions([]);
+    setSuggestionsError('');
+    setIsLoadingSuggestions(true);
+
+    try {
+      const suggestions = await fetchReplySuggestions(message);
+      setReplySuggestions(suggestions);
+    } catch (error) {
+      setSuggestionsError(error?.message || 'Failed to load AI suggestions');
+      setReplySuggestions([]);
+    } finally {
+      setIsLoadingSuggestions(false);
+    }
+  }
 
   function Card({ n }) {
     return (
-      <TouchableOpacity style={[s.notifCard, !n.read && s.notifCardUnread]} onPress={() => markRead(n.id)} activeOpacity={0.8}>
+      <TouchableOpacity
+        style={[s.notifCard, !n.read && s.notifCardUnread]}
+        onPress={() => {
+          openMessage({
+            title: n.title,
+            body: n.body,
+            source: n.source,
+            timestamp: n.timestamp,
+            senderName: n.senderName || '',
+          }, n.readKey);
+        }}
+        activeOpacity={0.8}
+      >
         <View style={{ flexDirection: 'row', gap: 12 }}>
           <View style={s.notifBubble}><Text style={{ fontSize: 18 }}>{n.sourceIcon}</Text></View>
           <View style={{ flex: 1 }}>
@@ -359,27 +488,69 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Notifications</Text>
-          <Text style={s.dashSubtitle}>{unread.length} unread · {notifs.length + inboxFromGmail.length} total</Text>
+          <Text style={s.dashSubtitle}>{unreadCount} unread · {totalCount} total</Text>
         </View>
-        {unread.length > 0 && (
+        {unreadCount > 0 && (
           <TouchableOpacity onPress={markAll} style={s.markAllBtn}>
             <Text style={{ fontSize: 12, color: C.textSecondary, fontWeight: '600' }}>Mark all read</Text>
           </TouchableOpacity>
         )}
       </View>
-      {unread.length > 0 && <>
+
+      {(unreadApp.length > 0 || unreadGmail.length > 0) && <>
         <Text style={s.groupLabel}>UNREAD</Text>
-        {unread.map(n => <Card key={n.id} n={n} />)}
-      </>}
-      {read.length > 0 && <>
-        <Text style={[s.groupLabel, { marginTop: 16 }]}>EARLIER</Text>
-        {read.map(n => <Card key={n.id} n={n} />)}
+        {unreadApp.length > 0 && <Text style={[s.groupLabel, { marginTop: 8, fontSize: 11 }]}>FROM APPS</Text>}
+        {unreadApp.map(n => <Card key={n.readKey} n={n} />)}
+        {unreadGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM GMAIL</Text>}
+        {unreadGmail.map(n => (
+          <TouchableOpacity
+            key={n.id}
+            style={s.notifCard}
+            activeOpacity={0.8}
+            onPress={() => openMessage({
+              title: n.title,
+              body: n.body,
+              source: n.source,
+              timestamp: n.timestamp,
+              senderName: n.senderName || '',
+            }, n.readKey)}
+          >
+            <View style={{ flexDirection: 'row', gap: 12 }}>
+              <View style={s.notifBubble}><Text style={{ fontSize: 18 }}>{n.sourceIcon}</Text></View>
+              <View style={{ flex: 1 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
+                  <View style={s.unreadDot} />
+                  <TouchableOpacity onPress={() => onMoveToJunk({ key: n.junkKey, from: 'Inbox', title: n.title, subtitle: n.body, timestamp: n.timestamp })}>
+                    <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
+                  </TouchableOpacity>
+                </View>
+                {!!n.body && <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20, marginTop: 4 }} numberOfLines={2}>{n.body}</Text>}
+                <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>{n.source} · {timeAgo(n.timestamp)}</Text>
+              </View>
+            </View>
+          </TouchableOpacity>
+        ))}
       </>}
 
-      {inboxFromGmail.length > 0 && <>
-        <Text style={[s.groupLabel, { marginTop: 16 }]}>FROM GMAIL</Text>
-        {inboxFromGmail.map(n => (
-          <View key={n.id} style={s.notifCard}>
+      {(readApp.length > 0 || readGmail.length > 0) && <>
+        <Text style={[s.groupLabel, { marginTop: 16 }]}>READ</Text>
+        {readApp.length > 0 && <Text style={[s.groupLabel, { marginTop: 8, fontSize: 11 }]}>FROM APPS</Text>}
+        {readApp.map(n => <Card key={n.readKey} n={n} />)}
+        {readGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM GMAIL</Text>}
+        {readGmail.map(n => (
+          <TouchableOpacity
+            key={n.id}
+            style={s.notifCard}
+            activeOpacity={0.8}
+            onPress={() => openMessage({
+              title: n.title,
+              body: n.body,
+              source: n.source,
+              timestamp: n.timestamp,
+              senderName: n.senderName || '',
+            }, n.readKey)}
+          >
             <View style={{ flexDirection: 'row', gap: 12 }}>
               <View style={s.notifBubble}><Text style={{ fontSize: 18 }}>{n.sourceIcon}</Text></View>
               <View style={{ flex: 1 }}>
@@ -393,9 +564,48 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
                 <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>{n.source} · {timeAgo(n.timestamp)}</Text>
               </View>
             </View>
-          </View>
+          </TouchableOpacity>
         ))}
       </>}
+
+      <Modal visible={!!selectedMessage} transparent animationType="slide" onRequestClose={() => setSelectedMessage(null)}>
+        <View style={s.modalOverlay}>
+          <View style={s.modalSheet}>
+            {selectedMessage && <>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
+                <Text style={s.modalTitle}>{selectedMessage.title}</Text>
+                <TouchableOpacity onPress={() => setSelectedMessage(null)}>
+                  <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
+                </TouchableOpacity>
+              </View>
+              <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>
+                {selectedMessage.source} · {timeAgo(selectedMessage.timestamp)}
+              </Text>
+              <View style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12, marginBottom: 14 }}>
+                <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>
+                  {selectedMessage.body || 'No content preview available.'}
+                </Text>
+              </View>
+
+              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>AI SUGGESTED REPLIES</Text>
+              {isLoadingSuggestions && (
+                <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>Generating suggestions...</Text>
+              )}
+              {!isLoadingSuggestions && !!suggestionsError && (
+                <Text style={{ color: C.red, fontSize: 13, marginBottom: 8 }}>{suggestionsError}</Text>
+              )}
+              {!isLoadingSuggestions && !suggestionsError && replySuggestions.length === 0 && (
+                <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>No suggestions available.</Text>
+              )}
+              {replySuggestions.map((reply, idx) => (
+                <TouchableOpacity key={`${idx}-${reply}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8 }}>
+                  <Text style={{ color: C.textPrimary, fontSize: 13, lineHeight: 19 }}>{reply}</Text>
+                </TouchableOpacity>
+              ))}
+            </>}
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 }
@@ -403,6 +613,11 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
 // ─── Dashboard: Calendar Tab ──────────────────────────────────────────────────
 function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveToJunk }) {
   const [selected, setSelected] = useState(null);
+  const [selectedDay, setSelectedDay] = useState(null);
+  const [monthCursor, setMonthCursor] = useState(() => {
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  });
 
   const msgById = React.useMemo(() => {
     const m = {};
@@ -448,20 +663,55 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
     })
     .filter(Boolean);
 
-  const grouped = [...ingestEvents.filter(e => !isDeleted(e.junkKey))].reduce((acc, e) => {
-    if (!acc[e.date]) acc[e.date] = [];
-    acc[e.date].push(e);
-    return acc;
-  }, {});
+  const visibleEvents = ingestEvents.filter(e => !isDeleted(e.junkKey));
 
-  const sortedDates = Object.keys(grouped).sort((a, b) => new Date(b) - new Date(a));
+  const eventMap = React.useMemo(() => {
+    const out = {};
+    visibleEvents.forEach((event) => {
+      if (!out[event.date]) out[event.date] = [];
+      out[event.date].push(event);
+    });
+    return out;
+  }, [visibleEvents]);
+
+  const monthTitle = monthCursor.toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  const firstOfMonth = monthCursor;
+  const startDow = firstOfMonth.getUTCDay();
+  const gridStart = new Date(Date.UTC(firstOfMonth.getUTCFullYear(), firstOfMonth.getUTCMonth(), 1 - startDow));
+  const gridDays = Array.from({ length: 42 }).map((_, i) => {
+    const d = new Date(gridStart);
+    d.setUTCDate(gridStart.getUTCDate() + i);
+    return d;
+  });
+
+  function toDateKey(d) {
+    return d.toISOString().slice(0, 10);
+  }
+
+  const selectedDateKey = selectedDay ? toDateKey(selectedDay) : null;
+  const selectedDayEvents = selectedDateKey ? (eventMap[selectedDateKey] || []) : [];
+
+  function prevMonth() {
+    setMonthCursor((prev) => new Date(Date.UTC(prev.getUTCFullYear(), prev.getUTCMonth() - 1, 1)));
+    setSelectedDay(null);
+  }
+
+  function nextMonth() {
+    setMonthCursor((prev) => new Date(Date.UTC(prev.getUTCFullYear(), prev.getUTCMonth() + 1, 1)));
+    setSelectedDay(null);
+  }
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
       <View style={s.dashHeader}>
-        <View>
+        <View style={{ flex: 1 }}>
           <Text style={s.dashTitle}>Calendar</Text>
           <Text style={s.dashSubtitle}>{ingestEvents.length} events from extracted dates</Text>
+        </View>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+          <TouchableOpacity onPress={prevMonth}><Text style={{ color: C.textSecondary, fontSize: 20 }}>‹</Text></TouchableOpacity>
+          <Text style={{ color: C.textPrimary, fontWeight: '700', fontSize: 14, minWidth: 120, textAlign: 'center' }}>{monthTitle}</Text>
+          <TouchableOpacity onPress={nextMonth}><Text style={{ color: C.textSecondary, fontSize: 20 }}>›</Text></TouchableOpacity>
         </View>
       </View>
 
@@ -469,26 +719,45 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
         <Text style={{ color: C.textMuted, fontSize: 13, marginBottom: 12 }}>No extracted dates yet.</Text>
       )}
 
-      {sortedDates.map(date => (
-        <View key={date} style={{ marginBottom: 6 }}>
-          <Text style={s.calDateLabel}>{formatDate(date)}</Text>
-          {grouped[date].map(e => (
-            <TouchableOpacity key={e.id} style={s.eventCard} onPress={() => setSelected(e)} activeOpacity={0.8}>
-              <View style={{ width: 56, alignItems: 'flex-end' }}>
-                <Text style={{ fontSize: 12, fontWeight: '700', color: C.textPrimary }}>{e.time}</Text>
-                {e.duration && <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{e.duration}</Text>}
-              </View>
-              <View style={{ width: 2, height: 40, backgroundColor: C.accent, borderRadius: 2, opacity: 0.5 }} />
-              <View style={{ flex: 1 }}>
-                <Text style={{ fontSize: 14, fontWeight: '600', color: C.textPrimary, marginBottom: 6 }}>{e.title}</Text>
-                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
-                  {e.attendees.map(a => (
-                    <View key={a} style={s.attendeeChip}><Text style={{ fontSize: 11, color: C.textSecondary, fontWeight: '500' }}>{a}</Text></View>
+      <View style={s.calGridWrap}>
+        <View style={s.calWeekRow}>
+          {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((d, idx) => (
+            <Text key={`${d}-${idx}`} style={s.calWeekLabel}>{d}</Text>
+          ))}
+        </View>
+
+        <View style={s.calGrid}>
+          {gridDays.map((day) => {
+            const key = toDateKey(day);
+            const inMonth = day.getUTCMonth() === monthCursor.getUTCMonth();
+            const dayEvents = eventMap[key] || [];
+            const isSelected = selectedDateKey === key;
+            return (
+              <TouchableOpacity key={key} style={[s.calCell, !inMonth && s.calCellMuted, isSelected && s.calCellSelected]} onPress={() => setSelectedDay(day)} activeOpacity={0.8}>
+                <Text style={[s.calCellNum, !inMonth && s.calCellNumMuted]}>{day.getUTCDate()}</Text>
+                <View style={s.calDotRow}>
+                  {dayEvents.slice(0, 3).map((ev) => (
+                    <View key={`dot-${ev.id}`} style={s.calDot} />
                   ))}
                 </View>
-              </View>
-              <View style={{ alignItems: 'center', gap: 8 }}>
-                <Text style={{ fontSize: 18 }}>{e.sourceIcon}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
+
+      {selectedDateKey && (
+        <View style={{ marginTop: 14 }}>
+          <Text style={s.groupLabel}>EVENTS · {formatDate(selectedDateKey)}</Text>
+          {selectedDayEvents.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13, marginBottom: 12 }}>No events on this day.</Text>}
+          {selectedDayEvents.map((e) => (
+            <TouchableOpacity key={e.id} style={s.notifCard} onPress={() => setSelected(e)} activeOpacity={0.8}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                <Text style={{ color: C.textSecondary, fontSize: 12, minWidth: 44 }}>{e.time || 'All day'}</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.notifTitle} numberOfLines={1}>{e.title}</Text>
+                  {!!e.notes && <Text style={{ color: C.textSecondary, fontSize: 12, marginTop: 4 }} numberOfLines={1}>{e.notes}</Text>}
+                </View>
                 <TouchableOpacity onPress={() => onMoveToJunk({ key: e.junkKey, from: 'Calendar', title: e.title, subtitle: e.notes, timestamp: Date.now() })}>
                   <Text style={{ color: C.textMuted, fontSize: 18, fontWeight: '700' }}>×</Text>
                 </TouchableOpacity>
@@ -496,7 +765,7 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
             </TouchableOpacity>
           ))}
         </View>
-      ))}
+      )}
 
       <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
         <View style={s.modalOverlay}>
@@ -747,7 +1016,7 @@ const TABS = [
 ];
 
 function Dashboard({ ingestData }) {
-  const [notifItems, setNotifItems] = useState(DATA.notifications);
+  const [notifItems, setNotifItems] = useState(DATA.notifications.map(n => ({ ...n, read: false })));
   const [deletedMap, setDeletedMap] = useState({});
   const [deletedItems, setDeletedItems] = useState([]);
   const [tab, setTab] = useState('notifications');
@@ -1022,6 +1291,17 @@ const s = StyleSheet.create({
   unreadDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: C.accent, marginLeft: 8 },
   badge: { borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
   badgeText: { fontSize: 10, fontWeight: '800', letterSpacing: 0.5 },
+  calGridWrap: { backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 10, marginBottom: 12 },
+  calWeekRow: { flexDirection: 'row', marginBottom: 8 },
+  calWeekLabel: { flex: 1, textAlign: 'center', color: C.textMuted, fontSize: 11, fontWeight: '700' },
+  calGrid: { flexDirection: 'row', flexWrap: 'wrap' },
+  calCell: { width: '14.2857%', height: 52, alignItems: 'center', justifyContent: 'center', borderRadius: 8, marginBottom: 4 },
+  calCellMuted: { opacity: 0.45 },
+  calCellSelected: { backgroundColor: C.accentSoft, borderWidth: 1, borderColor: C.accent },
+  calCellNum: { color: C.textPrimary, fontSize: 12, fontWeight: '600' },
+  calCellNumMuted: { color: C.textMuted },
+  calDotRow: { flexDirection: 'row', marginTop: 4, minHeight: 6, gap: 2 },
+  calDot: { width: 4, height: 4, borderRadius: 2, backgroundColor: C.accent },
   calDateLabel: { fontSize: 12, fontWeight: '700', color: C.textMuted, letterSpacing: 1, marginBottom: 8, marginTop: 8 },
   eventCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.surface, borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: C.border, gap: 12 },
   attendeeChip: { backgroundColor: C.surfaceAlt, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },

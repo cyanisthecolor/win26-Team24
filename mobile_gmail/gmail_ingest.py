@@ -1,9 +1,12 @@
 import base64
+import json
 import os
 import re
 import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.request
 from email.utils import parseaddr
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -46,6 +49,81 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 AUTO_INGEST_INTERVAL_SECONDS = int(os.environ.get("AUTO_INGEST_INTERVAL_SECONDS", "60"))
+
+
+def fallback_reply_suggestions(subject: str, body: str) -> List[str]:
+    text = f"{subject} {body}".lower()
+    if any(k in text for k in ["verify", "security", "password", "login", "sign-in"]):
+        return [
+            "Thanks for the heads-up. I verified this on my side.",
+            "I did not initiate this. Please lock the account and share next steps.",
+            "Received. I completed the verification successfully.",
+        ]
+    if any(k in text for k in ["meeting", "schedule", "calendar", "time"]):
+        return [
+            "Thanks! That time works for me.",
+            "Could we move this by 30 minutes due to a conflict?",
+            "Confirmed, I will join and come prepared.",
+        ]
+    return [
+        "Thanks for the update. I will follow up shortly.",
+        "Received — I reviewed this and will respond with details soon.",
+        "Got it. I will take care of this today.",
+    ]
+
+
+def ai_reply_suggestions(subject: str, body: str, sender_name: str = "") -> List[str]:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return fallback_reply_suggestions(subject, body)
+
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    url = f"{base_url.rstrip('/')}/chat/completions"
+
+    system_prompt = (
+        "You generate short, professional email reply suggestions. "
+        "Return strictly JSON array of 3 strings. No markdown, no extra keys."
+    )
+    user_prompt = (
+        f"Sender: {sender_name or 'Unknown'}\n"
+        f"Subject: {subject}\n"
+        f"Body: {body}\n\n"
+        "Write 3 concise reply options."
+    )
+
+    payload = {
+        "model": model,
+        "temperature": 0.4,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8")
+        parsed = json.loads(raw)
+        content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "[]")
+        suggestions = json.loads(content)
+        if isinstance(suggestions, list):
+            cleaned = [str(x).strip() for x in suggestions if str(x).strip()]
+            return cleaned[:3] if cleaned else fallback_reply_suggestions(subject, body)
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError, KeyError, IndexError, ValueError) as e:
+        logger.warning(f"AI suggestion API failed, using fallback: {e}")
+
+    return fallback_reply_suggestions(subject, body)
 
 # Modify the `looks_like_real_date` function to ensure valid spans like "tomorrow" and "Feb 22nd" are not filtered out.
 def looks_like_real_date(raw: str) -> bool:
@@ -725,6 +803,21 @@ def summary():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/routes', methods=['GET'])
+def routes():
+    """Debug endpoint: list all registered Flask routes."""
+    rule_rows = []
+    for rule in app.url_map.iter_rules():
+        methods = sorted([m for m in rule.methods if m not in {"HEAD", "OPTIONS"}])
+        rule_rows.append({
+            "rule": str(rule),
+            "methods": methods,
+            "endpoint": rule.endpoint,
+        })
+    rule_rows.sort(key=lambda x: x["rule"])
+    return jsonify({"status": "success", "routes": rule_rows})
+
+
 @app.route('/lookup_message', methods=['GET'])
 def lookup_message():
     """Find ingested messages by keyword and include extracted date rows for each message."""
@@ -768,6 +861,28 @@ def lookup_message():
             conn.close()
     except Exception as e:
         logger.error(f"Error during lookup_message: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/suggest_reply', methods=['POST'])
+@app.route('/suggest-reply', methods=['POST'])
+@app.route('/reply_suggestions', methods=['POST'])
+@app.route('/api/suggest_reply', methods=['POST'])
+def suggest_reply():
+    """Generate AI reply suggestions for a message payload."""
+    try:
+        payload = request.json or {}
+        subject = (payload.get('subject') or '').strip()
+        body = (payload.get('body') or '').strip()
+        sender_name = (payload.get('sender_name') or '').strip()
+
+        if not subject and not body:
+            return jsonify({"status": "error", "message": "subject or body is required"}), 400
+
+        suggestions = ai_reply_suggestions(subject, body, sender_name)
+        return jsonify({"status": "success", "suggestions": suggestions})
+    except Exception as e:
+        logger.error(f"Error during suggest_reply: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
