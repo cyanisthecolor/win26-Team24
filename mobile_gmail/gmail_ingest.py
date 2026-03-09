@@ -2,8 +2,11 @@ import base64
 import os
 import re
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
+from email.utils import parseaddr
 from typing import Dict, Iterable, List, Optional, Tuple, TypedDict, NotRequired
 
 from dateparser.search import search_dates
@@ -51,12 +54,13 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 CORS(app)
+AUTO_INGEST_INTERVAL_SECONDS = int(os.environ.get("AUTO_INGEST_INTERVAL_SECONDS", "60"))
 
 # Modify the `looks_like_real_date` function to ensure valid spans like "tomorrow" and "Feb 22nd" are not filtered out.
 def looks_like_real_date(raw: str) -> bool:
     s = (raw or "").lower().strip()
 
-    # Too short → almost always garbage
+    # Too short means almost always garbage
     if len(s) < 3:  # Reduced the minimum length to 3
         return False
 
@@ -92,7 +96,31 @@ def open_sqlite_rw(path: str) -> sqlite3.Connection:
         schema_sql = f.read()
         conn.executescript(schema_sql)
     conn.row_factory = sqlite3.Row
+    ensure_messages_schema(conn)
     return conn
+
+
+def ensure_messages_schema(conn: sqlite3.Connection) -> None:
+    cols = conn.execute("PRAGMA table_info(messages)").fetchall()
+    col_names = {c["name"] for c in cols}
+    changed = False
+
+    if "sender_name" not in col_names:
+        conn.execute("ALTER TABLE messages ADD COLUMN sender_name TEXT")
+        changed = True
+
+    # Best-effort backfill for existing rows
+    rows = conn.execute(
+        "SELECT id, sender FROM messages WHERE (sender_name IS NULL OR sender_name = '') AND sender IS NOT NULL"
+    ).fetchall()
+    for r in rows:
+        name, email = parseaddr(r["sender"])
+        sender_name = (name or "").strip() or (email or "").strip() or r["sender"]
+        conn.execute("UPDATE messages SET sender_name = ? WHERE id = ?", (sender_name, r["id"]))
+        changed = True
+
+    if changed:
+        conn.commit()
 
 
 def get_last_cursor(conn: sqlite3.Connection, source: str) -> int:
@@ -114,6 +142,10 @@ def set_last_cursor(conn: sqlite3.Connection, source: str, cursor: int) -> None:
         """,
         (source, cursor),
     )
+
+
+def reset_cursor(conn: sqlite3.Connection, source: str) -> None:
+    conn.execute("DELETE FROM sync_state WHERE source = ?", (source,))
 
 
 def upsert_conversation(conn: sqlite3.Connection, source: str, thread_key: str, display_name: Optional[str]) -> int:
@@ -140,16 +172,17 @@ def insert_message(
     source_rowid: int,  # Gmail internalDate (ms)
     conversation_id: int,
     sender: Optional[str],
+    sender_name: Optional[str],
     sent_at_utc: str,
     text: str,
 ) -> Optional[int]:
     try:
         conn.execute(
             """
-            INSERT INTO messages(source, source_msg_key, source_rowid, conversation_id, sender, is_from_me, sent_at_utc, text)
-            VALUES(?, ?, ?, ?, ?, 0, ?, ?)
+            INSERT INTO messages(source, source_msg_key, source_rowid, conversation_id, sender, sender_name, is_from_me, sent_at_utc, text)
+            VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
-            (source, source_msg_key, source_rowid, conversation_id, sender, sent_at_utc, text),
+            (source, source_msg_key, source_rowid, conversation_id, sender, sender_name, sent_at_utc, text),
         )
     except sqlite3.IntegrityError:
         return None
@@ -295,7 +328,7 @@ def fetch_db_snapshot(db_path: str, limit: int = 20) -> Dict[str, List[Dict]]:
     try:
         msgs = conn.execute(
             """
-            SELECT m.id, m.sender, m.sent_at_utc, substr(m.text, 1, 200) AS snippet,
+            SELECT m.id, m.sender, m.sent_at_utc, m.text, substr(m.text, 1, 200) AS snippet,
                    c.thread_key AS thread_id, m.source_msg_key AS gmail_message_id
             FROM messages m
             LEFT JOIN conversations c ON m.conversation_id = c.id
@@ -338,8 +371,28 @@ def fetch_db_snapshot(db_path: str, limit: int = 20) -> Dict[str, List[Dict]]:
         def rows_to_dict(rows: List[sqlite3.Row]) -> List[Dict]:
             return [dict(r) for r in rows]
 
+        def derive_subject(text_val: Optional[str]) -> Optional[str]:
+            if not text_val:
+                return None
+            prefix = "Subject: "
+            idx = text_val.find(prefix)
+            if idx != -1:
+                rest = text_val[idx + len(prefix):]
+                first_line = rest.splitlines()[0].strip()
+                return first_line or None
+            # fallback: use first non-empty line
+            for line in text_val.splitlines():
+                line = line.strip()
+                if line:
+                    return line
+            return None
+
+        msg_dicts = rows_to_dict(msgs)
+        for m in msg_dicts:
+            m['subject'] = derive_subject(m.get('text'))
+
         return {
-            "messages": rows_to_dict(msgs),
+            "messages": msg_dicts,
             "dates": rows_to_dict(dates),
             "links": rows_to_dict(links),
             "attachments": rows_to_dict(attachments),
@@ -348,7 +401,9 @@ def fetch_db_snapshot(db_path: str, limit: int = 20) -> Dict[str, List[Dict]]:
         conn.close()
 
 
-def google_credentials(creds_path: str = "credentials.json", token_path: str = "token.json"):
+def google_credentials(creds_path: str = "credentials.json", token_path: str = "token.json", force_reauth: bool = False):
+    if force_reauth and os.path.exists(token_path):
+        os.remove(token_path)
     creds = None
     if os.path.exists(token_path):
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
@@ -366,8 +421,8 @@ def google_credentials(creds_path: str = "credentials.json", token_path: str = "
     return creds
 
 
-def gmail_auth(creds_path: str = "credentials.json", token_path: str = "token.json"):
-    return build("gmail", "v1", credentials=google_credentials(creds_path, token_path))
+def gmail_auth(creds_path: str = "credentials.json", token_path: str = "token.json", force_reauth: bool = False):
+    return build("gmail", "v1", credentials=google_credentials(creds_path, token_path, force_reauth))
 
 
 def get_calendar(creds_path: str = "credentials.json", token_path: str = "token.json"):
@@ -444,27 +499,46 @@ def extract_attachment_metas(payload: Dict) -> List[Tuple[str, str, str]]:
 
 
 # Modify the `list_message_ids_since` function to ensure it retrieves the correct emails.
-def list_message_ids_since(service, user_id: str, after_seconds: int, max_pages: int = 25) -> List[str]:
-    # Adjust the Gmail query to ensure it retrieves emails from the correct time range
-    q = f"in:inbox after:{after_seconds}"
-    ids = []
-    page_token = None
+def list_message_ids_since(service, user_id: str, after_seconds: int, max_pages: int = 25) -> Tuple[List[str], str]:
+    def run_query(query: Optional[str], include_spam_trash: bool) -> List[str]:
+        ids: List[str] = []
+        page_token = None
+        for _ in range(max_pages):
+            kwargs = {
+                "userId": user_id,
+                "includeSpamTrash": include_spam_trash,
+                "pageToken": page_token,
+                "maxResults": 200,
+            }
+            if query:
+                kwargs["q"] = query
 
-    for _ in range(max_pages):
-        resp = service.users().messages().list(
-            userId=user_id,
-            q=q,
-            pageToken=page_token,
-            maxResults=200
-        ).execute()
+            resp = service.users().messages().list(**kwargs).execute()
+            ids.extend([m["id"] for m in resp.get("messages", []) or []])
 
-        ids.extend([m["id"] for m in resp.get("messages", []) or []])
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return ids
 
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
+    one_week_seconds = 7 * 24 * 60 * 60
+    week_floor_seconds = int(datetime.now(tz=timezone.utc).timestamp()) - one_week_seconds
+    effective_after = max(after_seconds, week_floor_seconds)
+    after_date_str = datetime.fromtimestamp(effective_after, tz=timezone.utc).strftime("%Y/%m/%d")
 
-    return ids
+    # Primary: only Gmail Primary category in the last week.
+    primary_q = f"category:primary -category:social -category:promotions -category:updates after:{after_date_str}"
+    primary_ids = run_query(primary_q, include_spam_trash=False)
+    if primary_ids:
+        return list(dict.fromkeys(primary_ids)), primary_q
+
+    # Fallback 1: primary category with explicit 7-day relative query.
+    fallback_q = "category:primary -category:social -category:promotions -category:updates newer_than:7d"
+    fallback_ids = run_query(query=fallback_q, include_spam_trash=False)
+    if fallback_ids:
+        return list(dict.fromkeys(fallback_ids)), fallback_q
+
+    return [], primary_q
 
 
 def fetch_emails_direct(out_db_path: str, source: str = "gmail", user_id: str = "me", max_messages: int = 100) -> Dict[str, int]:
@@ -527,6 +601,9 @@ def fetch_emails_direct(out_db_path: str, source: str = "gmail", user_id: str = 
             if not combined.strip():
                 combined = f"Subject: {subject}\n(no body)" if subject else "(no content)"
 
+            sender_name_hdr, sender_email_hdr = parseaddr(sender or "")
+            sender_name = (sender_name_hdr or "").strip() or (sender_email_hdr or "").strip() or (sender or "")
+
             conv_id = upsert_conversation(conn, source, thread_id, display_name=subject)
             msg_id_db = insert_message(
                 conn,
@@ -535,6 +612,7 @@ def fetch_emails_direct(out_db_path: str, source: str = "gmail", user_id: str = 
                 source_rowid=internal_ms,
                 conversation_id=conv_id,
                 sender=sender,
+                sender_name=sender_name,
                 sent_at_utc=sent_at_utc,
                 text=combined,
             )
@@ -558,21 +636,38 @@ def fetch_emails_direct(out_db_path: str, source: str = "gmail", user_id: str = 
         conn.close()
 
 
-def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me") -> Dict[str, int]:
+def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me", reset_cursor_flag: bool = False, force_reauth: bool = False) -> Dict[str, int]:
     conn = open_sqlite_rw(out_db_path)
-    service = gmail_auth()
+    service = gmail_auth(force_reauth=force_reauth)
 
+    account_email = None
+    try:
+        profile = service.users().getProfile(userId=user_id).execute()
+        account_email = profile.get('emailAddress')
+        logger.info(f"Authenticated Gmail account: {account_email}")
+    except Exception as e:
+        logger.warning(f"Unable to read Gmail profile: {e}")
+
+    if reset_cursor_flag:
+        reset_cursor(conn, source)
     last_ms = get_last_cursor(conn, source)
     last_dt = datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc) if last_ms else datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-    # Adjust the `after_seconds` calculation to ensure it retrieves recent emails
-    after_seconds = max(0, int(last_dt.timestamp()))
+    # Use a safety lookback window so late-arriving or re-labeled mail is not missed.
+    safety_lookback_seconds = 3 * 24 * 60 * 60
+    after_seconds = max(0, int(last_dt.timestamp()) - safety_lookback_seconds)
 
-    msg_ids = list_message_ids_since(service, user_id=user_id, after_seconds=after_seconds)
+    msg_ids, query_used = list_message_ids_since(service, user_id=user_id, after_seconds=after_seconds)
     if not msg_ids:
-        logger.info("No new Gmail messages to ingest.")
+        logger.info(f"No new Gmail messages to ingest. account={account_email} query='{query_used}' after_seconds={after_seconds}")
         conn.close()
-        return {"processed": 0, "inserted": 0}
+        return {
+            "processed": 0,
+            "inserted": 0,
+            "account_email": account_email,
+            "query_used": query_used,
+            "after_seconds": after_seconds,
+        }
 
     max_internal_ms_seen = last_ms
 
@@ -590,6 +685,8 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me") -
             payload = msg.get("payload") or {}
             headers = header_map(payload.get("headers", []) or [])
             sender = headers.get("from")
+            sender_name_hdr, sender_email_hdr = parseaddr(sender or "")
+            sender_name = (sender_name_hdr or "").strip() or (sender_email_hdr or "").strip() or (sender or "")
             subject = headers.get("subject") or ""
 
             thread_id = msg.get("threadId") or mid
@@ -609,6 +706,7 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me") -
                 source_rowid=internal_ms,
                 conversation_id=conv_id,
                 sender=sender,
+                sender_name=sender_name,
                 sent_at_utc=sent_at_utc,
                 text=combined,
             )
@@ -626,12 +724,32 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me") -
         set_last_cursor(conn, source, max_internal_ms_seen)
         conn.execute("COMMIT;")
         logger.info(f"Done. ingested={len(msg_ids)} cursor_ms={max_internal_ms_seen}")
-        return {"processed": len(msg_ids), "inserted": inserted_count}
+        return {
+            "processed": len(msg_ids),
+            "inserted": inserted_count,
+            "account_email": account_email,
+            "query_used": query_used,
+            "after_seconds": after_seconds,
+        }
     except Exception:
         conn.execute("ROLLBACK;")
         raise
     finally:
         conn.close()
+
+
+def start_auto_ingest_worker(db_path: str = "extracted.db", interval_seconds: int = AUTO_INGEST_INTERVAL_SECONDS) -> None:
+    def _worker() -> None:
+        while True:
+            try:
+                stats = ingest_gmail(db_path, reset_cursor_flag=False, force_reauth=False)
+                logger.info(f"Auto-ingest tick: processed={stats.get('processed', 0)} inserted={stats.get('inserted', 0)}")
+            except Exception as e:
+                logger.error(f"Auto-ingest tick failed: {e}")
+            time.sleep(max(10, interval_seconds))
+
+    t = threading.Thread(target=_worker, daemon=True, name="gmail-auto-ingest")
+    t.start()
 
 
 def process_email(
@@ -652,6 +770,8 @@ def process_email(
     conversation_id = upsert_conversation(conn, source=source, thread_key=thread_key, display_name=subject)
 
     # Insert the message
+    sender_name_hdr, sender_email_hdr = parseaddr(sender or "")
+    sender_name = (sender_name_hdr or "").strip() or (sender_email_hdr or "").strip() or (sender or "")
     message_id = insert_message(
         conn,
         source=source,
@@ -659,6 +779,7 @@ def process_email(
         source_rowid=source_rowid,
         conversation_id=conversation_id,
         sender=sender,
+        sender_name=sender_name,
         sent_at_utc=sent_at_utc,
         text=text,
     )
@@ -1156,11 +1277,12 @@ def get_calendar_events():
 def ingest():
     """API endpoint to trigger Gmail ingestion."""
     try:
-        data = request.json or {}
-        db_path = data.get('db_path', 'extracted.db')
-        max_messages = min(int(data.get('max_messages', 100)), 500)
-        logger.info(f"Starting Gmail ingestion for database: {db_path} (max_messages={max_messages})")
-        ingest_stats = fetch_emails_direct(db_path, max_messages=max_messages)
+        payload = request.json or {}
+        db_path = payload.get('db_path', 'extracted.db')
+        reset_flag = bool(payload.get('reset_cursor'))
+        force_reauth_flag = bool(payload.get('force_reauth')) if payload.get('force_reauth') is not None else False
+        logger.info(f"Starting Gmail ingestion for database: {db_path} reset_cursor={reset_flag} force_reauth={force_reauth_flag}")
+        ingest_stats = ingest_gmail(db_path, reset_cursor_flag=reset_flag, force_reauth=force_reauth_flag)
         summary = get_db_summary(db_path)
         logger.info("Gmail ingestion completed successfully.")
         return jsonify({
@@ -1246,7 +1368,12 @@ def summary():
     """Return recent messages, dates, and links from the ingestion DB."""
     try:
         db_path = request.args.get('db_path', 'extracted.db')
-        snap = fetch_db_snapshot(db_path)
+        limit_raw = request.args.get('limit', '20')
+        try:
+            limit = max(1, min(500, int(limit_raw)))
+        except ValueError:
+            limit = 20
+        snap = fetch_db_snapshot(db_path, limit=limit)
         stats = get_db_summary(db_path)
         return jsonify({"status": "success", "summary": stats, "data": snap})
     except Exception as e:
@@ -1254,6 +1381,59 @@ def summary():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/lookup_message', methods=['GET'])
+def lookup_message():
+    """Find ingested messages by keyword and include extracted date rows for each message."""
+    try:
+        db_path = request.args.get('db_path', 'extracted.db')
+        q = (request.args.get('q') or '').strip()
+        if not q:
+            return jsonify({"status": "error", "message": "Query parameter q is required."}), 400
+
+        conn = open_sqlite_rw(db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, sender, sent_at_utc, substr(text, 1, 300) AS snippet
+                FROM messages
+                WHERE text LIKE ?
+                ORDER BY source_rowid DESC
+                LIMIT 50
+                """,
+                (f"%{q}%",),
+            ).fetchall()
+
+            out = []
+            for r in rows:
+                dates = conn.execute(
+                    """
+                    SELECT id, raw_span, resolved_date, parsed_at_utc
+                    FROM extracted_dates
+                    WHERE message_id = ?
+                    ORDER BY id DESC
+                    """,
+                    (r["id"],),
+                ).fetchall()
+                out.append({
+                    "message": dict(r),
+                    "dates": [dict(d) for d in dates],
+                })
+
+            return jsonify({"status": "success", "count": len(out), "results": out})
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error during lookup_message: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 if __name__ == "__main__":
-    # Run the Flask app for API integration on an alternate port to avoid conflicts
+    try:
+        logger.info("Auto-start ingest on startup: force_reauth=False reset_cursor=False")
+        ingest_gmail("extracted.db", reset_cursor_flag=False, force_reauth=False)
+    except Exception as e:
+        logger.error(f"Auto ingest on startup failed: {e}")
+
+    start_auto_ingest_worker("extracted.db", AUTO_INGEST_INTERVAL_SECONDS)
+
     app.run(debug=True, host="0.0.0.0", port=5001)
