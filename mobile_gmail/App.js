@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView,
   Switch, TextInput, Animated, StatusBar, Modal, Alert, Linking, Platform,
@@ -380,17 +380,34 @@ const webPickerInputStyle = {
   boxSizing: 'border-box',
 };
 
+function formatDurationFromSeconds(seconds) {
+  if (seconds == null || seconds <= 0) return null;
+  const s = Math.round(seconds);
+  if (s < 60) return `${s} sec`;
+  const mins = Math.floor(s / 60);
+  const secs = s % 60;
+  if (mins < 60) {
+    if (secs === 0) return `${mins} min`;
+    return `${mins} min ${secs} sec`;
+  }
+  const hrs = Math.floor(mins / 60);
+  const remainMins = mins % 60;
+  if (remainMins === 0) return `${hrs} hr`;
+  return `${hrs} hr ${remainMins} min`;
+}
+
 function mapCalendarEvent(e) {
   const start = new Date(e.start_utc);
-  const end = new Date(e.end_utc);
-  const dateStr = start.toISOString().slice(0, 10);
+  const dateStr = start.toLocaleDateString('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit' });
   const timeStr = start.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-  const durationMinutes = Math.round((end - start) / 60000);
-  const duration = durationMinutes > 0
-    ? durationMinutes >= 60
-      ? `${Math.floor(durationMinutes / 60)} hr${durationMinutes % 60 ? ` ${durationMinutes % 60} min` : ''}`
-      : `${durationMinutes} min`
-    : null;
+  const durationSeconds = e.duration_seconds != null ? Number(e.duration_seconds) : null;
+  const duration = durationSeconds != null
+    ? formatDurationFromSeconds(durationSeconds)
+    : (() => {
+        const end = new Date(e.end_utc);
+        const mins = Math.round((end - start) / 60000);
+        return formatDurationFromSeconds(mins * 60);
+      })();
   return {
     id: `cal-${e.id}`,
     title: e.summary,
@@ -407,6 +424,8 @@ function mapCalendarEvent(e) {
 
 function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar }) {
   const [selected, setSelected] = useState(null);
+  const [removing, setRemoving] = useState(false);
+  const [removingAllPast, setRemovingAllPast] = useState(false);
   const [pastExpanded, setPastExpanded] = useState(false);
   const [addModalVisible, setAddModalVisible] = useState(false);
   const [addTitle, setAddTitle] = useState('');
@@ -433,25 +452,18 @@ function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar 
     setAdding(true);
     setAddError(null);
     try {
-      const dateStr = addStartDate.toISOString().slice(0, 10);
-      const timeStr = addStartDate.toLocaleTimeString('en-US', {
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true,
-      });
       const h = Math.max(0, parseInt(addDurationHours, 10) || 0);
       const m = Math.min(59, Math.max(0, parseInt(addDurationMinutes, 10) || 0));
       const s = Math.min(59, Math.max(0, parseInt(addDurationSeconds, 10) || 0));
-      const durationMinutes = Math.round(h * 60 + m + s / 60) || 60;
+      const durationSeconds = h * 3600 + m * 60 + s;
 
       const res = await fetch(`${CALENDAR_API}/calendar/events`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           title: addTitle.trim(),
-          date: dateStr,
-          time: timeStr,
-          duration_minutes: durationMinutes,
+          start_utc: addStartDate.toISOString(),
+          duration_seconds: durationSeconds || 3600,
           notes: addNotes.trim() || undefined,
         }),
       });
@@ -477,6 +489,29 @@ function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar 
       setAddError(err.message || 'Network error');
     } finally {
       setAdding(false);
+    }
+  };
+
+  const handleRemoveEvent = async () => {
+    if (!selected || !selected.id?.startsWith('cal-')) return;
+    const eventId = parseInt(selected.id.replace('cal-', ''), 10);
+    if (isNaN(eventId)) return;
+    setRemoving(true);
+    try {
+      const res = await fetch(`${CALENDAR_API}/calendar/events/${eventId}/remove`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json();
+      if (data.status === 'success') {
+        setSelected(null);
+        onRefreshCalendar?.();
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setRemoving(false);
     }
   };
 
@@ -553,10 +588,34 @@ function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar 
   const sortedUpcomingDates = Object.keys(upcomingGrouped).sort();
   const sortedPastDates = Object.keys(pastGrouped).sort().reverse();
 
+  const handleRemoveAllPast = async () => {
+    const calendarPastEvents = past.filter(e => e.id?.startsWith('cal-'));
+    if (calendarPastEvents.length === 0) return;
+    setRemovingAllPast(true);
+    try {
+      for (const e of calendarPastEvents) {
+        const eventId = parseInt(e.id.replace('cal-', ''), 10);
+        if (isNaN(eventId)) continue;
+        const res = await fetch(`${CALENDAR_API}/calendar/events/${eventId}/remove`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (data.status !== 'success') break;
+      }
+      onRefreshCalendar?.();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setRemovingAllPast(false);
+    }
+  };
+
   function EventCard({ e }) {
     return (
       <TouchableOpacity style={s.eventCard} onPress={() => setSelected(e)} activeOpacity={0.8}>
-        <View style={{ width: 56, alignItems: 'flex-end' }}>
+        <View style={{ width: 84, alignItems: 'flex-end' }}>
           <Text style={{ fontSize: 12, fontWeight: '700', color: C.textPrimary }}>{e.time}</Text>
           {e.duration && (
             <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{e.duration}</Text>
@@ -600,12 +659,12 @@ function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar 
 
       {past.length > 0 && (
         <View style={{ marginTop: 16 }}>
-          <TouchableOpacity
-            style={[s.eventCard, { opacity: 0.85 }]}
-            onPress={() => setPastExpanded(!pastExpanded)}
-            activeOpacity={0.8}
-          >
-            <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <View style={[s.eventCard, { opacity: 0.85, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 }]}>
+            <TouchableOpacity
+              style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 }}
+              onPress={() => setPastExpanded(!pastExpanded)}
+              activeOpacity={0.8}
+            >
               <Text style={{ fontSize: 20 }}>📂</Text>
               <View style={{ flex: 1 }}>
                 <Text style={{ fontSize: 14, fontWeight: '600', color: C.textPrimary }}>
@@ -616,8 +675,15 @@ function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar 
                 </Text>
               </View>
               <Text style={{ fontSize: 18, color: C.textMuted }}>{pastExpanded ? '▼' : '▶'}</Text>
-            </View>
-          </TouchableOpacity>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={{ paddingVertical: 8, paddingHorizontal: 12, backgroundColor: C.red + '33', borderRadius: 8 }}
+              onPress={handleRemoveAllPast}
+              disabled={removingAllPast}
+            >
+              <Text style={{ fontSize: 12, fontWeight: '600', color: C.red }}>{removingAllPast ? 'Removing…' : 'Delete all past'}</Text>
+            </TouchableOpacity>
+          </View>
 
           {pastExpanded && (
             <View style={{ marginTop: 4, marginLeft: 12, paddingLeft: 12, borderLeftWidth: 3, borderLeftColor: C.border }}>
@@ -665,6 +731,16 @@ function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar 
                     {selected.notes}
                   </Text>
                 </View>
+              )}
+
+              {selected.id?.startsWith('cal-') && (
+                <TouchableOpacity
+                  style={[s.addEventSubmitBtn, { marginTop: 20, backgroundColor: C.red }]}
+                  onPress={handleRemoveEvent}
+                  disabled={removing}
+                >
+                  <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>{removing ? 'Removing…' : 'Remove from calendar'}</Text>
+                </TouchableOpacity>
               )}
             </>}
           </View>
@@ -899,6 +975,264 @@ function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar 
   );
 }
 
+// ─── Dashboard: Emails Tab ───────────────────────────────────────────────────
+function EmailsTab({ emails = [], onRefresh, onSync }) {
+  const [selected, setSelected] = useState(null);
+  const [syncing, setSyncing] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [responseDraft, setResponseDraft] = useState('');
+  const [showSentFeedback, setShowSentFeedback] = useState(false);
+
+  useEffect(() => {
+    if (!selected) setResponseDraft('');
+  }, [selected]);
+
+  const handleDeleteConversation = async () => {
+    if (!selected) return;
+    Alert.alert(
+      'Delete conversation',
+      `Remove this conversation (${selected.count} message${selected.count !== 1 ? 's' : ''})? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            setDeleting(true);
+            try {
+              const isSingle = String(selected.key || '').startsWith('single-');
+              const body = isSingle
+                ? { message_ids: (selected.messages || []).map(m => m.id).filter(Boolean) }
+                : { thread_id: selected.key };
+              const res = await fetch(`${CALENDAR_API}/conversations/delete`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+              });
+              const data = await res.json().catch(() => ({}));
+              if (data.status === 'success') {
+                setSelected(null);
+                onRefresh?.();
+              } else {
+                Alert.alert('Delete failed', data.message || 'Could not delete');
+              }
+            } catch (err) {
+              Alert.alert('Delete failed', err.message || 'Network error');
+            } finally {
+              setDeleting(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleSendResponse = async () => {
+    if (!selected || !responseDraft.trim()) return;
+    const lastMsg = selected.last ?? selected;
+    setSending(true);
+    try {
+      const subject = (lastMsg.subject || selected.subject || '(no subject)');
+      const replySubject = subject.toLowerCase().startsWith('re:') ? subject : `Re: ${subject}`;
+      const res = await fetch(`${CALENDAR_API}/send-email`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sender: lastMsg.sender,
+          subject: replySubject,
+          content: responseDraft.trim(),
+          thread_id: lastMsg.thread_id || undefined,
+          gmail_message_id: lastMsg.gmail_message_id || undefined,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data.status === 'success') {
+        setResponseDraft('');
+        setShowSentFeedback(true);
+        setTimeout(() => setShowSentFeedback(false), 2500);
+      } else {
+        Alert.alert('Send failed', data.message || 'Could not send email');
+      }
+    } catch (err) {
+      Alert.alert('Send failed', err.message || 'Network error');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const handleSync = async () => {
+    if (!onSync) return;
+    setSyncing(true);
+    try {
+      const res = await fetch(`${CALENDAR_API}/ingest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ db_path: 'extracted.db', max_messages: 200 }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data.status === 'success') {
+        onSync?.();
+      } else {
+        Alert.alert('Sync failed', data.message || 'Could not fetch emails');
+      }
+    } catch (err) {
+      Alert.alert('Sync failed', err.message || 'Network error');
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const formatEmailDate = (sentAt) => {
+    if (!sentAt) return '';
+    const d = new Date(sentAt);
+    if (Number.isNaN(d.getTime())) return sentAt;
+    const mins = Math.round((Date.now() - d.getTime()) / 60000);
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.round(hours / 24);
+    if (days < 7) return `${days}d ago`;
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: d.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined });
+  };
+
+  const safeEmails = Array.isArray(emails) ? emails : [];
+  const conversations = useMemo(() => {
+    const byThread = {};
+    for (const e of safeEmails) {
+      if (!e || typeof e !== 'object') continue;
+      const key = e.thread_id || `single-${e.id}`;
+      if (!byThread[key]) byThread[key] = [];
+      byThread[key].push(e);
+    }
+    return Object.entries(byThread)
+      .map(([threadKey, msgs]) => {
+        const sorted = [...msgs].sort((a, b) => (new Date(a?.sent_at_utc || 0)).getTime() - (new Date(b?.sent_at_utc || 0)).getTime());
+        const last = sorted[sorted.length - 1];
+        if (!last) return null;
+        const subject = ((sorted[0]?.subject || last?.subject || '(no subject)') + '').replace(/^Re:\s*/i, '');
+        return { key: threadKey, messages: sorted, subject, last, count: sorted.length };
+      })
+      .filter(Boolean)
+      .sort((a, b) => (new Date(b?.last?.sent_at_utc || 0)).getTime() - (new Date(a?.last?.sent_at_utc || 0)).getTime());
+  }, [safeEmails]);
+
+  return (
+    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
+      <View style={s.dashHeader}>
+        <View>
+          <Text style={s.dashTitle}>Emails</Text>
+          <Text style={s.dashSubtitle}>
+            {conversations.length} conversation{conversations.length !== 1 ? 's' : ''} · {safeEmails.length} message{safeEmails.length !== 1 ? 's' : ''}
+          </Text>
+        </View>
+        <View style={{ flexDirection: 'row', gap: 8 }}>
+          {onSync && (
+            <TouchableOpacity style={s.markAllBtn} onPress={handleSync} disabled={syncing}>
+              <Text style={{ color: C.textSecondary, fontSize: 12, fontWeight: '600' }}>{syncing ? 'Syncing…' : 'Sync from Gmail'}</Text>
+            </TouchableOpacity>
+          )}
+          {onRefresh && (
+            <TouchableOpacity style={s.markAllBtn} onPress={onRefresh}>
+              <Text style={{ color: C.textSecondary, fontSize: 12, fontWeight: '600' }}>Refresh</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+
+      {conversations.length === 0 && (
+        <Text style={{ color: C.textMuted, fontSize: 14, marginTop: 8 }}>No emails yet. Run ingestion to sync your inbox.</Text>
+      )}
+
+      {conversations.map((conv) => (
+        <TouchableOpacity
+          key={conv.key}
+          style={s.notifCard}
+          activeOpacity={0.8}
+          onPress={() => setSelected(conv)}
+        >
+          <View style={{ flex: 1 }}>
+            <Text style={s.notifTitle} numberOfLines={1}>{conv.subject || '(no subject)'}</Text>
+            <Text style={{ fontSize: 12, color: C.textSecondary, marginTop: 4 }} numberOfLines={1}>{conv.last?.sender || 'Unknown'}</Text>
+            {conv.last?.snippet ? (
+              <Text style={{ fontSize: 12, color: C.textMuted, marginTop: 6 }} numberOfLines={2}>{conv.last.snippet}</Text>
+            ) : null}
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 6, gap: 8 }}>
+              <Text style={{ fontSize: 11, color: C.textMuted }}>{formatEmailDate(conv.last?.sent_at_utc)}</Text>
+              {conv.count > 1 && (
+                <Text style={{ fontSize: 11, color: C.textMuted }}>· {conv.count} messages</Text>
+              )}
+            </View>
+          </View>
+          <Text style={{ fontSize: 18, marginLeft: 8 }}>✉️</Text>
+        </TouchableOpacity>
+      ))}
+
+      <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
+        <View style={s.modalOverlay}>
+          <View style={[s.modalSheet, { maxHeight: '80%' }]}>
+            {selected && (
+              <>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.modalTitle}>{selected.subject || '(no subject)'}</Text>
+                    <Text style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{selected.count} message{selected.count !== 1 ? 's' : ''}</Text>
+                  </View>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                    <TouchableOpacity onPress={handleDeleteConversation} disabled={deleting} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+                      <Text style={{ fontSize: 18, color: deleting ? C.textMuted : C.red }}>🗑</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => setSelected(null)} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+                      <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+                <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={true}>
+                  {(selected.messages || []).map((msg, i) => (
+                    <View key={msg.id || i} style={{ marginBottom: 16, paddingBottom: 16, borderBottomWidth: i < (selected.messages?.length || 0) - 1 ? 1 : 0, borderBottomColor: C.border }}>
+                      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                        <Text style={{ fontSize: 13, fontWeight: '600', color: C.textPrimary }}>{msg.sender || 'Unknown'}</Text>
+                        <Text style={{ fontSize: 11, color: C.textMuted }}>{formatEmailDate(msg.sent_at_utc)}</Text>
+                      </View>
+                      <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }} selectable>
+                        {msg.text || msg.snippet || 'No content'}
+                      </Text>
+                    </View>
+                  ))}
+                </ScrollView>
+                <View style={{ marginTop: 16, paddingTop: 12, borderTopWidth: 1, borderTopColor: C.border }}>
+                  <Text style={{ fontSize: 11, fontWeight: '700', color: C.textMuted, marginBottom: 8 }}>RESPONSE</Text>
+                  <TextInput
+                    style={[s.addEventInput, { minHeight: 80 }]}
+                    placeholder="Type your reply..."
+                    placeholderTextColor={C.textMuted}
+                    value={responseDraft}
+                    onChangeText={setResponseDraft}
+                    multiline
+                    editable={!sending}
+                  />
+                  <TouchableOpacity
+                    style={[s.addEventSubmitBtn, { marginTop: 10 }, sending && { opacity: 0.6 }]}
+                    onPress={handleSendResponse}
+                    disabled={sending || !responseDraft.trim()}
+                  >
+                    <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>{sending ? 'Sending…' : 'Send'}</Text>
+                  </TouchableOpacity>
+                  {showSentFeedback && (
+                    <View style={{ backgroundColor: C.green, borderRadius: 10, padding: 12, marginTop: 12, alignItems: 'center' }}>
+                      <Text style={{ color: '#fff', fontWeight: '700', fontSize: 14 }}>Email sent!</Text>
+                    </View>
+                  )}
+                </View>
+              </>
+            )}
+          </View>
+        </View>
+      </Modal>
+    </ScrollView>
+  );
+}
+
 // ─── Dashboard: TODO Tab (links & attachments) ───────────────────────────────
 function TodoTab({ ingestLinks = [], ingestAttachments = [] }) {
   const links = ingestLinks.slice(0, 3);
@@ -1034,6 +1368,7 @@ function ThreadsTab() {
 // ─── Dashboard Shell ──────────────────────────────────────────────────────────
 const TABS = [
   { key: 'notifications', label: 'Inbox', icon: '🔔' },
+  { key: 'emails', label: 'Emails', icon: '✉️' },
   { key: 'calendar', label: 'Calendar', icon: '📅' },
   { key: 'todo', label: 'TODO', icon: '📌' },
 ];
@@ -1041,6 +1376,7 @@ const TABS = [
 function Dashboard({ ingestData, loadSummary }) {
   const [tab, setTab] = useState('notifications');
   const [calendarEvents, setCalendarEvents] = useState([]);
+  const [emails, setEmails] = useState([]);
   const unreadCount = DATA.notifications.filter(n => !n.read).length;
 
   const loadCalendarEvents = () => {
@@ -1054,10 +1390,23 @@ function Dashboard({ ingestData, loadSummary }) {
       .catch(err => console.error(err));
   };
 
+  const loadEmails = () => {
+    fetch(`${CALENDAR_API}/emails`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'success') {
+          setEmails(Array.isArray(data.emails) ? data.emails : []);
+        }
+      })
+      .catch(err => console.error(err));
+  };
+
   useEffect(() => {
     loadSummary?.();
     if (tab === 'calendar') {
       loadCalendarEvents();
+    } else if (tab === 'emails') {
+      loadEmails();
     }
   }, [tab]);
 
@@ -1066,6 +1415,13 @@ function Dashboard({ ingestData, loadSummary }) {
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={{ flex: 1, paddingHorizontal: 20 }}>
         {tab === 'notifications' && <NotificationsTab />}
+        {tab === 'emails' && (
+          <EmailsTab
+            emails={emails.length ? emails : (Array.isArray(ingestData?.messages) ? ingestData.messages : [])}
+            onRefresh={loadEmails}
+            onSync={() => { loadSummary?.(); loadEmails(); }}
+          />
+        )}
         {tab === 'calendar' && (
           <CalendarTab
             ingestDates={ingestData.dates}
