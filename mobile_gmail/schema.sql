@@ -44,7 +44,13 @@ CREATE TABLE IF NOT EXISTS events (
   -- Optional
   summary     TEXT,
   description TEXT,
-  location    TEXT
+  location    TEXT,
+
+  -- Event length in seconds (u64); can derive end from start + duration_seconds
+  duration_seconds INTEGER,
+
+  -- Soft delete: hide from UI without removing row
+  removed INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS extracted_dates (

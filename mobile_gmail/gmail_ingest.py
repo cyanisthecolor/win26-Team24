@@ -295,9 +295,11 @@ def fetch_db_snapshot(db_path: str, limit: int = 20) -> Dict[str, List[Dict]]:
     try:
         msgs = conn.execute(
             """
-            SELECT id, sender, sent_at_utc, substr(text, 1, 200) AS snippet
-            FROM messages
-            ORDER BY source_rowid DESC
+            SELECT m.id, m.sender, m.sent_at_utc, substr(m.text, 1, 200) AS snippet,
+                   c.thread_key AS thread_id, m.source_msg_key AS gmail_message_id
+            FROM messages m
+            LEFT JOIN conversations c ON m.conversation_id = c.id
+            ORDER BY m.source_rowid DESC
             LIMIT ?
             """,
             (limit,),
@@ -465,7 +467,97 @@ def list_message_ids_since(service, user_id: str, after_seconds: int, max_pages:
     return ids
 
 
-# Ensure the `ingest_gmail` function uses the correct `after_seconds` value.
+def fetch_emails_direct(out_db_path: str, source: str = "gmail", user_id: str = "me", max_messages: int = 100) -> Dict[str, int]:
+    """
+    Fetch emails directly using labelIds (no search query). More reliable than query-based fetch.
+    Uses INBOX label and paginates through messages.
+    """
+    conn = open_sqlite_rw(out_db_path)
+    service = gmail_auth()
+
+    msg_ids: List[str] = []
+    page_token = None
+    pages = 0
+    max_pages = max(1, (max_messages + 99) // 100)
+
+    while pages < max_pages:
+        resp = service.users().messages().list(
+            userId=user_id,
+            labelIds=["INBOX"],
+            maxResults=min(100, max_messages - len(msg_ids)),
+            pageToken=page_token,
+        ).execute()
+        batch = [m["id"] for m in resp.get("messages", []) or []]
+        msg_ids.extend(batch)
+        page_token = resp.get("nextPageToken")
+        pages += 1
+        if not page_token or len(batch) == 0:
+            break
+
+    if not msg_ids:
+        logger.info("No Gmail messages found in INBOX.")
+        conn.close()
+        return {"processed": 0, "inserted": 0}
+
+    conn.execute("BEGIN;")
+    inserted_count = 0
+    try:
+        for mid in msg_ids:
+            try:
+                msg = service.users().messages().get(userId=user_id, id=mid, format="full").execute()
+            except Exception as e:
+                logger.warning(f"Failed to get message {mid}: {e}")
+                continue
+
+            internal_ms = int(msg.get("internalDate", "0"))
+            if internal_ms <= 0:
+                continue
+
+            payload = msg.get("payload") or {}
+            headers = header_map(payload.get("headers", []) or [])
+            sender = headers.get("from")
+            subject = headers.get("subject") or ""
+
+            thread_id = msg.get("threadId") or mid
+            sent_at_utc = datetime.fromtimestamp(internal_ms / 1000, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+            body_text = extract_best_text(payload)
+            combined = (f"Subject: {subject}\n" if subject else "") + body_text
+
+            if not combined.strip():
+                combined = f"Subject: {subject}\n(no body)" if subject else "(no content)"
+
+            conv_id = upsert_conversation(conn, source, thread_id, display_name=subject)
+            msg_id_db = insert_message(
+                conn,
+                source=source,
+                source_msg_key=mid,
+                source_rowid=internal_ms,
+                conversation_id=conv_id,
+                sender=sender,
+                sent_at_utc=sent_at_utc,
+                text=combined,
+            )
+
+            if msg_id_db is None:
+                continue
+
+            inserted_count += 1
+            insert_extractions(conn, msg_id_db, combined, sent_at_utc)
+
+            for filename, mime, attachment_id in extract_attachment_metas(payload):
+                insert_attachment_meta(conn, msg_id_db, filename, mime, attachment_id)
+
+        conn.execute("COMMIT;")
+        logger.info(f"fetch_emails_direct: processed={len(msg_ids)} inserted={inserted_count}")
+        return {"processed": len(msg_ids), "inserted": inserted_count}
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.close()
+
+
 def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me") -> Dict[str, int]:
     conn = open_sqlite_rw(out_db_path)
     service = gmail_auth()
@@ -629,6 +721,7 @@ def get_new_events(calendar, updated_after: datetime):
 
 def ingest_calendar_events(out_db_path: str, source: str = "gcal") -> Dict[str, int]:
     conn = open_sqlite_rw(out_db_path)
+    _ensure_events_duration_seconds_column(conn)
 
     calendar = get_calendar()
 
@@ -676,11 +769,19 @@ def ingest_calendar_events(out_db_path: str, source: str = "gcal") -> Dict[str, 
             description = e.get("description")
             location = e.get("location")
 
+            duration_seconds = None
+            try:
+                start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                duration_seconds = int((end_dt - start_dt).total_seconds())
+            except (ValueError, TypeError):
+                pass
+
             try:
                 conn.execute(
                     """
-                    INSERT INTO events(start_utc, end_utc, summary, description, location)
-                    VALUES(?, ?, ?, ?, ?)
+                    INSERT INTO events(start_utc, end_utc, summary, description, location, duration_seconds)
+                    VALUES(?, ?, ?, ?, ?, ?)
                     """,
                     (
                         start,
@@ -688,6 +789,7 @@ def ingest_calendar_events(out_db_path: str, source: str = "gcal") -> Dict[str, 
                         summary,
                         description,
                         location,
+                        duration_seconds,
                     ),
                 )
                 inserted += 1
@@ -740,15 +842,94 @@ class Email(TypedDict):
     Content: str
 
 
-def send_email(gmail, message: Email):
+def send_email(gmail, message: Email, thread_id: Optional[str] = None):
     email = EmailMessage()
     email.set_content(message["Content"])
     email["From"] = "me"
     email["To"] = ", ".join(message["To"]) if isinstance(message["To"], list) else message["To"]
     email["Subject"] = message["Subject"]
 
-    create_message = { "raw": base64.urlsafe_b64encode(email.as_bytes()).decode(), }
+    create_message = {"raw": base64.urlsafe_b64encode(email.as_bytes()).decode()}
+    if thread_id:
+        create_message["threadId"] = thread_id
     return gmail.users().messages().send(userId="me", body=create_message).execute()
+
+
+def send_reply_in_thread(
+    gmail,
+    to_addr: str,
+    subject: str,
+    content: str,
+    thread_id: str,
+    gmail_message_id: str,
+) -> dict:
+    """
+    Send a reply in the same thread by fetching the original message's Message-ID
+    and setting In-Reply-To and References headers. Required for proper threading.
+    """
+    msg = gmail.users().messages().get(userId="me", id=gmail_message_id, format="full").execute()
+    payload = msg.get("payload") or {}
+    headers = header_map(payload.get("headers", []) or [])
+    orig_message_id = (headers.get("message-id") or headers.get("message_id") or "").strip()
+
+    email = EmailMessage()
+    email.set_content(content)
+    email["From"] = "me"
+    email["To"] = to_addr
+    email["Subject"] = subject
+    if orig_message_id:
+        email["In-Reply-To"] = orig_message_id
+        email["References"] = orig_message_id
+
+    create_message = {
+        "raw": base64.urlsafe_b64encode(email.as_bytes()).decode(),
+        "threadId": thread_id,
+    }
+    return gmail.users().messages().send(userId="me", body=create_message).execute()
+
+
+def extract_email_from_sender(sender: Optional[str]) -> str:
+    """Extract email address from 'Name <email@example.com>' or return as-is if plain email."""
+    if not sender or not sender.strip():
+        return ""
+    s = sender.strip()
+    m = re.search(r"<([^>]+)>", s)
+    if m:
+        return m.group(1).strip()
+    if "@" in s:
+        return s
+    return s
+
+
+@app.route('/send-email', methods=['POST'])
+def api_send_email():
+    """Send an email via Gmail API. Expects to (or reply_to/sender), subject, content in JSON body."""
+    try:
+        data = request.json or {}
+        to_addr = (data.get("to") or data.get("reply_to") or "").strip()
+        if not to_addr and data.get("sender"):
+            to_addr = extract_email_from_sender(data.get("sender"))
+        if not to_addr:
+            return jsonify({"status": "error", "message": "Recipient (to) is required"}), 400
+        subject = (data.get("subject") or "").strip()
+        content = (data.get("content") or data.get("body") or "").strip()
+        if not content:
+            return jsonify({"status": "error", "message": "Content is required"}), 400
+        if not subject:
+            subject = "(no subject)"
+        thread_id = (data.get("thread_id") or data.get("threadId") or "").strip() or None
+        gmail_msg_id = (data.get("gmail_message_id") or data.get("gmailMessageId") or "").strip() or None
+
+        gmail = gmail_auth()
+        if thread_id and gmail_msg_id:
+            send_reply_in_thread(gmail, to_addr, subject, content, thread_id, gmail_msg_id)
+        else:
+            send_email(gmail, {"To": to_addr, "Subject": subject, "Content": content}, thread_id=thread_id)
+        logger.info(f"Sent email to {to_addr} subject={subject[:50]}")
+        return jsonify({"status": "success", "message": "Email sent"})
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route('/ingest_calendar', methods=['POST'])
@@ -782,6 +963,25 @@ def calendar_events():
     return get_calendar_events()
 
 
+@app.route('/calendar/events/<int:event_id>/remove', methods=['POST'])
+def remove_calendar_event(event_id: int):
+    """Mark an event as removed (soft delete)."""
+    try:
+        db_path = (request.json or {}).get('db_path', 'extracted.db')
+        conn = sqlite3.connect(db_path)
+        _ensure_events_removed_column(conn)
+        cur = conn.execute("UPDATE events SET removed = 1 WHERE id = ?", (event_id,))
+        conn.commit()
+        conn.close()
+        if cur.rowcount == 0:
+            return jsonify({"status": "error", "message": "Event not found"}), 404
+        logger.info(f"Marked calendar event id={event_id} as removed")
+        return jsonify({"status": "success", "message": "Event removed"})
+    except Exception as e:
+        logger.error(f"Error removing calendar event: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 def _parse_time_to_hour_min(time_str: str) -> Tuple[int, int]:
     """Parse '10:00 AM' or '10:00' to (hour, minute)."""
     if not time_str:
@@ -799,29 +999,46 @@ def _parse_time_to_hour_min(time_str: str) -> Tuple[int, int]:
 
 
 def add_calendar_event():
-    """Insert a new event into the local events table."""
+    """Insert a new event into the local events table.
+    Expects start_utc (ISO string, local time converted to UTC by client) or date+time."""
     try:
         data = request.json or {}
         summary = (data.get('summary') or data.get('title') or '').strip()
         if not summary:
             return jsonify({"status": "error", "message": "Title is required"}), 400
 
-        date_str = (data.get('date') or '').strip()
-        if not date_str:
-            return jsonify({"status": "error", "message": "Date is required"}), 400
+        duration_seconds = data.get('duration_seconds')
+        if duration_seconds is not None:
+            duration_seconds = int(duration_seconds)
+        else:
+            duration_min = int(data.get('duration_minutes') or data.get('duration') or 60)
+            duration_seconds = duration_min * 60
 
-        time_str = data.get('time') or '09:00 AM'
-        h, min_val = _parse_time_to_hour_min(time_str)
-        duration_min = int(data.get('duration_minutes') or data.get('duration') or 60)
+        start_utc_raw = data.get('start_utc')
+        if start_utc_raw:
+            try:
+                start_dt = datetime.fromisoformat(start_utc_raw.replace('Z', '+00:00'))
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+                else:
+                    start_dt = start_dt.astimezone(timezone.utc)
+                start_utc = start_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+00:00'
+            except (ValueError, TypeError):
+                return jsonify({"status": "error", "message": "Invalid start_utc format"}), 400
+        else:
+            date_str = (data.get('date') or '').strip()
+            if not date_str:
+                return jsonify({"status": "error", "message": "Date or start_utc is required"}), 400
+            time_str = data.get('time') or '09:00 AM'
+            h, min_val = _parse_time_to_hour_min(time_str)
+            try:
+                y, mo, d = map(int, date_str.split('-'))
+            except (ValueError, AttributeError):
+                return jsonify({"status": "error", "message": "Invalid date format (use YYYY-MM-DD)"}), 400
+            start_dt = datetime(y, mo, d, h, min_val, 0, tzinfo=timezone.utc)
+            start_utc = start_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+00:00'
 
-        try:
-            y, mo, d = map(int, date_str.split('-'))
-        except (ValueError, AttributeError):
-            return jsonify({"status": "error", "message": "Invalid date format (use YYYY-MM-DD)"}), 400
-
-        start_dt = datetime(y, mo, d, h, min_val, 0, tzinfo=timezone.utc)
-        end_dt = start_dt + timedelta(minutes=duration_min)
-        start_utc = start_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+00:00'
+        end_dt = start_dt + timedelta(seconds=duration_seconds)
         end_utc = end_dt.strftime('%Y-%m-%dT%H:%M:%S') + '+00:00'
 
         description = (data.get('description') or data.get('notes') or '').strip() or None
@@ -829,12 +1046,13 @@ def add_calendar_event():
 
         db_path = data.get('db_path', 'extracted.db')
         conn = sqlite3.connect(db_path)
+        _ensure_events_duration_seconds_column(conn)
         conn.execute(
             """
-            INSERT INTO events(start_utc, end_utc, summary, description, location)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO events(start_utc, end_utc, summary, description, location, duration_seconds)
+            VALUES(?, ?, ?, ?, ?, ?)
             """,
-            (start_utc, end_utc, summary, description, location),
+            (start_utc, end_utc, summary, description, location, duration_seconds),
         )
         row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
@@ -851,6 +1069,37 @@ def add_calendar_event():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+def _ensure_events_removed_column(conn: sqlite3.Connection) -> None:
+    """Add removed column to events table if it doesn't exist (migration)."""
+    try:
+        conn.execute("ALTER TABLE events ADD COLUMN removed INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+
+def _ensure_events_duration_seconds_column(conn: sqlite3.Connection) -> None:
+    """Add duration_seconds column and backfill from start/end (migration)."""
+    try:
+        conn.execute("ALTER TABLE events ADD COLUMN duration_seconds INTEGER")
+        conn.commit()
+        # Backfill: compute duration from start_utc and end_utc for existing rows
+        rows = conn.execute(
+            "SELECT id, start_utc, end_utc FROM events WHERE duration_seconds IS NULL"
+        ).fetchall()
+        for row in rows:
+            try:
+                start_dt = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(row[2].replace("Z", "+00:00"))
+                secs = int((end_dt - start_dt).total_seconds())
+                conn.execute("UPDATE events SET duration_seconds = ? WHERE id = ?", (secs, row[0]))
+            except (ValueError, TypeError):
+                pass
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+
 def get_calendar_events():
     """Update from Google Calendar, then return events from local DB."""
     try:
@@ -860,12 +1109,15 @@ def get_calendar_events():
         ingest_stats = ingest_calendar_events(db_path)
 
         conn = sqlite3.connect(db_path)
+        _ensure_events_removed_column(conn)
+        _ensure_events_duration_seconds_column(conn)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
         cur.execute("""
-            SELECT id, summary, description, start_utc, end_utc, location
+            SELECT id, summary, description, start_utc, end_utc, location, duration_seconds
             FROM events
+            WHERE COALESCE(removed, 0) = 0
             ORDER BY start_utc ASC
         """)
 
@@ -904,9 +1156,11 @@ def get_calendar_events():
 def ingest():
     """API endpoint to trigger Gmail ingestion."""
     try:
-        db_path = request.json.get('db_path', 'extracted.db')
-        logger.info(f"Starting Gmail ingestion for database: {db_path}")
-        ingest_stats = ingest_gmail(db_path)
+        data = request.json or {}
+        db_path = data.get('db_path', 'extracted.db')
+        max_messages = min(int(data.get('max_messages', 100)), 500)
+        logger.info(f"Starting Gmail ingestion for database: {db_path} (max_messages={max_messages})")
+        ingest_stats = fetch_emails_direct(db_path, max_messages=max_messages)
         summary = get_db_summary(db_path)
         logger.info("Gmail ingestion completed successfully.")
         return jsonify({
@@ -917,6 +1171,73 @@ def ingest():
         })
     except Exception as e:
         logger.error(f"Error during Gmail ingestion: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/conversations/delete', methods=['POST'])
+def delete_conversation():
+    """Delete a conversation by thread_id (removes conversation + all messages) or by message_ids (single-email case)."""
+    try:
+        data = request.json or {}
+        db_path = data.get('db_path', 'extracted.db')
+        thread_id = (data.get('thread_id') or data.get('threadId') or "").strip() or None
+        message_ids = data.get('message_ids') or data.get('messageIds') or []
+
+        conn = sqlite3.connect(db_path)
+        try:
+            if thread_id:
+                cur = conn.execute(
+                    "DELETE FROM conversations WHERE thread_key = ? AND source = 'gmail'",
+                    (thread_id,),
+                )
+                deleted = cur.rowcount
+            elif message_ids:
+                ids = [int(x) for x in message_ids if x is not None]
+                if not ids:
+                    return jsonify({"status": "error", "message": "thread_id or message_ids required"}), 400
+                placeholders = ",".join("?" * len(ids))
+                cur = conn.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", ids)
+                deleted = cur.rowcount
+            else:
+                return jsonify({"status": "error", "message": "thread_id or message_ids required"}), 400
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info(f"Deleted conversation/msgs: thread_id={thread_id} message_ids={message_ids} rows={deleted}")
+        return jsonify({"status": "success", "message": "Conversation deleted", "deleted": deleted})
+    except Exception as e:
+        logger.error(f"Error deleting conversation: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/emails', methods=['GET'])
+def get_emails():
+    """Return all emails from the ingestion DB with subject from conversation."""
+    try:
+        db_path = request.args.get('db_path', 'extracted.db')
+        limit = min(int(request.args.get('limit', 200)), 500)
+        conn = open_sqlite_rw(db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT m.id, m.sender, m.sent_at_utc, m.text, m.is_from_me,
+                       substr(m.text, 1, 300) AS snippet,
+                       c.display_name AS subject,
+                       c.thread_key AS thread_id,
+                       m.source_msg_key AS gmail_message_id
+                FROM messages m
+                LEFT JOIN conversations c ON m.conversation_id = c.id
+                ORDER BY m.source_rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            emails = [dict(r) for r in rows]
+        finally:
+            conn.close()
+        return jsonify({"status": "success", "emails": emails})
+    except Exception as e:
+        logger.error(f"Error fetching emails: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
