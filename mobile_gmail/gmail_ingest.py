@@ -17,7 +17,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import logging
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -41,6 +41,13 @@ DATE_KEYWORDS = [
     "due", "deadline", "submit", "meet", "meeting", "call", "interview"
 ]
 
+ALLOWED_ATTACHMENT_EXTENSIONS = {".pdf", ".doc", ".docx"}
+ALLOWED_ATTACHMENT_MIME_TYPES = {
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -49,6 +56,26 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 AUTO_INGEST_INTERVAL_SECONDS = int(os.environ.get("AUTO_INGEST_INTERVAL_SECONDS", "60"))
+
+
+def normalize_user_key(user_key: Optional[str]) -> Optional[str]:
+    raw = (user_key or "").strip().lower()
+    if not raw:
+        return None
+    cleaned = re.sub(r"[^a-z0-9._-]", "_", raw)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned or None
+
+
+def resolve_user_paths(user_key: Optional[str], db_path: Optional[str] = None) -> Tuple[str, str]:
+    normalized = normalize_user_key(user_key)
+    if normalized:
+        token_path = f"token_{normalized}.json"
+        resolved_db_path = db_path or f"extracted_{normalized}.db"
+    else:
+        token_path = "token.json"
+        resolved_db_path = db_path or "extracted.db"
+    return token_path, resolved_db_path
 
 
 def fallback_reply_suggestions(subject: str, body: str) -> List[str]:
@@ -162,8 +189,27 @@ def open_sqlite_rw(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
+    ensure_base_schema(conn)
     ensure_messages_schema(conn)
     return conn
+
+
+def ensure_base_schema(conn: sqlite3.Connection) -> None:
+    has_messages = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone()
+    if has_messages:
+        return
+
+    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+    if not os.path.exists(schema_path):
+        raise FileNotFoundError(f"schema.sql not found at {schema_path}")
+
+    with open(schema_path, "r", encoding="utf-8") as f:
+        schema_sql = f.read()
+
+    conn.executescript(schema_sql)
+    conn.commit()
 
 
 def ensure_messages_schema(conn: sqlite3.Connection) -> None:
@@ -173,6 +219,14 @@ def ensure_messages_schema(conn: sqlite3.Connection) -> None:
 
     if "sender_name" not in col_names:
         conn.execute("ALTER TABLE messages ADD COLUMN sender_name TEXT")
+        changed = True
+
+    if "account_key" not in col_names:
+        conn.execute("ALTER TABLE messages ADD COLUMN account_key TEXT")
+        changed = True
+
+    if "account_email" not in col_names:
+        conn.execute("ALTER TABLE messages ADD COLUMN account_email TEXT")
         changed = True
 
     # Best-effort backfill for existing rows
@@ -239,16 +293,18 @@ def insert_message(
     conversation_id: int,
     sender: Optional[str],
     sender_name: Optional[str],
+    account_key: Optional[str],
+    account_email: Optional[str],
     sent_at_utc: str,
     text: str,
 ) -> Optional[int]:
     try:
         conn.execute(
             """
-            INSERT INTO messages(source, source_msg_key, source_rowid, conversation_id, sender, sender_name, is_from_me, sent_at_utc, text)
-            VALUES(?, ?, ?, ?, ?, ?, 0, ?, ?)
+            INSERT INTO messages(source, source_msg_key, source_rowid, conversation_id, sender, sender_name, account_key, account_email, is_from_me, sent_at_utc, text)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
-            (source, source_msg_key, source_rowid, conversation_id, sender, sender_name, sent_at_utc, text),
+            (source, source_msg_key, source_rowid, conversation_id, sender, sender_name, account_key, account_email, sent_at_utc, text),
         )
     except sqlite3.IntegrityError:
         return None
@@ -356,6 +412,9 @@ def insert_extractions(conn: sqlite3.Connection, message_id: int, text: str, sen
 
 
 def insert_attachment_meta(conn: sqlite3.Connection, message_id: int, filename: str, mime: str, attachment_id: str) -> None:
+    if not is_allowed_document_attachment(filename, mime):
+        return
+
     conn.execute(
         """
         INSERT INTO extracted_attachments(message_id, filename, mime_type, original_path)
@@ -365,17 +424,87 @@ def insert_attachment_meta(conn: sqlite3.Connection, message_id: int, filename: 
     )
 
 
-def get_db_summary(db_path: str) -> Dict[str, Optional[str]]:
+def is_allowed_document_attachment(filename: Optional[str], mime_type: Optional[str]) -> bool:
+    lower_mime = (mime_type or "").strip().lower()
+    if lower_mime in ALLOWED_ATTACHMENT_MIME_TYPES:
+        return True
+
+    ext = os.path.splitext((filename or "").strip().lower())[1]
+    return ext in ALLOWED_ATTACHMENT_EXTENSIONS
+
+
+def get_db_summary(db_path: str, account_key: Optional[str] = None) -> Dict[str, Optional[str]]:
     """Return high-level counts from the ingestion database."""
     conn = open_sqlite_rw(db_path)
     try:
-        messages = conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"]
-        dates = conn.execute("SELECT COUNT(*) AS c FROM extracted_dates").fetchone()["c"]
-        links = conn.execute("SELECT COUNT(*) AS c FROM extracted_links").fetchone()["c"]
-        attachments = conn.execute("SELECT COUNT(*) AS c FROM extracted_attachments").fetchone()["c"]
-        latest_row = conn.execute(
-            "SELECT sent_at_utc FROM messages ORDER BY source_rowid DESC LIMIT 1"
-        ).fetchone()
+        norm_key = normalize_user_key(account_key)
+
+        if norm_key:
+            messages = conn.execute("SELECT COUNT(*) AS c FROM messages WHERE account_key = ?", (norm_key,)).fetchone()["c"]
+            dates = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM extracted_dates d
+                JOIN messages m ON m.id = d.message_id
+                WHERE m.account_key = ?
+                """,
+                (norm_key,),
+            ).fetchone()["c"]
+            links = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM extracted_links l
+                JOIN messages m ON m.id = l.message_id
+                WHERE m.account_key = ?
+                """,
+                (norm_key,),
+            ).fetchone()["c"]
+            attachments = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM extracted_attachments a
+                JOIN messages m ON m.id = a.message_id
+                                WHERE m.account_key = ?
+                                    AND (
+                                        LOWER(COALESCE(a.mime_type, '')) IN (
+                                            'application/pdf',
+                                            'application/msword',
+                                            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                                        )
+                                        OR LOWER(COALESCE(a.filename, '')) LIKE '%.pdf'
+                                        OR LOWER(COALESCE(a.filename, '')) LIKE '%.doc'
+                                        OR LOWER(COALESCE(a.filename, '')) LIKE '%.docx'
+                                    )
+                """,
+                (norm_key,),
+            ).fetchone()["c"]
+            latest_row = conn.execute(
+                "SELECT sent_at_utc FROM messages WHERE account_key = ? ORDER BY source_rowid DESC LIMIT 1",
+                (norm_key,),
+            ).fetchone()
+        else:
+            messages = conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"]
+            dates = conn.execute("SELECT COUNT(*) AS c FROM extracted_dates").fetchone()["c"]
+            links = conn.execute("SELECT COUNT(*) AS c FROM extracted_links").fetchone()["c"]
+            attachments = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM extracted_attachments a
+                WHERE
+                    LOWER(COALESCE(a.mime_type, '')) IN (
+                        'application/pdf',
+                        'application/msword',
+                        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                    )
+                    OR LOWER(COALESCE(a.filename, '')) LIKE '%.pdf'
+                    OR LOWER(COALESCE(a.filename, '')) LIKE '%.doc'
+                    OR LOWER(COALESCE(a.filename, '')) LIKE '%.docx'
+                """
+            ).fetchone()["c"]
+            latest_row = conn.execute(
+                "SELECT sent_at_utc FROM messages ORDER BY source_rowid DESC LIMIT 1"
+            ).fetchone()
+
         latest_sent_at = latest_row["sent_at_utc"] if latest_row else None
         return {
             "messages": int(messages),
@@ -388,49 +517,119 @@ def get_db_summary(db_path: str) -> Dict[str, Optional[str]]:
         conn.close()
 
 
-def fetch_db_snapshot(db_path: str, limit: int = 20) -> Dict[str, List[Dict]]:
+def fetch_db_snapshot(db_path: str, limit: int = 20, account_key: Optional[str] = None) -> Dict[str, List[Dict]]:
     """Return recent rows from messages, extracted_dates, extracted_links, and attachments."""
     conn = open_sqlite_rw(db_path)
     try:
-        msgs = conn.execute(
-            """
-            SELECT id, sender, sender_name, sent_at_utc, text, substr(text, 1, 200) AS snippet
-            FROM messages
-            ORDER BY source_rowid DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+        norm_key = normalize_user_key(account_key)
 
-        attachments = conn.execute(
-            """
-            SELECT id, message_id, filename, mime_type, original_path
-            FROM extracted_attachments
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+        if norm_key:
+            msgs = conn.execute(
+                """
+                SELECT id, sender, sender_name, sent_at_utc, text, substr(text, 1, 200) AS snippet
+                FROM messages
+                WHERE account_key = ?
+                ORDER BY source_rowid DESC
+                LIMIT ?
+                """,
+                (norm_key, limit),
+            ).fetchall()
 
-        dates = conn.execute(
-            """
-            SELECT id, message_id, raw_span, resolved_date, parsed_at_utc
-            FROM extracted_dates
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+            attachments = conn.execute(
+                """
+                SELECT a.id, a.message_id, a.filename, a.mime_type, a.original_path
+                FROM extracted_attachments a
+                JOIN messages m ON m.id = a.message_id
+                                WHERE m.account_key = ?
+                                    AND (
+                                        LOWER(COALESCE(a.mime_type, '')) IN (
+                                            'application/pdf',
+                                            'application/msword',
+                                            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                                        )
+                                        OR LOWER(COALESCE(a.filename, '')) LIKE '%.pdf'
+                                        OR LOWER(COALESCE(a.filename, '')) LIKE '%.doc'
+                                        OR LOWER(COALESCE(a.filename, '')) LIKE '%.docx'
+                                    )
+                ORDER BY a.id DESC
+                LIMIT ?
+                """,
+                (norm_key, limit),
+            ).fetchall()
 
-        links = conn.execute(
-            """
-            SELECT id, message_id, url
-            FROM extracted_links
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+            dates = conn.execute(
+                """
+                SELECT d.id, d.message_id, d.raw_span, d.resolved_date, d.parsed_at_utc
+                FROM extracted_dates d
+                JOIN messages m ON m.id = d.message_id
+                WHERE m.account_key = ?
+                ORDER BY d.id DESC
+                LIMIT ?
+                """,
+                (norm_key, limit),
+            ).fetchall()
+
+            links = conn.execute(
+                """
+                SELECT l.id, l.message_id, l.url, m.sender_name, m.sender, m.text
+                FROM extracted_links l
+                JOIN messages m ON m.id = l.message_id
+                WHERE m.account_key = ?
+                ORDER BY l.id DESC
+                LIMIT ?
+                """,
+                (norm_key, limit),
+            ).fetchall()
+        else:
+            msgs = conn.execute(
+                """
+                SELECT id, sender, sender_name, sent_at_utc, text, substr(text, 1, 200) AS snippet
+                FROM messages
+                ORDER BY source_rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+            attachments = conn.execute(
+                """
+                SELECT id, message_id, filename, mime_type, original_path
+                                FROM extracted_attachments a
+                                WHERE
+                                    LOWER(COALESCE(a.mime_type, '')) IN (
+                                        'application/pdf',
+                                        'application/msword',
+                                        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                                    )
+                                    OR LOWER(COALESCE(a.filename, '')) LIKE '%.pdf'
+                                    OR LOWER(COALESCE(a.filename, '')) LIKE '%.doc'
+                                    OR LOWER(COALESCE(a.filename, '')) LIKE '%.docx'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+            dates = conn.execute(
+                """
+                SELECT id, message_id, raw_span, resolved_date, parsed_at_utc
+                FROM extracted_dates
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+            links = conn.execute(
+                """
+                SELECT l.id, l.message_id, l.url, m.sender_name, m.sender, m.text
+                FROM extracted_links l
+                LEFT JOIN messages m ON m.id = l.message_id
+                ORDER BY l.id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
 
         def rows_to_dict(rows: List[sqlite3.Row]) -> List[Dict]:
             return [dict(r) for r in rows]
@@ -455,11 +654,22 @@ def fetch_db_snapshot(db_path: str, limit: int = 20) -> Dict[str, List[Dict]]:
         for m in msg_dicts:
             m['subject'] = derive_subject(m.get('text'))
 
+        link_dicts = rows_to_dict(links)
+        for l in link_dicts:
+            l['subject'] = derive_subject(l.get('text'))
+            l.pop('text', None)
+
+        attachment_dicts = rows_to_dict(attachments)
+        attachment_dicts = [
+            a for a in attachment_dicts
+            if is_allowed_document_attachment(a.get("filename"), a.get("mime_type"))
+        ]
+
         return {
             "messages": msg_dicts,
             "dates": rows_to_dict(dates),
-            "links": rows_to_dict(links),
-            "attachments": rows_to_dict(attachments),
+            "links": link_dicts,
+            "attachments": attachment_dicts,
         }
     finally:
         conn.close()
@@ -579,19 +789,19 @@ def list_message_ids_since(service, user_id: str, after_seconds: int, max_pages:
                 break
         return ids
 
-    one_week_seconds = 7 * 24 * 60 * 60
-    week_floor_seconds = int(datetime.now(tz=timezone.utc).timestamp()) - one_week_seconds
-    effective_after = max(after_seconds, week_floor_seconds)
+    two_weeks_seconds = 14 * 24 * 60 * 60
+    two_week_floor_seconds = int(datetime.now(tz=timezone.utc).timestamp()) - two_weeks_seconds
+    effective_after = max(after_seconds, two_week_floor_seconds)
     after_date_str = datetime.fromtimestamp(effective_after, tz=timezone.utc).strftime("%Y/%m/%d")
 
-    # Primary: only Gmail Primary category in the last week.
+    # Primary: only Gmail Primary category in the last two weeks.
     primary_q = f"category:primary -category:social -category:promotions -category:updates after:{after_date_str}"
     primary_ids = run_query(primary_q, include_spam_trash=False)
     if primary_ids:
         return list(dict.fromkeys(primary_ids)), primary_q
 
-    # Fallback 1: primary category with explicit 7-day relative query.
-    fallback_q = "category:primary -category:social -category:promotions -category:updates newer_than:7d"
+    # Fallback 1: primary category with explicit 14-day relative query.
+    fallback_q = "category:primary -category:social -category:promotions -category:updates newer_than:14d"
     fallback_ids = run_query(query=fallback_q, include_spam_trash=False)
     if fallback_ids:
         return list(dict.fromkeys(fallback_ids)), fallback_q
@@ -600,9 +810,17 @@ def list_message_ids_since(service, user_id: str, after_seconds: int, max_pages:
 
 
 # Ensure the `ingest_gmail` function uses the correct `after_seconds` value.
-def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me", reset_cursor_flag: bool = False, force_reauth: bool = False) -> Dict[str, int]:
+def ingest_gmail(
+    out_db_path: str,
+    source: str = "gmail",
+    user_id: str = "me",
+    reset_cursor_flag: bool = False,
+    force_reauth: bool = False,
+    token_path: str = "token.json",
+    account_key: Optional[str] = None,
+) -> Dict[str, int]:
     conn = open_sqlite_rw(out_db_path)
-    service = gmail_auth(force_reauth=force_reauth)
+    service = gmail_auth(token_path=token_path, force_reauth=force_reauth)
 
     account_email = None
     try:
@@ -614,6 +832,7 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me", r
 
     if reset_cursor_flag:
         reset_cursor(conn, source)
+        conn.commit()
     last_ms = get_last_cursor(conn, source)
     last_dt = datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc) if last_ms else datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -635,9 +854,11 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me", r
 
     max_internal_ms_seen = last_ms
 
-    conn.execute("BEGIN;")
     inserted_count = 0
     try:
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN")
         for mid in msg_ids:
             msg = service.users().messages().get(userId=user_id, id=mid, format="full").execute()
 
@@ -671,6 +892,8 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me", r
                 conversation_id=conv_id,
                 sender=sender,
                 sender_name=sender_name,
+                account_key=normalize_user_key(account_key),
+                account_email=account_email,
                 sent_at_utc=sent_at_utc,
                 text=combined,
             )
@@ -686,7 +909,7 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me", r
                 insert_attachment_meta(conn, msg_id_db, filename, mime, attachment_id)
 
         set_last_cursor(conn, source, max_internal_ms_seen)
-        conn.execute("COMMIT;")
+        conn.commit()
         logger.info(f"Done. ingested={len(msg_ids)} cursor_ms={max_internal_ms_seen}")
         return {
             "processed": len(msg_ids),
@@ -696,7 +919,8 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me", r
             "after_seconds": after_seconds,
         }
     except Exception:
-        conn.execute("ROLLBACK;")
+        if conn.in_transaction:
+            conn.rollback()
         raise
     finally:
         conn.close()
@@ -744,6 +968,8 @@ def process_email(
         conversation_id=conversation_id,
         sender=sender,
         sender_name=sender_name,
+        account_key=None,
+        account_email=None,
         sent_at_utc=sent_at_utc,
         text=text,
     )
@@ -762,7 +988,9 @@ def ingest():
     """API endpoint to trigger Gmail ingestion."""
     try:
         payload = request.json or {}
-        db_path = payload.get('db_path', 'extracted.db')
+        user_key = payload.get('user_key')
+        db_path_payload = payload.get('db_path')
+        token_path, db_path = resolve_user_paths(user_key=user_key, db_path=db_path_payload)
         reset_flag = bool(payload.get('reset_cursor'))
         # By default, reuse token and only force reauth when explicitly requested.
         force_reauth_flag = payload.get('force_reauth')
@@ -770,9 +998,15 @@ def ingest():
             force_reauth_flag = False
         else:
             force_reauth_flag = bool(force_reauth_flag)
-        logger.info(f"Starting Gmail ingestion for database: {db_path} reset_cursor={reset_flag} force_reauth={force_reauth_flag}")
-        ingest_stats = ingest_gmail(db_path, reset_cursor_flag=reset_flag, force_reauth=force_reauth_flag)
-        summary = get_db_summary(db_path)
+        logger.info(f"Starting Gmail ingestion for database: {db_path} token_path={token_path} reset_cursor={reset_flag} force_reauth={force_reauth_flag}")
+        ingest_stats = ingest_gmail(
+            db_path,
+            reset_cursor_flag=reset_flag,
+            force_reauth=force_reauth_flag,
+            token_path=token_path,
+            account_key=user_key,
+        )
+        summary = get_db_summary(db_path, account_key=user_key)
         logger.info("Gmail ingestion completed successfully.")
         return jsonify({
             "status": "success",
@@ -789,17 +1023,105 @@ def ingest():
 def summary():
     """Return recent messages, dates, and links from the ingestion DB."""
     try:
-        db_path = request.args.get('db_path', 'extracted.db')
+        user_key = request.args.get('user_key')
+        db_path_raw = request.args.get('db_path')
+        _, db_path = resolve_user_paths(user_key=user_key, db_path=db_path_raw)
         limit_raw = request.args.get('limit', '20')
         try:
             limit = max(1, min(500, int(limit_raw)))
         except ValueError:
             limit = 20
-        snap = fetch_db_snapshot(db_path, limit=limit)
-        stats = get_db_summary(db_path)
+        snap = fetch_db_snapshot(db_path, limit=limit, account_key=user_key)
+        stats = get_db_summary(db_path, account_key=user_key)
         return jsonify({"status": "success", "summary": stats, "data": snap})
     except Exception as e:
         logger.error(f"Error during summary fetch: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/attachment_preview', methods=['GET'])
+def attachment_preview():
+    """Stream attachment bytes for preview by extracted_attachments row id."""
+    try:
+        attachment_id_raw = (request.args.get('attachment_id') or '').strip()
+        if not attachment_id_raw:
+            return jsonify({"status": "error", "message": "attachment_id is required"}), 400
+
+        try:
+            attachment_id = int(attachment_id_raw)
+        except ValueError:
+            return jsonify({"status": "error", "message": "attachment_id must be an integer"}), 400
+
+        user_key = normalize_user_key(request.args.get('user_key'))
+        db_path_raw = request.args.get('db_path')
+        _, db_path = resolve_user_paths(user_key=user_key, db_path=db_path_raw)
+
+        conn = open_sqlite_rw(db_path)
+        try:
+            if user_key:
+                row = conn.execute(
+                    """
+                    SELECT a.id, a.filename, a.mime_type, a.original_path, m.source_msg_key, m.account_key
+                    FROM extracted_attachments a
+                    JOIN messages m ON m.id = a.message_id
+                    WHERE a.id = ? AND m.account_key = ?
+                    LIMIT 1
+                    """,
+                    (attachment_id, user_key),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT a.id, a.filename, a.mime_type, a.original_path, m.source_msg_key, m.account_key
+                    FROM extracted_attachments a
+                    JOIN messages m ON m.id = a.message_id
+                    WHERE a.id = ?
+                    LIMIT 1
+                    """,
+                    (attachment_id,),
+                ).fetchone()
+        finally:
+            conn.close()
+
+        if not row:
+            return jsonify({"status": "error", "message": "Attachment not found"}), 404
+
+        original_path = (row["original_path"] or "").strip()
+        prefix = "gmail_attachment_id:"
+        if not original_path.startswith(prefix):
+            return jsonify({"status": "error", "message": "Attachment preview source is unsupported"}), 400
+
+        gmail_attachment_id = original_path[len(prefix):].strip()
+        if not gmail_attachment_id:
+            return jsonify({"status": "error", "message": "Missing Gmail attachment id"}), 400
+
+        message_id = (row["source_msg_key"] or "").strip()
+        if not message_id:
+            return jsonify({"status": "error", "message": "Missing source message id for attachment"}), 400
+
+        effective_key = user_key or row["account_key"]
+        token_path, _ = resolve_user_paths(user_key=effective_key, db_path=db_path_raw)
+        service = gmail_auth(token_path=token_path, force_reauth=False)
+
+        attachment = service.users().messages().attachments().get(
+            userId='me', messageId=message_id, id=gmail_attachment_id
+        ).execute()
+
+        data_b64 = attachment.get('data') or ''
+        if not data_b64:
+            return jsonify({"status": "error", "message": "Attachment data is empty"}), 404
+
+        padding = '=' * (-len(data_b64) % 4)
+        blob = base64.urlsafe_b64decode(data_b64 + padding)
+
+        filename = (row["filename"] or "attachment").replace('"', '')
+        mime_type = row["mime_type"] or 'application/octet-stream'
+        headers = {
+            'Content-Disposition': f'inline; filename="{filename}"'
+        }
+        return Response(blob, mimetype=mime_type, headers=headers)
+    except Exception as e:
+        logger.error(f"Error during attachment preview fetch: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -823,22 +1145,35 @@ def lookup_message():
     """Find ingested messages by keyword and include extracted date rows for each message."""
     try:
         db_path = request.args.get('db_path', 'extracted.db')
+        user_key = normalize_user_key(request.args.get('user_key'))
         q = (request.args.get('q') or '').strip()
         if not q:
             return jsonify({"status": "error", "message": "Query parameter q is required."}), 400
 
         conn = open_sqlite_rw(db_path)
         try:
-            rows = conn.execute(
-                """
-                SELECT id, sender, sent_at_utc, substr(text, 1, 300) AS snippet
-                FROM messages
-                WHERE text LIKE ?
-                ORDER BY source_rowid DESC
-                LIMIT 50
-                """,
-                (f"%{q}%",),
-            ).fetchall()
+            if user_key:
+                rows = conn.execute(
+                    """
+                    SELECT id, sender, sent_at_utc, substr(text, 1, 300) AS snippet
+                    FROM messages
+                    WHERE account_key = ? AND text LIKE ?
+                    ORDER BY source_rowid DESC
+                    LIMIT 50
+                    """,
+                    (user_key, f"%{q}%"),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, sender, sent_at_utc, substr(text, 1, 300) AS snippet
+                    FROM messages
+                    WHERE text LIKE ?
+                    ORDER BY source_rowid DESC
+                    LIMIT 50
+                    """,
+                    (f"%{q}%",),
+                ).fetchall()
 
             out = []
             for r in rows:
@@ -887,14 +1222,15 @@ def suggest_reply():
 
 
 if __name__ == "__main__":
-    # Run the Flask app for API integration on an alternate port to avoid conflicts
-    # Auto-trigger a one-time ingest on startup so auth prompts appear without manual POST.
-    try:
-        logger.info("Auto-start ingest on startup: force_reauth=False reset_cursor=False")
-        ingest_gmail("extracted.db", reset_cursor_flag=False, force_reauth=False)
-    except Exception as e:
-        logger.error(f"Auto ingest on startup failed: {e}")
+    # Do not auto-ingest on startup by default; onboarding-triggered /ingest should control auth prompts.
+    if os.environ.get("ENABLE_STARTUP_AUTO_INGEST", "0") == "1":
+        try:
+            logger.info("Auto-start ingest on startup: force_reauth=False reset_cursor=False")
+            ingest_gmail("extracted.db", reset_cursor_flag=False, force_reauth=False)
+        except Exception as e:
+            logger.error(f"Auto ingest on startup failed: {e}")
 
-    start_auto_ingest_worker("extracted.db", AUTO_INGEST_INTERVAL_SECONDS)
+    if os.environ.get("ENABLE_BACKGROUND_INGEST", "0") == "1":
+        start_auto_ingest_worker("extracted.db", AUTO_INGEST_INTERVAL_SECONDS)
 
     app.run(debug=False, host="0.0.0.0", port=5001)
