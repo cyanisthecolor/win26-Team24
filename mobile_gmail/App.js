@@ -26,8 +26,8 @@ const C = {
 const APPS = [
   { id: 'gmail', label: 'Gmail', icon: '✉️', desc: 'Import threads, links, dates, and attachments.' },
   { id: 'calendar', label: 'Calendar', icon: '📅', desc: 'Overlay extracted dates on your calendar.' },
-  { id: 'slack', label: 'Slack', icon: '💬', desc: 'Bring channel context into your inbox.' },
-  { id: 'whatsapp', label: 'WhatsApp', icon: '📱', desc: 'Keep personal threads synced.' },
+  { id: 'outlook', label: 'Outlook', icon: '📨', desc: 'Bring your Outlook mail and schedule context.' },
+  { id: 'imessage', label: 'iMessage', icon: '💬', desc: 'Include your iMessage conversations.' },
 ];
 
 const PRIVACY_SETTINGS = [
@@ -69,7 +69,7 @@ const DATA = {
 const BASE_URL_OVERRIDE = '';
 
 const NOTIF_TIMINGS = ['30 min', '1 hour', '3 hours', '1 day'];
-const ONBOARDING_STEPS = ['welcome', 'connect', 'whitelist', 'privacy', 'notifications', 'done'];
+const ONBOARDING_STEPS = ['welcome', 'connect', 'accounts', 'whitelist', 'privacy', 'notifications', 'done'];
 
 function timeAgo(ts) {
   const d = new Date(ts);
@@ -233,6 +233,44 @@ function ConnectAppsScreen({ selected, onToggle }) {
           </View>
         </TouchableOpacity>
       ))}
+    </ScrollView>
+  );
+}
+
+function AppAccountsScreen({ selectedApps, accountValues, onChangeAccount }) {
+  const selectedMeta = APPS.filter(app => selectedApps.includes(app.id));
+
+  return (
+    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 24 }}>
+      <View style={{ paddingTop: 12, paddingBottom: 20 }}>
+        <Text style={{ fontSize: 36, marginBottom: 12 }}>🔐</Text>
+        <Text style={s.sectionTitle}>Sign in to selected apps</Text>
+        <Text style={s.sectionSubtitle}>Enter account identifiers for the apps you selected on the previous step.</Text>
+      </View>
+
+      {selectedMeta.length === 0 && (
+        <Text style={{ color: C.textMuted, fontSize: 13 }}>Select apps first, then come back to connect accounts.</Text>
+      )}
+
+      {selectedMeta.map((app) => (
+        <View key={app.id} style={[s.appCard, { paddingVertical: 12 }]}> 
+          <Text style={{ fontSize: 24, marginRight: 12 }}>{app.icon}</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 }}>{app.label} account</Text>
+            <TextInput
+              style={[s.textInput, { paddingVertical: 10 }]}
+              placeholder={app.id === 'gmail' || app.id === 'outlook' ? 'you@example.com' : 'Phone number or Apple ID'}
+              placeholderTextColor={C.textMuted}
+              autoCapitalize="none"
+              keyboardType={app.id === 'imessage' ? 'default' : 'email-address'}
+              value={accountValues[app.id] || ''}
+              onChangeText={(v) => onChangeAccount(app.id, v)}
+            />
+          </View>
+        </View>
+      ))}
+
+      <InfoBox icon="ℹ️" text="For Gmail, this value is used as your user key and sync source in the dashboard." />
     </ScrollView>
   );
 }
@@ -809,14 +847,74 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
 }
 
 // ─── Dashboard: TODO Tab (links & attachments) ───────────────────────────────
-function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveToJunk }) {
+function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveToJunk, userKey = '' }) {
   const links = ingestLinks.filter(l => !isDeleted(`link-${l.id}`)).slice(0, 3);
-  const attachments = ingestAttachments.filter(a => !isDeleted(`att-${a.id}`)).slice(0, 20);
+  const isAllowedDocAttachment = (a) => {
+    const mime = String(a?.mime_type || '').trim().toLowerCase();
+    if (
+      mime === 'application/pdf' ||
+      mime === 'application/msword' ||
+      mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ) {
+      return true;
+    }
+    const filename = String(a?.filename || '').trim().toLowerCase();
+    return /\.(pdf|doc|docx)$/i.test(filename);
+  };
+  const attachments = ingestAttachments
+    .filter(a => !isDeleted(`att-${a.id}`))
+    .filter(isAllowedDocAttachment)
+    .slice(0, 20);
+  const senderDisplay = (link) => {
+    if (link?.sender_name && String(link.sender_name).trim()) return String(link.sender_name).trim();
+    const raw = String(link?.sender || '').trim();
+    if (!raw) return '';
+    const m = raw.match(/^(.*)<([^>]+)>$/);
+    if (m) {
+      const name = (m[1] || '').replace(/\"/g, '').trim();
+      return name || (m[2] || '').trim();
+    }
+    return raw;
+  };
+  const hostLabel = (url) => {
+    const value = String(url || '').trim();
+    if (!value) return 'Link';
+    try {
+      const withProtocol = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+      return new URL(withProtocol).hostname.replace(/^www\./i, '');
+    } catch {
+      return value;
+    }
+  };
+  const linkLabel = (link) => {
+    const subject = String(link?.subject || '').trim();
+    if (subject) return subject;
+
+    const sender = senderDisplay(link);
+    if (sender) return sender;
+
+    return hostLabel(link?.url);
+  };
   const openLink = (url) => {
     const target = url?.startsWith('http') ? url : `http://${url}`;
     Linking.openURL(target).catch(() => Alert.alert('Unable to open link', target));
   };
   const openAttachment = (a) => {
+    const source = String(a?.original_path || '').trim();
+
+    if (a?.id != null) {
+      const normalizedUser = String(userKey || '').trim().toLowerCase();
+      const qs = `attachment_id=${encodeURIComponent(String(a.id))}${normalizedUser ? `&user_key=${encodeURIComponent(normalizedUser)}` : ''}`;
+      const previewUrl = `${getBaseUrl()}/attachment_preview?${qs}`;
+      Linking.openURL(previewUrl).catch(() => Alert.alert('Unable to open attachment', previewUrl));
+      return;
+    }
+
+    if (source && /^https?:\/\//i.test(source)) {
+      Linking.openURL(source).catch(() => Alert.alert('Unable to open attachment', source));
+      return;
+    }
+
     Alert.alert('Attachment', a.filename || 'Attachment');
   };
 
@@ -831,8 +929,8 @@ function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveTo
 
       <Text style={s.groupLabel}>Links</Text>
       {links.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13, marginBottom: 12 }}>No links yet.</Text>}
-      {links.map((l, idx) => {
-        const friendly = ['Williams Sonoma Main Website', 'Williams Sonoma User Pravacy', 'Williams Sonoma Email Option'][idx] || l.url;
+      {links.map((l) => {
+        const friendly = linkLabel(l);
         return (
         <TouchableOpacity key={`l-${l.id}`} style={s.notifCard} activeOpacity={0.8} onPress={() => openLink(l.url)}>
           <View style={{ flex: 1 }}>
@@ -1015,7 +1113,7 @@ const TABS = [
   { key: 'junk', label: 'Junk', icon: '🗑️' },
 ];
 
-function Dashboard({ ingestData }) {
+function Dashboard({ ingestData, onBackToSetup, userKey = '' }) {
   const [notifItems, setNotifItems] = useState(DATA.notifications.map(n => ({ ...n, read: false })));
   const [deletedMap, setDeletedMap] = useState({});
   const [deletedItems, setDeletedItems] = useState([]);
@@ -1035,6 +1133,11 @@ function Dashboard({ ingestData }) {
     <SafeAreaView style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={{ flex: 1, paddingHorizontal: 20 }}>
+        <View style={{ alignItems: 'flex-end', paddingTop: 8, marginBottom: 6 }}>
+          <TouchableOpacity style={s.markAllBtn} onPress={onBackToSetup}>
+            <Text style={{ fontSize: 12, color: C.textSecondary, fontWeight: '600' }}>← Back to setup</Text>
+          </TouchableOpacity>
+        </View>
         {tab === 'notifications' && (
           <NotificationsTab
             notifications={notifItems}
@@ -1047,7 +1150,7 @@ function Dashboard({ ingestData }) {
         )}
         {tab === 'threads' && <ThreadsTab ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
         {tab === 'calendar' && <CalendarTab ingestDates={ingestData.dates} ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
-        {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
+        {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} userKey={userKey} />}
         {tab === 'junk' && <JunkTab deletedItems={deletedItems} />}
       </View>
       <View style={s.tabBar}>
@@ -1083,6 +1186,11 @@ export default function App() {
   const [notifEnabled, setNotifEnabled] = useState(true);
   const [leadTime, setLeadTime] = useState('1 hour');
   const [ingestData, setIngestData] = useState({ messages: [], dates: [], links: [], attachments: [], meta: {} });
+  const [appAccounts, setAppAccounts] = useState({ gmail: '', calendar: '', outlook: '', imessage: '' });
+  const [userKey, setUserKey] = useState('');
+  const [isConnectingAccounts, setIsConnectingAccounts] = useState(false);
+
+  const normalizedUserKey = (userKey || '').trim().toLowerCase();
 
   function transition(fn) {
     Animated.sequence([
@@ -1101,6 +1209,7 @@ export default function App() {
     switch (current) {
       case 'welcome': return <WelcomeScreen />;
       case 'connect': return <ConnectAppsScreen selected={selectedApps} onToggle={id => setSelectedApps(p => p.includes(id) ? p.filter(a => a !== id) : [...p, id])} />;
+      case 'accounts': return <AppAccountsScreen selectedApps={selectedApps} accountValues={appAccounts} onChangeAccount={(appId, value) => setAppAccounts(prev => ({ ...prev, [appId]: value }))} />;
       case 'whitelist': return <WhitelistScreen contacts={contacts} inputValue={contactInput} onChangeInput={setContactInput}
         onAdd={() => { const t = contactInput.trim(); if (t && !contacts.includes(t)) setContacts(p => [...p, t]); setContactInput(''); }}
         onRemove={name => setContacts(p => p.filter(c => c !== name))} />;
@@ -1110,12 +1219,16 @@ export default function App() {
     }
   }
 
-  const triggerIngestion = async () => {
+  const triggerIngestion = async (showAlert = true) => {
     try {
+      if (!normalizedUserKey) {
+        if (showAlert) Alert.alert('Connect account', 'Enter your email first.');
+        return;
+      }
       const response = await fetch(`${getBaseUrl()}/ingest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ db_path: 'extracted.db' }),
+        body: JSON.stringify({ user_key: normalizedUserKey }),
       });
 
       // Read body even on error to surface backend message
@@ -1145,16 +1258,18 @@ export default function App() {
         latest,
       ].filter(Boolean);
 
-      Alert.alert('Success', lines.join('\n'));
+      if (showAlert) Alert.alert('Success', lines.join('\n'));
     } catch (error) {
-      Alert.alert('Error', error.message || 'Failed to trigger ingestion');
+      if (showAlert) Alert.alert('Error', error.message || 'Failed to trigger ingestion');
       console.error(error);
     }
   };
 
-  const loadSummary = async () => {
+  const loadSummary = async (overrideUserKey = null) => {
     try {
-      const response = await fetch(`${getBaseUrl()}/summary`);
+      const effectiveUserKey = (overrideUserKey || normalizedUserKey || '').trim().toLowerCase();
+      if (!effectiveUserKey) return;
+      const response = await fetch(`${getBaseUrl()}/summary?user_key=${encodeURIComponent(effectiveUserKey)}`);
       const raw = await response.text();
       let data = null;
       try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
@@ -1184,10 +1299,59 @@ export default function App() {
     }
   };
 
+  const finishSetupAndConnect = async () => {
+    const gmailSelected = selectedApps.includes('gmail');
+    const gmailAccount = (appAccounts.gmail || '').trim().toLowerCase();
+
+    if (gmailSelected && !gmailAccount) {
+      Alert.alert('Gmail account required', 'Please add your Gmail account in the Sign in step.');
+      return;
+    }
+
+    if (!gmailSelected) {
+      setDone(true);
+      return;
+    }
+
+    setIsConnectingAccounts(true);
+    try {
+      setUserKey(gmailAccount);
+
+      const response = await fetch(`${getBaseUrl()}/ingest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_key: gmailAccount, force_reauth: false, reset_cursor: true }),
+      });
+
+      const raw = await response.text();
+      let data = null;
+      try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+
+      if (!response.ok) {
+        const msg = data?.message || `HTTP ${response.status} ${response.statusText}`;
+        throw new Error(msg);
+      }
+
+      await loadSummary(gmailAccount);
+      setDone(true);
+    } catch (error) {
+      Alert.alert('Connect failed', error?.message || 'Unable to connect selected Gmail account.');
+      console.error(error);
+    } finally {
+      setIsConnectingAccounts(false);
+    }
+  };
+
   // Pull summary right away so the dashboard has backend data without waiting on onboarding state.
   useEffect(() => {
+    if (!done || !normalizedUserKey) return;
     loadSummary();
-  }, []);
+    const id = setInterval(() => {
+      triggerIngestion(false);
+      loadSummary();
+    }, 20000);
+    return () => clearInterval(id);
+  }, [done, normalizedUserKey]);
 
   useEffect(() => {
     if (done) {
@@ -1197,7 +1361,7 @@ export default function App() {
 
   if (done) return (
     <SafeAreaProvider>
-      <Dashboard ingestData={ingestData} />
+      <Dashboard ingestData={ingestData} onBackToSetup={() => setDone(false)} userKey={normalizedUserKey} />
     </SafeAreaProvider>
   );
 
@@ -1210,7 +1374,7 @@ export default function App() {
           {renderScreen()}
         </Animated.View>
         <View style={s.navRow}>
-          {!isFirst && !isDone && (
+          {!isFirst && (
             <TouchableOpacity style={s.backBtn} onPress={() => transition(() => setStep(p => p - 1))}>
               <Text style={{ color: C.textSecondary, fontSize: 15, fontWeight: '600' }}>← Back</Text>
             </TouchableOpacity>
@@ -1223,8 +1387,12 @@ export default function App() {
             </TouchableOpacity>
           )}
           {isDone && (
-            <TouchableOpacity style={[s.nextBtn, { flex: 1, backgroundColor: C.green }]} onPress={() => setDone(true)}>
-              <Text style={{ color: '#0D1A14', fontSize: 15, fontWeight: '800' }}>Open Dashboard →</Text>
+            <TouchableOpacity
+              style={[s.nextBtn, { flex: 1, backgroundColor: C.green }, isConnectingAccounts && { opacity: 0.65 }]}
+              onPress={finishSetupAndConnect}
+              disabled={isConnectingAccounts}
+            >
+              <Text style={{ color: '#0D1A14', fontSize: 15, fontWeight: '800' }}>{isConnectingAccounts ? 'Connecting account…' : 'Open Dashboard →'}</Text>
             </TouchableOpacity>
           )}
         </View>
