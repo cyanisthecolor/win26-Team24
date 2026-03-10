@@ -24,10 +24,10 @@ const C = {
 };
 
 const APPS = [
-  { id: 'gmail', label: 'Gmail', icon: '✉️', desc: 'Import threads, links, dates, and attachments.' },
-  { id: 'calendar', label: 'Calendar', icon: '📅', desc: 'Overlay extracted dates on your calendar.' },
-  { id: 'outlook', label: 'Outlook', icon: '📨', desc: 'Bring your Outlook mail and schedule context.' },
-  { id: 'imessage', label: 'iMessage', icon: '💬', desc: 'Include your iMessage conversations.' },
+  { id: 'gmail', label: 'Gmail', icon: '✉️', desc: 'Summarize emails, surface action items, and track what needs a reply.' },
+  { id: 'calendar', label: 'Calendar', icon: '📅', desc: 'See upcoming events, deadlines, and meeting prep — all in one place.' },
+  { id: 'outlook', label: 'Outlook', icon: '📨', desc: 'Pull in work emails and meetings from your Outlook account.' },
+  { id: 'imessage', label: 'iMessage', icon: '💬', desc: 'Include texts in your context so nothing slips through the cracks.' },
 ];
 
 const PRIVACY_SETTINGS = [
