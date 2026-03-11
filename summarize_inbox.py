@@ -4,7 +4,6 @@ import os
 import requests
 from datetime import datetime, timedelta
 import openai
-from openai import error as openai_error
 from dotenv import load_dotenv
 import json
 import ast
@@ -65,8 +64,8 @@ def filter_emails(emails=None, output_file="filtered_emails.json"):
     """
     Uses OpenAI to filter emails and saves the 'high-signal' results to a JSON file.
     """
-    if not emails:
-        print("No emails found to filter.")
+    if emails is None or not emails:
+        print("No emails found to filter.", file=sys.stderr)
         return []
 
     mini_metadata = []
@@ -104,12 +103,158 @@ def filter_emails(emails=None, output_file="filtered_emails.json"):
     with open("potential_spam.json", 'w', encoding='utf-8') as f:
         json.dump(potential_spam, f, indent=4, ensure_ascii=False)
     
-    print(f"Successfully saved {len(filtered_list)} high-signal emails to {output_file}")
-    return filtered_list
+    import sys
+    print(f"Successfully saved {len(filtered_list)} high-signal emails to {output_file}", file=sys.stderr)
+
+    notifications = []
+    todo_counter = 1
+    for email in filtered_list:
+        subj = email.get('subject') or '(no subject)'
+        frm = email.get('from', {}).get('emailAddress', {}).get('name') or str(email.get('from'))
+        # Use full body content, not just preview
+        body_content = email.get('body', {}).get('content') or email.get('bodyPreview') or ''
+        body_content = (body_content[:2000] + '...') if len(body_content) > 2000 else body_content  # Limit to 2000 chars
+        
+        prompt = (
+            "Extract all actionable to-dos, tasks, or action items from this email. Be inclusive and err on the side of caution. "
+            "Include: reply requests, deadlines, tasks mentioned, meetings to schedule, documents to review, decisions needed, suggestions to consider, things to follow up on, etc. "
+            "Also include softer action items like: 'should consider X', 'might want to Y', 'consider doing Z', or anything that implies an action or consideration. "
+            "Return ONLY a JSON array of strings, where each string is one specific actionable item or consideration. "
+            "If there are no clear action items at all, return an empty array []. "
+            "Do not include any text outside the JSON array.\n"
+            f"Subject: {subj}\n\nBody:\n{body_content}"
+        )
+        print(f"Processing email: {subj}", file=sys.stderr)
+        try:
+            resp = openai.ChatCompletion.create(
+                model='gpt-4o-mini',
+                messages=[
+                    {"role": "system", "content": "You are an expert at extracting actionable to-dos from emails."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=500,
+            )
+            response_text = resp['choices'][0]['message']['content'].strip()
+            # Strip markdown code blocks if present
+            if response_text.startswith('```'):
+                response_text = response_text.split('```')[1]
+                if response_text.startswith('json'):
+                    response_text = response_text[4:]
+                response_text = response_text.strip()
+            print(f"Cleaned response: {response_text}", file=sys.stderr)
+            todos = json.loads(response_text)
+            
+            # Group related to-dos using OpenAI
+            if todos and len(todos) > 1:
+                consolidate_prompt = (
+                    "Group these related to-dos into fewer, more consolidated action items. "
+                    "Combine tasks that are part of the same action (e.g., 'provide suggestions' and 'share experiences' could be one to-do). "
+                    "Return ONLY a JSON array of consolidated to-dos.\n"
+                    f"Original to-dos: {json.dumps(todos)}"
+                )
+                try:
+                    consolidate_resp = openai.ChatCompletion.create(
+                        model='gpt-4o-mini',
+                        messages=[
+                            {"role": "system", "content": "You consolidate and group related to-dos."},
+                            {"role": "user", "content": consolidate_prompt},
+                        ],
+                        temperature=0.1,
+                        max_tokens=400,
+                    )
+                    consolidated_text = consolidate_resp['choices'][0]['message']['content'].strip()
+                    # Strip markdown if present
+                    if consolidated_text.startswith('```'):
+                        consolidated_text = consolidated_text.split('```')[1]
+                        if consolidated_text.startswith('json'):
+                            consolidated_text = consolidated_text[4:]
+                        consolidated_text = consolidated_text.strip()
+                    todos = json.loads(consolidated_text)
+                    print(f"Consolidated to {len(todos)} to-dos", file=sys.stderr)
+                except Exception as e:
+                    print(f"Could not consolidate todos: {e}", file=sys.stderr)
+            
+            print(f"Extracted {len(todos)} to-dos from email: {subj}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error extracting to-dos from email '{subj}': {e}", file=sys.stderr)
+            todos = []
+        if isinstance(todos, list):
+            for todo in todos:
+                # Categorize the task as WORK, SOCIAL, or OPPORTUNITY
+                categorize_prompt = (
+                    "Categorize this task from a work email as one of: WORK (professional/work task), SOCIAL (social or personal), or OPPORTUNITY (something interesting but not urgent to respond to). "
+                    f"Task: {todo}\n"
+                    f"Email subject: {subj}\n"
+                    f"Email from: {frm}\n\n"
+                    "Return ONLY one word: WORK, SOCIAL, or OPPORTUNITY"
+                )
+                try:
+                    cat_resp = openai.ChatCompletion.create(
+                        model='gpt-4o-mini',
+                        messages=[
+                            {"role": "system", "content": "You categorize tasks into WORK, SOCIAL, or OPPORTUNITY."},
+                            {"role": "user", "content": categorize_prompt},
+                        ],
+                        temperature=0.1,
+                        max_tokens=10,
+                    )
+                    category = cat_resp['choices'][0]['message']['content'].strip().upper()
+                    if category not in ["WORK", "SOCIAL", "OPPORTUNITY"]:
+                        category = "WORK"
+                except Exception:
+                    category = "WORK"
+                
+                # Create concise title and complete phrase with recipient
+                title = todo[:60] + ("..." if len(todo) > 60 else "")  # Concise title
+                phrase = f"{todo} ({frm})"  # Complete phrase naming the sender/recipient
+                
+                # Create a rich notification with context
+                notifications.append({
+                    "id": f"todo_{todo_counter}",
+                    "title": title,  # Short actionable title (60 chars)
+                    "phrase": phrase,  # Complete phrase with recipient named
+                    "description": f"{subj}",  # Subject line as description
+                    "body": f"From {frm}: {subj}",  # Alternative field
+                    "date": datetime.utcnow().strftime('%Y-%m-%d'),
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "notes": f"From: {frm} | Subject: {subj}",
+                    "source": "Outlook",
+                    "sourceIcon": "📧",
+                    "priority": "MEDIUM",  # Default priority; can be enhanced with email analysis
+                    "category": category,  # WORK, SOCIAL, or OPPORTUNITY
+                    "read": False
+                })
+                todo_counter += 1
+
+    # Overwrite notifications in data.json
+    try:
+        with open("data.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["notifications"] = notifications
+        with open("data.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"Successfully wrote {len(notifications)} notifications to data.json", file=sys.stderr)
+        
+        # Push updated notifications to localhost app
+        try:
+            import requests as req
+            response = req.post(
+                'http://localhost:3000/update-notifications',
+                json={"notifications": notifications},
+                timeout=5
+            )
+            print(f"Pushed notifications to app: {response.status_code}", file=sys.stderr)
+        except Exception as push_err:
+            print(f"Could not push to localhost (app may not be running): {push_err}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error writing to data.json: {e}", file=sys.stderr)
+    return notifications
 
 
 def build_prompt(emails):
-    emails = filter_emails(emails)
+    if not emails:
+        return "No emails to summarize."
     parts = []
     for i, e in enumerate(emails, start=1):
         subj = e.get('subject') or '(no subject)'
@@ -131,7 +276,7 @@ def build_prompt(emails):
 
 
 
-def summarize_emails(emails, model='gpt-4o-mini'):
+def summarize_emails_backup(emails, model='gpt-4o-mini'):
     prompt = build_prompt(emails)
     try:
         resp = openai.ChatCompletion.create(
@@ -305,22 +450,16 @@ def draft_response(target, emails: list, tone: str = 'concise and polite', model
 
 
 if __name__ == '__main__':
-    since = datetime.utcnow() - timedelta(days=1)
-    emails = fetch_messages_since(since, top=50)
-    build_email_json(since, top=50)
+    since = datetime.utcnow() - timedelta(days=100)
+    emails = fetch_messages_since(since, top=100)
+    build_email_json(since, top=100)
     emails = read_data_json("emails.json")
 
-    summary = summarize_emails(emails)
-    print('\n----- SUMMARY -----\n')
-    print(summary)
+    # Filter emails and extract to-dos
+    notifications = filter_emails(emails)
 
-    print('\n----- TOPIC: Assignment -----\n')
-    since = datetime.utcnow() - timedelta(days=50)
-    emails = fetch_messages_since(since, top=200)
-    print(summarize_topic("Assignment", emails))
+    # Print final processed to-dos (notifications)
+    print("\nFinal processed to-dos:")
+    for n in notifications:
+        print(json.dumps(n, ensure_ascii=False))
 
-    print('\n----- PERSON: TLDR -----\n')
-    print(summarize_person("dan@tldrnewsletter.com", emails))
-
-    print('\n----- RESPONSE -----\n')
-    print(draft_response(1, emails, tone='concise and polite'))
