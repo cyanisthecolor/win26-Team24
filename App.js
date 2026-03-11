@@ -1,10 +1,54 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView,
   Switch, TextInput, Animated, Dimensions, StatusBar,
-  SafeAreaView, Modal,
+  SafeAreaView, Modal, ActivityIndicator, Platform
 } from 'react-native';
+import * as AuthSession from 'expo-auth-session';
+import * as WebBrowser from 'expo-web-browser';
+import * as FileSystem from 'expo-file-system/legacy';
 import DATA from './data.json';
+
+// helper for web storage
+function getWebThreads() {
+  if (Platform.OS === 'web') {
+    try {
+      const stored = localStorage.getItem('threads');
+      if (stored) return JSON.parse(stored);
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+  return null;
+}
+function setWebThreads(arr) {
+  if (Platform.OS === 'web') {
+    try {
+      localStorage.setItem('threads', JSON.stringify(arr));
+    } catch (_e) {}
+  }
+}
+
+// similar helpers for inbox emails
+function getWebInbox() {
+  if (Platform.OS === 'web') {
+    try {
+      const stored = localStorage.getItem('inbox');
+      if (stored) return JSON.parse(stored);
+    } catch (_e) {}
+  }
+  return null;
+}
+function setWebInbox(arr) {
+  if (Platform.OS === 'web') {
+    try {
+      localStorage.setItem('inbox', JSON.stringify(arr));
+    } catch (_e) {}
+  }
+}    
+
+// Initialize WebBrowser for Auth
+WebBrowser.maybeCompleteAuthSession();
 
 const { width } = Dimensions.get('window');
 
@@ -13,6 +57,11 @@ const C = {
   accent: '#4F8EF7', accentSoft: '#1E2F4A', green: '#3DD68C', greenSoft: '#1A3028',
   red: '#F75C5C', redSoft: '#3D1A1A', yellow: '#F7C948', yellowSoft: '#382E10',
   textPrimary: '#EDF0F7', textSecondary: '#7A8099', textMuted: '#4A5068',
+};
+
+const discovery = {
+  authorizationEndpoint: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
+  tokenEndpoint: 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
 };
 
 function timeAgo(iso) {
@@ -227,34 +276,90 @@ function DoneScreen({ connectedCount, contactCount }) {
 }
 
 // ─── Dashboard: Notifications Tab ─────────────────────────────────────────────
-function NotificationsTab() {
-  const [notifs, setNotifs] = useState(DATA.notifications);
-  const unread = notifs.filter(n => !n.read);
-  const read = notifs.filter(n => n.read);
+function NotificationsTab({ inboxEmails, setInboxEmails }) {
+  // Use only inboxEmails from polling server, no fallback to DATA
+  const source = inboxEmails && Array.isArray(inboxEmails) ? inboxEmails : [];
+  const unread = source.filter(n => !n.read);
+  const read = source.filter(n => n.read);
 
-  function markRead(id) { setNotifs(p => p.map(n => n.id === id ? { ...n, read: true } : n)); }
-  function markAll() { setNotifs(p => p.map(n => ({ ...n, read: true }))); }
+  function persistInbox(updated) {
+    if (Platform.OS === 'web') {
+      setWebInbox(updated);
+    } else {
+      (async () => {
+        try {
+          const inboxPath = FileSystem.documentDirectory + 'inbox.json';
+          await FileSystem.writeAsStringAsync(inboxPath, JSON.stringify({ emails: updated }, null, 2));
+        } catch (_e) {}
+      })();
+    }
+  }
+
+  function markRead(id) {
+    const out = source.map(n => n.id === id ? { ...n, read: true } : n);
+    setInboxEmails(out);
+    persistInbox(out);
+    
+    // Also sync to server
+    try {
+      fetch('http://localhost:3000/mark-read', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      }).catch(_e => {/* ignore network errors */});
+    } catch (_e) {}
+  }
+  function markAll() {
+    const out = source.map(n => ({ ...n, read: true }));
+    setInboxEmails(out);
+    persistInbox(out);
+    
+    // Sync all to server
+    out.forEach(n => {
+      try {
+        fetch('http://localhost:3000/mark-read', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: n.id })
+        }).catch(_e => {/* ignore network errors */});
+      } catch (_e) {}
+    });
+  }
 
   function Card({ n }) {
+    // determine displayed title/body from classification if available
+    const title = n.phrase || n.title;
+    const body = n.description || n.body;
+    const badgeLabel = n.priority ? n.priority.toUpperCase() : n.priority;
     return (
       <TouchableOpacity style={[s.notifCard, !n.read && s.notifCardUnread]} onPress={() => markRead(n.id)} activeOpacity={0.8}>
         <View style={{ flexDirection: 'row', gap: 12 }}>
           <View style={s.notifBubble}><Text style={{ fontSize: 18 }}>{n.sourceIcon}</Text></View>
           <View style={{ flex: 1 }}>
             <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
-              <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
+              <Text style={s.notifTitle} numberOfLines={1}>{title}</Text>
               {!n.read && <View style={s.unreadDot} />}
             </View>
-            <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }} numberOfLines={2}>{n.body}</Text>
+            <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }} numberOfLines={2}>{body}</Text>
             <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>
-              <View style={[s.badge, { backgroundColor: priorityBg(n.priority) }]}>
-                <Text style={[s.badgeText, { color: priorityColor(n.priority) }]}>{n.priority.toUpperCase()}</Text>
-              </View>
-              <Text style={{ fontSize: 11, color: C.textMuted }}>{n.source} · {timeAgo(n.timestamp)}</Text>
+              {badgeLabel && <View style={[s.badge, { backgroundColor: priorityBg(n.priority) }]}><Text style={[s.badgeText, { color: priorityColor(n.priority) }]}>{badgeLabel}</Text></View>}
+              <Text style={{ fontSize: 11, color: C.textMuted }}>{n.category || n.source} · {timeAgo(n.timestamp)}</Text>
             </View>
           </View>
-        </View>
+        </View>  {/* end outer row gap */}
       </TouchableOpacity>
+    );
+  }
+
+  if (source.length === 0) {
+    return (
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8, justifyContent: 'center', flexGrow: 1 }}>
+        <View style={{ alignItems: 'center', justifyContent: 'center', paddingVertical: 40 }}>
+          <Text style={{ fontSize: 32, marginBottom: 12 }}>📬</Text>
+          <Text style={[s.dashTitle, { marginBottom: 4 }]}>No notifications yet</Text>
+          <Text style={s.dashSubtitle}>Login and check your emails to get started</Text>
+        </View>
+      </ScrollView>
     );
   }
 
@@ -263,7 +368,7 @@ function NotificationsTab() {
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Notifications</Text>
-          <Text style={s.dashSubtitle}>{unread.length} unread · {notifs.length} total</Text>
+          <Text style={s.dashSubtitle}>{unread.length} unread · {source.length} total</Text>
         </View>
         {unread.length > 0 && (
           <TouchableOpacity onPress={markAll} style={s.markAllBtn}>
@@ -276,7 +381,7 @@ function NotificationsTab() {
         {unread.map(n => <Card key={n.id} n={n} />)}
       </>}
       {read.length > 0 && <>
-        <Text style={[s.groupLabel, { marginTop: 16 }]}>EARLIER</Text>
+        <Text style={[s.groupLabel, { marginTop: 16 }]}>READ</Text>
         {read.map(n => <Card key={n.id} n={n} />)}
       </>}
     </ScrollView>
@@ -284,28 +389,40 @@ function NotificationsTab() {
 }
 
 // ─── Dashboard: Calendar Tab ──────────────────────────────────────────────────
-function CalendarTab() {
+function CalendarTab({ events = [] }) {
   const [selected, setSelected] = useState(null);
 
-  const grouped = DATA.events.reduce((acc, e) => {
+  const grouped = events.reduce((acc, e) => {
     if (!acc[e.date]) acc[e.date] = [];
     acc[e.date].push(e);
     return acc;
   }, {});
+
+  if (events.length === 0) {
+    return (
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8, justifyContent: 'center', flexGrow: 1 }}>
+        <View style={{ alignItems: 'center', justifyContent: 'center', paddingVertical: 40 }}>
+          <Text style={{ fontSize: 32, marginBottom: 12 }}>📅</Text>
+          <Text style={[s.dashTitle, { marginBottom: 4 }]}>No events</Text>
+          <Text style={s.dashSubtitle}>Your calendar events will appear here</Text>
+        </View>
+      </ScrollView>
+    );
+  }
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Calendar</Text>
-          <Text style={s.dashSubtitle}>{DATA.events.length} upcoming events</Text>
+          <Text style={s.dashSubtitle}>{events.length} upcoming events</Text>
         </View>
       </View>
 
-      {Object.entries(grouped).map(([date, events]) => (
+      {Object.entries(grouped).map(([date, dateEvents]) => (
         <View key={date} style={{ marginBottom: 6 }}>
           <Text style={s.calDateLabel}>{formatDate(date)}</Text>
-          {events.map(e => (
+          {dateEvents.map(e => (
             <TouchableOpacity key={e.id} style={s.eventCard} onPress={() => setSelected(e)} activeOpacity={0.8}>
               <View style={{ width: 56, alignItems: 'flex-end' }}>
                 <Text style={{ fontSize: 12, fontWeight: '700', color: C.textPrimary }}>{e.time}</Text>
@@ -315,7 +432,7 @@ function CalendarTab() {
               <View style={{ flex: 1 }}>
                 <Text style={{ fontSize: 14, fontWeight: '600', color: C.textPrimary, marginBottom: 6 }}>{e.title}</Text>
                 <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
-                  {e.attendees.map(a => (
+                  {e.attendees && e.attendees.map(a => (
                     <View key={a} style={s.attendeeChip}><Text style={{ fontSize: 11, color: C.textSecondary, fontWeight: '500' }}>{a}</Text></View>
                   ))}
                 </View>
@@ -340,7 +457,7 @@ function CalendarTab() {
                 ['🕐', `${selected.time}${selected.duration ? ` · ${selected.duration}` : ''}`],
                 ['📅', formatDate(selected.date)],
                 [selected.sourceIcon, selected.source],
-                selected.attendees.length > 0 ? ['👥', selected.attendees.join(', ')] : null,
+                selected.attendees && selected.attendees.length > 0 ? ['👥', selected.attendees.join(', ')] : null,
               ].filter(Boolean).map(([icon, text]) => (
                 <View key={text} style={s.modalRow}>
                   <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>{icon}</Text>
@@ -368,7 +485,7 @@ function CalendarTab() {
 }
 
 // ─── Dashboard: Threads Tab ───────────────────────────────────────────────────
-function ThreadsTab() {
+function ThreadsTab({ threads = DATA.threads }) {
   const [selected, setSelected] = useState(null);
 
   return (
@@ -376,11 +493,11 @@ function ThreadsTab() {
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Threads</Text>
-          <Text style={s.dashSubtitle}>{DATA.threads.filter(t => t.unread > 0).length} need attention</Text>
+          <Text style={s.dashSubtitle}>{threads.filter(t => t.unread > 0).length} need attention</Text>
         </View>
       </View>
 
-      {DATA.threads.map(t => (
+      {threads.map(t => (
         <TouchableOpacity key={t.id} style={s.threadCard} onPress={() => setSelected(t)} activeOpacity={0.8}>
           <View style={[s.avatar, { backgroundColor: t.avatarColor }]}>
             <Text style={{ fontSize: 16, fontWeight: '800', color: '#fff' }}>{t.avatar}</Text>
@@ -394,9 +511,9 @@ function ThreadsTab() {
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 6 }}>
               <Text style={{ fontSize: 12 }}>{t.sourceIcon}</Text>
               <Text style={{ fontSize: 11, color: C.textMuted }}>{t.source}</Text>
-              {t.openItems.length > 0 && (
+              {(t.openItems?.length || 0) > 0 && (
                 <View style={s.openBadge}>
-                  <Text style={{ fontSize: 10, color: C.yellow, fontWeight: '700' }}>{t.openItems.length} open</Text>
+                  <Text style={{ fontSize: 10, color: C.yellow, fontWeight: '700' }}>{t.openItems?.length || 0} open</Text>
                 </View>
               )}
             </View>
@@ -430,14 +547,17 @@ function ThreadsTab() {
                 <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>{selected.summary}</Text>
               </View>
               <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>OPEN ITEMS</Text>
-              {selected.openItems.map(item => (
-                <View key={item} style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginBottom: 8 }}>
+              {(selected.openItems || []).map((item, index) => {
+                const itemText = typeof item === 'string' ? item : (item?.item || '');
+                const itemKey = typeof item === 'string' ? item : `${item?.item || 'item'}-${index}`;
+                return (
+                <View key={itemKey} style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginBottom: 8 }}>
                   <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: C.accent, marginTop: 6 }} />
-                  <Text style={{ flex: 1, fontSize: 13, color: C.textPrimary, lineHeight: 20 }}>{item}</Text>
+                  <Text style={{ flex: 1, fontSize: 13, color: C.textPrimary, lineHeight: 20 }}>{itemText}</Text>
                 </View>
-              ))}
+              )})}
               <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginTop: 14, marginBottom: 8 }}>RELATED DATES</Text>
-              {selected.relatedDates.map(d => (
+              {(selected.relatedDates || []).map(d => (
                 <View key={d} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 }}>
                   <Text style={{ fontSize: 14 }}>📅</Text>
                   <Text style={{ fontSize: 13, color: C.textSecondary }}>{d}</Text>
@@ -451,23 +571,105 @@ function ThreadsTab() {
   );
 }
 
+// ─── Dashboard: Connections Tab ────────────────────────────────────────────────
+function ConnectionsTab({ onMicrosoftConnect, isMicrosoftConnected, isLoading }) {
+  return (
+    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
+      <View style={s.dashHeader}>
+        <View>
+          <Text style={s.dashTitle}>Connect Apps</Text>
+          <Text style={s.dashSubtitle}>Manage your third-party integrations</Text>
+        </View>
+      </View>
+
+      <View style={{ gap: 12 }}>
+        {/* Microsoft Button */}
+        <TouchableOpacity 
+          style={[s.authCard, isMicrosoftConnected && s.authCardConnected]} 
+          onPress={onMicrosoftConnect}
+          disabled={isLoading}
+        >
+          <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+            <Text style={{ fontSize: 24, marginRight: 16 }}>📧</Text>
+            <View>
+              <Text style={s.authCardTitle}>Microsoft Outlook</Text>
+              <Text style={s.authCardStatus}>
+                {isMicrosoftConnected ? 'Connected' : 'Tap to sign in'}
+              </Text>
+            </View>
+          </View>
+          {isLoading ? (
+            <ActivityIndicator color={C.accent} />
+          ) : (
+            <View style={[s.authBadge, isMicrosoftConnected && s.authBadgeConnected]}>
+              <Text style={s.authBadgeText}>{isMicrosoftConnected ? '✓' : 'Connect'}</Text>
+            </View>
+          )}
+        </TouchableOpacity>
+
+        {/* Google Button (Placeholder) */}
+        <TouchableOpacity style={s.authCard} activeOpacity={0.7}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+            <Text style={{ fontSize: 24, marginRight: 16 }}>✉️</Text>
+            <View>
+              <Text style={s.authCardTitle}>Google Gmail</Text>
+              <Text style={s.authCardStatus}>Tap to sign in</Text>
+            </View>
+          </View>
+          <View style={s.authBadge}>
+            <Text style={s.authBadgeText}>Connect</Text>
+          </View>
+        </TouchableOpacity>
+      </View>
+      
+      <InfoBox 
+        icon="ℹ️" 
+        text="Connecting these apps allows the assistant to pull in your latest threads and calendar events." 
+        style={{ marginTop: 24 }} 
+      />
+    </ScrollView>
+  );
+}
+
 // ─── Dashboard Shell ──────────────────────────────────────────────────────────
 const TABS = [
   { key: 'notifications', label: 'Inbox', icon: '🔔' },
   { key: 'calendar', label: 'Calendar', icon: '📅' },
   { key: 'threads', label: 'Threads', icon: '💬' },
+  { key: 'connections', label: 'Connect', icon: '🔗' },
 ];
 
-function Dashboard() {
+function Dashboard({ msAuthProps, threads, inboxEmails, setInboxEmails, calendarEvents }) {
   const [tab, setTab] = useState('notifications');
-  const unreadCount = DATA.notifications.filter(n => !n.read).length;
+  const unreadCount = (inboxEmails && inboxEmails.length > 0 ? inboxEmails : []).filter(n => !n.read).length;
+
+  // Poll server for updated notifications every 3 seconds
+  useEffect(() => {
+    const pollInterval = setInterval(async () => {
+      try {
+        const response = await fetch('http://localhost:3000/notifications');
+        if (response.ok) {
+          const data = await response.json();
+          if (data.notifications && data.notifications.length > 0) {
+            setInboxEmails(data.notifications);
+          }
+        }
+      } catch (_e) {
+        // Server may not be running, silently fail
+      }
+    }, 3000);
+    
+    return () => clearInterval(pollInterval);
+  }, [setInboxEmails]);
+
   return (
     <SafeAreaView style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={{ flex: 1, paddingHorizontal: 20 }}>
-        {tab === 'notifications' && <NotificationsTab />}
-        {tab === 'calendar' && <CalendarTab />}
-        {tab === 'threads' && <ThreadsTab />}
+        {tab === 'notifications' && <NotificationsTab inboxEmails={inboxEmails} setInboxEmails={setInboxEmails} />}
+        {tab === 'calendar' && <CalendarTab events={calendarEvents} />}
+        {tab === 'threads' && <ThreadsTab threads={threads} />}
+        {tab === 'connections' && <ConnectionsTab {...msAuthProps} />}
       </View>
       <View style={s.tabBar}>
         {TABS.map(t => {
@@ -495,12 +697,339 @@ export default function App() {
   const [step, setStep] = useState(0);
   const fade = useRef(new Animated.Value(1)).current;
 
+  // Onboarding States
   const [selectedApps, setSelectedApps] = useState(['gmail', 'calendar']);
   const [contacts, setContacts] = useState(['Natalie', 'Eugenie', 'Jonathan', 'Amanda']);
   const [contactInput, setContactInput] = useState('');
   const [privacyValues, setPrivacyValues] = useState(Object.fromEntries(PRIVACY_SETTINGS.map(p => [p.id, p.default])));
   const [notifEnabled, setNotifEnabled] = useState(true);
   const [leadTime, setLeadTime] = useState('1 hour');
+
+  // Auth States
+  const [microsoftToken, setMicrosoftToken] = useState(null);
+  const starting = getWebThreads();
+  const startingInbox = getWebInbox();
+  const [threads, setThreads] = useState(starting ?? DATA.threads);
+  const [inboxEmails, setInboxEmails] = useState(startingInbox ?? []);
+  const [calendarEvents, setCalendarEvents] = useState(DATA.events);
+
+  const [request, response, promptAsync] = AuthSession.useAuthRequest(
+    {
+      clientId: 'fde8d6d4-cb6f-4ad5-862f-0ab740a0bec8',
+      scopes: ['openid', 'profile', 'email', 'User.Read', 'Mail.Read', 'Calendars.Read'],
+      redirectUri: AuthSession.makeRedirectUri({ scheme: 'team24app' }),
+      responseType: AuthSession.ResponseType.Token,
+      usePKCE: false,
+    },
+    discovery
+  );
+
+  async function classifyOutlook(token) {
+    try {
+      console.log('Classifying Outlook messages with token:', token?.substring(0, 20) + '...');
+      const URL = `http://localhost:3000/classify?token=${encodeURIComponent(token)}`;
+      console.log('Calling endpoint:', URL);
+      
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+      
+      const resp = await fetch(URL, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      
+      console.log('Classification response status:', resp.status);
+      if (!resp.ok) {
+        const text = await resp.text();
+        console.error('classification service error', resp.status, text);
+        return;
+      }
+      const json = await resp.json();
+      console.log('Classification response:', json);
+      
+      // Response contains notifications from filter_emails
+      if (json.notifications && Array.isArray(json.notifications)) {
+        console.log('Setting inboxEmails with', json.notifications.length, 'notifications');
+        setInboxEmails(json.notifications);
+        // also persist classified data
+        if (Platform.OS === 'web') {
+          setWebInbox(json.notifications);
+        } else {
+          (async () => {
+            try {
+              const inboxPath = FileSystem.documentDirectory + 'inbox.json';
+              await FileSystem.writeAsStringAsync(inboxPath, JSON.stringify({ emails: json.notifications }, null, 2));
+            } catch (_e) {}
+          })();
+        }
+      }
+    } catch (err) {
+      console.error('Failed to classify outlook messages', err.message || err);
+      if (err.name === 'AbortError') {
+        console.error('Request timed out - server may be busy or unresponsive');
+      }
+    }
+  }
+
+  // Compute threads from inbox, calendar, and notifications
+  function buildThreadsFromData() {
+    const threadMap = new Map();
+    
+    // Group notifications (to-dos) by sender
+    if (inboxEmails && Array.isArray(inboxEmails)) {
+      inboxEmails.forEach(notification => {
+        // Extract sender from "From X:" pattern in body
+        const fromMatch = notification.body?.match(/From ([^:]+):/);
+        let sender = fromMatch ? fromMatch[1].trim() : (notification.linkedContact || 'Unknown');
+        
+        if (!threadMap.has(sender)) {
+          threadMap.set(sender, {
+            contact: sender,
+            openItems: [],
+            relatedDates: [],
+            lastMessage: '',
+            summary: '',
+            notifications: [],
+          });
+        }
+        
+        const thread = threadMap.get(sender);
+        // Add notification for reference
+        thread.notifications.push(notification);
+        
+        // Add to-do/phrase as open item (this is the actionable task from the email)
+        if (notification.phrase && !notification.read) {
+          thread.openItems.push({
+            item: notification.phrase,
+            deadline: null,
+          });
+        }
+        
+        // Update lastMessage with email subject
+        if (notification.description && !thread.lastMessage) {
+          thread.lastMessage = notification.description;
+        }
+      });
+    }
+    
+    // Add calendar events to threads
+    if (calendarEvents && Array.isArray(calendarEvents)) {
+      calendarEvents.forEach(event => {
+        event.attendees?.forEach(attendee => {
+          if (!threadMap.has(attendee)) {
+            threadMap.set(attendee, {
+              contact: attendee,
+              openItems: [],
+              relatedDates: [],
+              lastMessage: '',
+              summary: '',
+              notifications: [],
+            });
+          }
+          
+          const thread = threadMap.get(attendee);
+          // Add calendar date
+          thread.relatedDates.push(event.date);
+          // Update last message to include event title if not already set
+          if (!thread.lastMessage) {
+            thread.lastMessage = event.title;
+          }
+        });
+      });
+    }
+    
+    // Generate summaries and build final thread objects
+    const finalThreads = Array.from(threadMap.values()).map(thread => {
+      const contact = thread.contact.split(' ')[0]; // First name only
+      const avatar = contact[0]?.toUpperCase() || 'U';
+      
+      // Create informative summary based on available data
+      let summary = '';
+      const hasTodos = thread.openItems.length > 0;
+      const hasDates = thread.relatedDates.length > 0;
+      const hasMessage = thread.lastMessage;
+      
+      if (hasMessage && hasTodos && hasDates) {
+        summary = `${thread.lastMessage}. ${thread.openItems.length} action item${thread.openItems.length > 1 ? 's' : ''} pending.`;
+      } else if (hasMessage && hasTodos) {
+        summary = `Regarding ${thread.lastMessage}. ${thread.openItems.length} action item${thread.openItems.length > 1 ? 's' : ''} pending.`;
+      } else if (hasMessage && hasDates) {
+        summary = `Meeting: ${thread.lastMessage}.`;
+      } else if (hasTodos) {
+        summary = `${thread.openItems.length} action item${thread.openItems.length > 1 ? 's' : ''} require${thread.openItems.length > 1 ? '' : 's'} attention.`;
+      } else if (hasDates) {
+        summary = `Scheduled meetings on calendar.`;
+      } else {
+        summary = `Ongoing communication.`;
+      }
+      
+      return {
+        id: thread.contact.replace(/\s+/g, '_'),
+        contact: thread.contact,
+        avatar,
+        avatarColor: '#888888',
+        lastMessage: thread.lastMessage || '(no subject)',
+        timestamp: new Date().toISOString(),
+        source: 'Outlook',
+        sourceIcon: '📧',
+        unread: thread.openItems.length, // Count unread as open items
+        summary,
+        openItems: thread.openItems.slice(0, 5), // Show first 5 open items
+        relatedDates: [...new Set(thread.relatedDates)].sort(), // Unique dates, sorted
+      };
+    });
+    
+    return finalThreads;
+  }
+
+  // Update threads when inbox or calendar changes
+  useEffect(() => {
+    if ((inboxEmails && inboxEmails.length > 0) || (calendarEvents && calendarEvents.length > 0)) {
+      const computedThreads = buildThreadsFromData();
+      setThreads(computedThreads);
+      console.log('Updated threads from notifications and calendar:', computedThreads.length);
+    }
+  }, [inboxEmails, calendarEvents]);
+
+  async function fetchOutlookCalendar(token) {
+    try {
+      console.log('Fetching Microsoft calendar events...');
+      
+      const now = new Date();
+      const endDate = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days from now
+      
+      // Format dates as ISO strings without encoding (Graph API handles this)
+      const startDateTime = now.toISOString();
+      const endDateTime = endDate.toISOString();
+      
+      const url = `https://graph.microsoft.com/v1.0/me/calendarview?startDateTime=${startDateTime}&endDateTime=${endDateTime}`;
+      console.log('Calendar API URL:', url.substring(0, 80) + '...');
+
+      const resp = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      console.log('Calendar API response status:', resp.status);
+      const data = await resp.json();
+
+      if (!resp.ok) {
+        console.error('Calendar API error response:', data);
+        return;
+      }
+
+      if (data.error) {
+        console.error('Calendar API error:', data.error);
+        return;
+      }
+
+      if (data.value && Array.isArray(data.value)) {
+        const converted = data.value.map(event => {
+          try {
+            const startTime = new Date(event.start.dateTime);
+            const endTime = new Date(event.end.dateTime);
+            const dateStr = startTime.toISOString().split('T')[0];
+            const timeStr = startTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+            
+            // Calculate duration
+            const diffMs = endTime - startTime;
+            const diffMins = Math.round(diffMs / 60000);
+            const hours = Math.floor(diffMins / 60);
+            const mins = diffMins % 60;
+            let durationStr = '';
+            if (hours > 0) durationStr += `${hours}h `;
+            if (mins > 0) durationStr += `${mins}m`;
+            durationStr = durationStr.trim() || '0m';
+
+            return {
+              id: event.id,
+              title: event.subject || '(no title)',
+              date: dateStr,
+              time: timeStr,
+              duration: durationStr,
+              attendees: event.attendees ? event.attendees.map(a => a.emailAddress.name.split(' ')[0]) : [],
+              source: 'Outlook',
+              sourceIcon: '📅',
+              videoLink: event.onlineMeetingUrl || null,
+              notes: event.bodyPreview || '',
+            };
+          } catch (e) {
+            console.error('Error parsing event:', event, e);
+            return null;
+          }
+        }).filter(Boolean);
+        
+        setCalendarEvents(converted);
+        console.log('Successfully fetched', converted.length, 'calendar events');
+      } else {
+        console.log('No calendar events returned');
+        setCalendarEvents([]);
+      }
+    } catch (err) {
+      console.error('Failed to fetch calendar events:', err);
+    }
+  }
+  useEffect(() => {
+    if (response?.type === 'success') {
+      const { access_token } = response.params;
+      setMicrosoftToken(access_token);
+      console.log("Microsoft Connected!");
+      // Fetch calendar events
+      fetchOutlookCalendar(access_token);
+      // Fetch and classify inbox
+      classifyOutlook(access_token);
+    }
+  }, [response]);
+
+  // when token status changes, keep the outlook checkbox in sync and purge threads
+  useEffect(() => {
+    if (microsoftToken) {
+      setSelectedApps(p => p.includes('outlook') ? p : [...p, 'outlook']);
+    } else {
+      setSelectedApps(p => p.filter(a => a !== 'outlook'));
+      setThreads([]);
+      setInboxEmails([]);
+      if (Platform.OS === 'web') {
+        setWebThreads([]);
+        setWebInbox([]);
+        console.log('Cleared web-local threads and inbox due to Microsoft disconnect');
+      } else {
+        (async () => {
+          try {
+            const dataPath = FileSystem.documentDirectory + 'data.json';
+            const updatedData = { ...DATA, threads: [] };
+            await FileSystem.writeAsStringAsync(dataPath, JSON.stringify(updatedData, null, 2));
+            const inboxPath = FileSystem.documentDirectory + 'inbox.json';
+            await FileSystem.writeAsStringAsync(inboxPath, JSON.stringify({ emails: [] }, null, 2));
+            console.log('Cleared data.json and inbox.json due to Microsoft disconnect');
+          } catch (_e) {}
+        })();
+      }
+    }
+  }, [microsoftToken]);
+
+  // respond when the user toggles the outlook app checkbox manually
+  useEffect(() => {
+    const hasOutlook = selectedApps.includes('outlook');
+    if (!hasOutlook) {
+      setThreads([]);
+      setInboxEmails([]);
+      if (Platform.OS === 'web') {
+        setWebThreads([]);
+        setWebInbox([]);
+      } else {
+        (async () => {
+          try {
+            const dataPath = FileSystem.documentDirectory + 'data.json';
+            const updatedData = { ...DATA, threads: [] };
+            await FileSystem.writeAsStringAsync(dataPath, JSON.stringify(updatedData, null, 2));
+            const inboxPath = FileSystem.documentDirectory + 'inbox.json';
+            await FileSystem.writeAsStringAsync(inboxPath, JSON.stringify({ emails: [] }, null, 2));
+          } catch (_e) {}
+        })();
+      }
+    } else if (hasOutlook && microsoftToken) {
+      // if user just enabled outlook and we already have a token, fetch content
+      classifyOutlook(microsoftToken);
+    }
+  }, [selectedApps]);
 
   function transition(fn) {
     Animated.sequence([
@@ -528,7 +1057,13 @@ export default function App() {
     }
   }
 
-  if (done) return <Dashboard />;
+  const msAuthProps = {
+    onMicrosoftConnect: () => promptAsync(),
+    isMicrosoftConnected: !!microsoftToken,
+    isLoading: !request && !microsoftToken
+  };
+
+  if (done) return <Dashboard msAuthProps={msAuthProps} threads={threads} inboxEmails={inboxEmails} setInboxEmails={setInboxEmails} calendarEvents={calendarEvents} />;
 
   return (
     <SafeAreaView style={s.root}>
@@ -560,13 +1095,10 @@ export default function App() {
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
   progressBar: { flexDirection: 'row', paddingHorizontal: 24, paddingTop: 16, paddingBottom: 4 },
   progressSeg: { flex: 1, height: 3, borderRadius: 2 },
-
-  // Onboarding
   welcomeGlow: { position: 'absolute', top: -80, left: -60, width: 300, height: 300, borderRadius: 150, backgroundColor: C.accent, opacity: 0.06 },
   welcomeTitle: { fontSize: 36, fontWeight: '800', color: C.textPrimary, lineHeight: 44, marginBottom: 16, letterSpacing: -0.5 },
   welcomeBody: { fontSize: 15, color: C.textSecondary, lineHeight: 24, marginBottom: 32 },
@@ -591,13 +1123,9 @@ const s = StyleSheet.create({
   doneGlow: { position: 'absolute', top: -60, width: 280, height: 280, borderRadius: 140, backgroundColor: C.green, opacity: 0.07 },
   doneTitle: { fontSize: 32, fontWeight: '800', color: C.textPrimary, marginBottom: 12 },
   doneSummaryCard: { width: '100%', backgroundColor: C.surface, borderRadius: 16, padding: 20, borderWidth: 1, borderColor: C.border },
-
-  // Nav
   navRow: { flexDirection: 'row', paddingHorizontal: 24, paddingBottom: 24, paddingTop: 12, gap: 12 },
   backBtn: { paddingVertical: 14, paddingHorizontal: 20, borderRadius: 14, borderWidth: 1, borderColor: C.border },
   nextBtn: { flex: 1, backgroundColor: C.accent, borderRadius: 14, paddingVertical: 14, alignItems: 'center' },
-
-  // Dashboard
   dashHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 20, paddingTop: 8 },
   dashTitle: { fontSize: 26, fontWeight: '800', color: C.textPrimary, letterSpacing: -0.3 },
   dashSubtitle: { fontSize: 13, color: C.textMuted, marginTop: 2 },
@@ -628,4 +1156,11 @@ const s = StyleSheet.create({
   modalSheet: { backgroundColor: C.surface, borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, paddingBottom: 40, borderTopWidth: 1, borderColor: C.border },
   modalTitle: { fontSize: 18, fontWeight: '800', color: C.textPrimary, flex: 1, marginRight: 8 },
   modalRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 10 },
+  authCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.surface, borderRadius: 16, padding: 18, borderWidth: 1, borderColor: C.border },
+  authCardConnected: { borderColor: C.green, backgroundColor: C.greenSoft },
+  authCardTitle: { fontSize: 15, fontWeight: '700', color: C.textPrimary },
+  authCardStatus: { fontSize: 12, color: C.textSecondary, marginTop: 2 },
+  authBadge: { backgroundColor: C.accent, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 6 },
+  authBadgeConnected: { backgroundColor: C.green },
+  authBadgeText: { fontSize: 12, fontWeight: '700', color: '#fff' },
 });
