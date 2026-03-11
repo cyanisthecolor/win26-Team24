@@ -1,10 +1,14 @@
 import base64
 import os
 import re
+import sys
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from typing import Dict, Iterable, List, Optional, Tuple, TypedDict, NotRequired
+
+# Allow importing outlook_ingest from the parent directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dateparser.search import search_dates
 
@@ -1171,6 +1175,35 @@ def ingest():
         })
     except Exception as e:
         logger.error(f"Error during Gmail ingestion: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/ingest_outlook', methods=['POST'])
+def ingest_outlook():
+    """Ingest Outlook mail and calendar using an access token obtained from
+    the user's Microsoft popup sign-in in the mobile app.
+
+    Expected JSON body::
+
+        {
+          "access_token": "<bearer token from popup>",
+          "db_path": "extracted.db"   // optional
+        }
+    """
+    try:
+        import outlook_ingest as _oi
+        data = request.json or {}
+        access_token = (data.get('access_token') or '').strip()
+        if not access_token:
+            return jsonify({"status": "error", "message": "access_token is required"}), 400
+
+        db_path = data.get('db_path', 'extracted.db')
+        # json_path can be None so we only write to the DB here; the /summary
+        # endpoint already serves the data to the frontend.
+        _oi.ingest_all(db_path=db_path, json_path=None, quiet=False, access_token=access_token)
+        return jsonify({"status": "success", "message": "Outlook ingestion complete."})
+    except Exception as e:
+        logger.error(f"Error during Outlook ingestion: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 

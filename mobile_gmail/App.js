@@ -26,6 +26,7 @@ const C = {
 const APPS = [
   { id: 'gmail', label: 'Gmail', icon: '✉️', desc: 'Import threads, links, dates, and attachments.' },
   { id: 'calendar', label: 'Calendar', icon: '📅', desc: 'Overlay extracted dates on your calendar.' },
+  { id: 'outlook', label: 'Outlook', icon: '📨', desc: 'Bring your Outlook mail and schedule context.' },
   { id: 'slack', label: 'Slack', icon: '💬', desc: 'Bring channel context into your inbox.' },
   { id: 'whatsapp', label: 'WhatsApp', icon: '📱', desc: 'Keep personal threads synced.' },
 ];
@@ -66,7 +67,7 @@ const DATA = {
 };
 
 const NOTIF_TIMINGS = ['30 min', '1 hour', '3 hours', '1 day'];
-const ONBOARDING_STEPS = ['welcome', 'connect', 'whitelist', 'privacy', 'notifications', 'done'];
+const ONBOARDING_STEPS = ['welcome', 'connect', 'accounts', 'whitelist', 'privacy', 'notifications', 'done'];
 
 function timeAgo(ts) {
   const d = new Date(ts);
@@ -162,6 +163,94 @@ function ConnectAppsScreen({ selected, onToggle }) {
           </View>
         </TouchableOpacity>
       ))}
+    </ScrollView>
+  );
+}
+
+// ─── Onboarding: App Accounts (sign-in) ──────────────────────────────────────
+function AppAccountsScreen({ selectedApps, outlookSignedIn, onOutlookSignedIn }) {
+  const outlookSelected = selectedApps.includes('outlook');
+
+  if (!outlookSelected) {
+    return (
+      <View style={{ flex: 1, justifyContent: 'center', paddingBottom: 24 }}>
+        <Text style={{ fontSize: 36, marginBottom: 12 }}>🔐</Text>
+        <Text style={s.sectionTitle}>Sign in to your apps</Text>
+        <Text style={s.sectionSubtitle}>No additional sign-in required for your selected apps. Continue to the next step.</Text>
+      </View>
+    );
+  }
+
+  const MICROSOFT_CLIENT_ID = 'fde8d6d4-cb6f-4ad5-862f-0ab740a0bec8';
+
+  const openMicrosoftSignIn = async () => {
+    if (outlookSignedIn) return;
+    try {
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        const redirectUri = window.location.origin;
+        const authUrl =
+          `https://login.microsoftonline.com/common/oauth2/v2.0/authorize` +
+          `?client_id=${encodeURIComponent(MICROSOFT_CLIENT_ID)}` +
+          `&response_type=token` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&response_mode=fragment` +
+          `&scope=${encodeURIComponent('openid profile email https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Calendars.Read')}` +
+          `&prompt=select_account`;
+
+        const popup = window.open(authUrl, 'microsoft-sign-in', 'width=520,height=720,menubar=no,toolbar=no,location=yes,status=no,resizable=yes,scrollbars=yes');
+        if (!popup) { await Linking.openURL(authUrl); return; }
+
+        const timer = window.setInterval(() => {
+          try {
+            const href = popup.location?.href || '';
+            if (!href.startsWith(window.location.origin)) return;
+            const fragment = href.includes('#') ? href.split('#')[1] : '';
+            const params = new URLSearchParams(fragment);
+            const token = params.get('access_token');
+            if (token) {
+              window.clearInterval(timer);
+              popup.close();
+              onOutlookSignedIn(token);
+            }
+          } catch (_) { /* cross-origin until redirect completes */ }
+        }, 400);
+        return;
+      }
+      // Native: open in browser; token capture is not supported without a redirect scheme
+      await Linking.openURL(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize`);
+    } catch (err) {
+      Alert.alert('Unable to open Microsoft sign-in');
+    }
+  };
+
+  return (
+    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 24 }}>
+      <View style={{ paddingTop: 12, paddingBottom: 20 }}>
+        <Text style={{ fontSize: 36, marginBottom: 12 }}>🔐</Text>
+        <Text style={s.sectionTitle}>Sign in to Outlook</Text>
+        <Text style={s.sectionSubtitle}>Authenticate with Microsoft so the assistant can read your Outlook mail and calendar.</Text>
+      </View>
+      <View style={[s.appCard, { paddingVertical: 14 }]}>
+        <Text style={{ fontSize: 24, marginRight: 12 }}>📨</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 8 }}>Outlook account</Text>
+          <TouchableOpacity
+            style={[s.addBtn, {
+              alignSelf: 'flex-start',
+              paddingHorizontal: 14,
+              paddingVertical: 10,
+              backgroundColor: outlookSignedIn ? C.green : '#2563EB',
+            }]}
+            onPress={openMicrosoftSignIn}
+            disabled={outlookSignedIn}
+          >
+            <Text style={{ color: '#fff', fontWeight: '700', fontSize: 13 }}>
+              {outlookSignedIn ? '✓ Microsoft connected' : 'Sign in with Microsoft'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+      <InfoBox icon="ℹ️" text="Your access token is sent directly to the local backend and never stored in the cloud." />
     </ScrollView>
   );
 }
@@ -1464,6 +1553,14 @@ export default function App() {
   const [notifEnabled, setNotifEnabled] = useState(true);
   const [leadTime, setLeadTime] = useState('1 hour');
   const [ingestData, setIngestData] = useState({ messages: [], dates: [], links: [], attachments: [], meta: {} });
+  // Outlook sign-in state: token is the raw access_token from the Microsoft popup
+  const [outlookSignedIn, setOutlookSignedIn] = useState(false);
+  const [outlookAccessToken, setOutlookAccessToken] = useState(null);
+
+  const handleOutlookSignedIn = (token) => {
+    setOutlookAccessToken(token);
+    setOutlookSignedIn(true);
+  };
 
   function transition(fn) {
     Animated.sequence([
@@ -1482,6 +1579,7 @@ export default function App() {
     switch (current) {
       case 'welcome': return <WelcomeScreen />;
       case 'connect': return <ConnectAppsScreen selected={selectedApps} onToggle={id => setSelectedApps(p => p.includes(id) ? p.filter(a => a !== id) : [...p, id])} />;
+      case 'accounts': return <AppAccountsScreen selectedApps={selectedApps} outlookSignedIn={outlookSignedIn} onOutlookSignedIn={handleOutlookSignedIn} />;
       case 'whitelist': return <WhitelistScreen contacts={contacts} inputValue={contactInput} onChangeInput={setContactInput}
         onAdd={() => { const t = contactInput.trim(); if (t && !contacts.includes(t)) setContacts(p => [...p, t]); setContactInput(''); }}
         onRemove={name => setContacts(p => p.filter(c => c !== name))} />;
@@ -1603,7 +1701,25 @@ export default function App() {
             </TouchableOpacity>
           )}
           {isDone && (
-            <TouchableOpacity style={[s.nextBtn, { flex: 1, backgroundColor: C.green }]} onPress={() => setDone(true)}>
+            <TouchableOpacity
+              style={[s.nextBtn, { flex: 1, backgroundColor: C.green }]}
+              onPress={async () => {
+                // If the user signed in with Outlook, kick off backend Outlook ingestion
+                // using the access token captured from the Microsoft popup.
+                if (outlookAccessToken) {
+                  try {
+                    await fetch(`${CALENDAR_API}/ingest_outlook`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ access_token: outlookAccessToken }),
+                    });
+                  } catch (e) {
+                    console.warn('Outlook ingest failed:', e);
+                  }
+                }
+                setDone(true);
+              }}
+            >
               <Text style={{ color: '#0D1A14', fontSize: 15, fontWeight: '800' }}>Open Dashboard →</Text>
             </TouchableOpacity>
           )}

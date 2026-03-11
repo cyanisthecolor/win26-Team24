@@ -102,13 +102,17 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     
 
 
-def _fetch_all_messages() -> List[Dict]:
+def _fetch_all_messages(access_token: str = None) -> List[Dict]:
     """Retrieve messages from inbox and sent items only (excluding trash/deleted).
     
     Fetches from both inbox and sentitems folders, following @odata.nextLink
     pages until the service runs out of results.
+
+    ``access_token`` may be supplied directly (e.g. from a user's popup sign-in).
+    If omitted the module-level ACCESS_TOKEN global is used as a fallback.
     """
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    token = access_token or globals().get('ACCESS_TOKEN') or refresh_outlook_token()
+    headers = {"Authorization": f"Bearer {token}"}
     all_messages: List[Dict] = []
     
     # Fetch from inbox
@@ -136,11 +140,15 @@ def _fetch_all_messages() -> List[Dict]:
 
 # ingestion
 
-def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quiet: bool = False) -> None:
+def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quiet: bool = False, access_token: str = None) -> None:
     """Fetch every mail message, classify it and insert into the database.
 
     Spam messages are skipped; everything else is stored in the shared
     ``messages`` table with a ``category`` value.
+
+    ``access_token`` can be passed directly when called from a web server that
+    received the token from the user's Microsoft popup sign-in.  If omitted the
+    module-level refresh flow is used instead.
     """
     try:
         conn = sqlite3.connect(db_path)
@@ -177,7 +185,7 @@ def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quie
         
         if not quiet:
             print("fetching messages from Outlook...")
-        messages = _fetch_all_messages()
+        messages = _fetch_all_messages(access_token=access_token)
         if not quiet:
             print(f"retrieved {len(messages)} messages")
 
