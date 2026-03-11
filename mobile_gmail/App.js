@@ -1,9 +1,9 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView,
   Switch, TextInput, Animated, StatusBar, Modal, Alert, Linking, Platform,
 } from 'react-native';
-import DateTimePicker from '@react-native-community/datetimepicker';
+import Constants from 'expo-constants';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 const C = {
@@ -27,8 +27,7 @@ const APPS = [
   { id: 'gmail', label: 'Gmail', icon: '✉️', desc: 'Import threads, links, dates, and attachments.' },
   { id: 'calendar', label: 'Calendar', icon: '📅', desc: 'Overlay extracted dates on your calendar.' },
   { id: 'outlook', label: 'Outlook', icon: '📨', desc: 'Bring your Outlook mail and schedule context.' },
-  { id: 'slack', label: 'Slack', icon: '💬', desc: 'Bring channel context into your inbox.' },
-  { id: 'whatsapp', label: 'WhatsApp', icon: '📱', desc: 'Keep personal threads synced.' },
+  { id: 'imessage', label: 'iMessage', icon: '💬', desc: 'Include your iMessage conversations.' },
 ];
 
 const PRIVACY_SETTINGS = [
@@ -66,6 +65,9 @@ const DATA = {
   ],
 };
 
+// Set this to your backend URL if auto-detection fails (e.g., real device on LAN)
+const BASE_URL_OVERRIDE = '';
+
 const NOTIF_TIMINGS = ['30 min', '1 hour', '3 hours', '1 day'];
 const ONBOARDING_STEPS = ['welcome', 'connect', 'accounts', 'whitelist', 'privacy', 'notifications', 'done'];
 
@@ -83,12 +85,7 @@ function timeAgo(ts) {
 function formatDate(dateStr) {
   const d = new Date(dateStr);
   if (Number.isNaN(d.getTime())) return dateStr;
-  return d.toLocaleDateString('en-US', {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-    timeZone: 'UTC',
-  });
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
 function priorityColor(p) {
@@ -101,6 +98,79 @@ function priorityBg(p) {
   if (p === 'high') return '#2C0F17';
   if (p === 'medium') return '#2B2810';
   return C.surfaceAlt;
+}
+
+function localFallbackReplySuggestions(message) {
+  const text = `${message?.title || ''} ${message?.body || ''}`.toLowerCase();
+  if (text.includes('verify') || text.includes('security') || text.includes('password') || text.includes('login') || text.includes('sign-in')) {
+    return [
+      'Thanks for the heads-up. I verified this on my side.',
+      'I did not initiate this. Please lock the account and share next steps.',
+      'Received. I completed the verification successfully.',
+    ];
+  }
+  if (text.includes('meeting') || text.includes('schedule') || text.includes('calendar') || text.includes('time')) {
+    return [
+      'Thanks! That time works for me.',
+      'Could we move this by 30 minutes due to a conflict?',
+      'Confirmed, I will join and come prepared.',
+    ];
+  }
+  return [
+    'Thanks for the update. I will follow up shortly.',
+    'Received — I reviewed this and will respond with details soon.',
+    'Got it. I will take care of this today.',
+  ];
+}
+
+async function fetchReplySuggestions(message) {
+  const payload = {
+    subject: message?.title || '',
+    body: message?.body || '',
+    sender_name: message?.senderName || '',
+  };
+  const paths = ['/suggest_reply', '/suggest-reply', '/reply_suggestions', '/api/suggest_reply'];
+
+  let lastError = null;
+  for (const path of paths) {
+    const response = await fetch(`${getBaseUrl()}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    const raw = await response.text();
+    let data = null;
+    try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+
+    if (response.ok) {
+      const suggestions = Array.isArray(data?.suggestions) ? data.suggestions : [];
+      return suggestions.filter(Boolean);
+    }
+
+    if (response.status !== 404) {
+      const msg = data?.message || `HTTP ${response.status} ${response.statusText}`;
+      throw new Error(msg);
+    }
+
+    lastError = new Error(`HTTP ${response.status} ${response.statusText}`);
+  }
+
+  if (lastError && `${lastError.message}`.includes('404')) {
+    return localFallbackReplySuggestions(message);
+  }
+
+  throw lastError || new Error('AI suggestion endpoint not found');
+}
+
+function getBaseUrl() {
+  if (BASE_URL_OVERRIDE) return BASE_URL_OVERRIDE;
+  // Prefer Expo host when available (useful for real devices on LAN)
+  const host = Constants.expoConfig?.hostUri?.split(':')[0] || Constants.expoGoConfig?.debuggerHost?.split(':')[0];
+  if (host) return `http://${host}:5001`;
+  // Emulators and local dev fallbacks
+  if (Platform.OS === 'android') return 'http://10.0.2.2:5001';
+  return 'http://localhost:5001';
 }
 
 // ─── Shared Components ────────────────────────────────────────────────────────
@@ -167,19 +237,8 @@ function ConnectAppsScreen({ selected, onToggle }) {
   );
 }
 
-// ─── Onboarding: App Accounts (sign-in) ──────────────────────────────────────
-function AppAccountsScreen({ selectedApps, outlookSignedIn, onOutlookSignedIn }) {
-  const outlookSelected = selectedApps.includes('outlook');
-
-  if (!outlookSelected) {
-    return (
-      <View style={{ flex: 1, justifyContent: 'center', paddingBottom: 24 }}>
-        <Text style={{ fontSize: 36, marginBottom: 12 }}>🔐</Text>
-        <Text style={s.sectionTitle}>Sign in to your apps</Text>
-        <Text style={s.sectionSubtitle}>No additional sign-in required for your selected apps. Continue to the next step.</Text>
-      </View>
-    );
-  }
+function AppAccountsScreen({ selectedApps, accountValues, onChangeAccount, outlookSignedIn, onOutlookSignedIn }) {
+  const selectedMeta = APPS.filter(app => selectedApps.includes(app.id));
 
   const MICROSOFT_CLIENT_ID = 'fde8d6d4-cb6f-4ad5-862f-0ab740a0bec8';
 
@@ -227,30 +286,60 @@ function AppAccountsScreen({ selectedApps, outlookSignedIn, onOutlookSignedIn })
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 24 }}>
       <View style={{ paddingTop: 12, paddingBottom: 20 }}>
         <Text style={{ fontSize: 36, marginBottom: 12 }}>🔐</Text>
-        <Text style={s.sectionTitle}>Sign in to Outlook</Text>
-        <Text style={s.sectionSubtitle}>Authenticate with Microsoft so the assistant can read your Outlook mail and calendar.</Text>
+        <Text style={s.sectionTitle}>Sign in to selected apps</Text>
+        <Text style={s.sectionSubtitle}>Enter account identifiers for the apps you selected on the previous step.</Text>
       </View>
-      <View style={[s.appCard, { paddingVertical: 14 }]}>
-        <Text style={{ fontSize: 24, marginRight: 12 }}>📨</Text>
-        <View style={{ flex: 1 }}>
-          <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 8 }}>Outlook account</Text>
-          <TouchableOpacity
-            style={[s.addBtn, {
-              alignSelf: 'flex-start',
-              paddingHorizontal: 14,
-              paddingVertical: 10,
-              backgroundColor: outlookSignedIn ? C.green : '#2563EB',
-            }]}
-            onPress={openMicrosoftSignIn}
-            disabled={outlookSignedIn}
-          >
-            <Text style={{ color: '#fff', fontWeight: '700', fontSize: 13 }}>
-              {outlookSignedIn ? '✓ Microsoft connected' : 'Sign in with Microsoft'}
-            </Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-      <InfoBox icon="ℹ️" text="Your access token is sent directly to the local backend and never stored in the cloud." />
+
+      {selectedMeta.length === 0 && (
+        <Text style={{ color: C.textMuted, fontSize: 13 }}>Select apps first, then come back to connect accounts.</Text>
+      )}
+
+      {selectedMeta.map((app) => {
+        if (app.id === 'outlook') {
+          return (
+            <View key={app.id} style={[s.appCard, { paddingVertical: 14 }]}> 
+              <Text style={{ fontSize: 24, marginRight: 12 }}>{app.icon}</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 8 }}>{app.label} account</Text>
+                <TouchableOpacity
+                  style={[s.addBtn, {
+                    alignSelf: 'flex-start',
+                    paddingHorizontal: 14,
+                    paddingVertical: 10,
+                    backgroundColor: outlookSignedIn ? C.green : '#2563EB',
+                  }]}
+                  onPress={openMicrosoftSignIn}
+                  disabled={outlookSignedIn}
+                >
+                  <Text style={{ color: '#fff', fontWeight: '700', fontSize: 13 }}>
+                    {outlookSignedIn ? '✓ Microsoft connected' : 'Sign in with Microsoft'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          );
+        }
+
+        return (
+          <View key={app.id} style={[s.appCard, { paddingVertical: 12 }]}> 
+            <Text style={{ fontSize: 24, marginRight: 12 }}>{app.icon}</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 }}>{app.label} account</Text>
+              <TextInput
+                style={[s.textInput, { paddingVertical: 10 }]}
+                placeholder={app.id === 'gmail' || app.id === 'outlook' ? 'you@example.com' : 'Phone number or Apple ID'}
+                placeholderTextColor={C.textMuted}
+                autoCapitalize="none"
+                keyboardType={app.id === 'imessage' ? 'default' : 'email-address'}
+                value={accountValues[app.id] || ''}
+                onChangeText={(v) => onChangeAccount(app.id, v)}
+              />
+            </View>
+          </View>
+        );
+      })}
+
+      <InfoBox icon="ℹ️" text="For Gmail, this value is used as your user key and sync source in the dashboard." />
     </ScrollView>
   );
 }
@@ -371,23 +460,128 @@ function DoneScreen({ connectedCount, contactCount }) {
 }
 
 // ─── Dashboard: Notifications Tab ─────────────────────────────────────────────
-function NotificationsTab() {
-  const [notifs, setNotifs] = useState(DATA.notifications);
-  const unread = notifs.filter(n => !n.read);
-  const read = notifs.filter(n => n.read);
+function NotificationsTab({ notifications, setNotifications, ingestMessages = [], ingestDates = [], isDeleted, onMoveToJunk }) {
+  const notifs = notifications;
+  const [selectedMessage, setSelectedMessage] = useState(null);
+  const [replySuggestions, setReplySuggestions] = useState([]);
+  const [isLoadingSuggestions, setIsLoadingSuggestions] = useState(false);
+  const [suggestionsError, setSuggestionsError] = useState('');
+  const [gmailReadMap, setGmailReadMap] = useState({});
 
-  function markRead(id) { setNotifs(p => p.map(n => n.id === id ? { ...n, read: true } : n)); }
-  function markAll() { setNotifs(p => p.map(n => ({ ...n, read: true }))); }
+  const dateMessageIds = React.useMemo(() => {
+    const ids = new Set();
+    (ingestDates || []).forEach(d => {
+      if (d?.message_id) ids.add(d.message_id);
+    });
+    return ids;
+  }, [ingestDates]);
+
+  const inboxFromGmail = React.useMemo(() => {
+    const actionRe = /(verify your device|security alert|action required|please verify|confirm|password|login|sign-in|urgent)/i;
+    return (ingestMessages || [])
+      .filter(m => {
+        const subject = `${m?.subject || ''}`;
+        const snippet = `${m?.snippet || ''}`;
+        const isActionLike = actionRe.test(subject) || actionRe.test(snippet);
+        return !dateMessageIds.has(m?.id) || isActionLike;
+      })
+      .slice(0, 8)
+      .map(m => {
+        const isOutlook = m.source === 'outlook';
+        const p = m.priority ? m.priority.toLowerCase() : undefined;
+        return {
+          id: `ing-msg-${m.id}`,
+          junkKey: `${m.source || 'gmail'}-${m.id}`,
+          readKey: `${m.source || 'gmail'}-${m.id}`,
+          title: isOutlook ? (m.summary_phrase || m.subject || 'Outlook Message').trim() : (m.subject || 'Gmail Message').trim(),
+          body: isOutlook ? (m.description || m.snippet || '').trim() : (m.snippet || '').trim(),
+          senderName: (m.sender_name || m.sender || '').trim(),
+          source: isOutlook ? 'Outlook' : 'Gmail',
+          sourceIcon: isOutlook ? '📨' : '✉️',
+          category: m.category || '',
+          priority: p || 'low',
+          timestamp: m.sent_at_utc ? new Date(m.sent_at_utc).getTime() : Date.now(),
+        };
+      })
+      .filter(n => !isDeleted(n.junkKey));
+  }, [ingestMessages, dateMessageIds, isDeleted]);
+
+  const appInbox = React.useMemo(() => {
+    return (notifs || [])
+      .filter(n => !isDeleted(`notif-${n.id}`))
+      .map(n => ({
+        ...n,
+        readKey: `notif-${n.id}`,
+      }));
+  }, [notifs, isDeleted]);
+
+  const unreadApp = appInbox.filter(n => !n.read);
+  const readApp = appInbox.filter(n => n.read);
+  const unreadGmail = inboxFromGmail.filter(n => !gmailReadMap[n.readKey]);
+  const readGmail = inboxFromGmail.filter(n => !!gmailReadMap[n.readKey]);
+  const unreadCount = unreadApp.length + unreadGmail.length;
+  const totalCount = appInbox.length + inboxFromGmail.length;
+
+  function markRead(id) { setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n)); }
+  function markAll() {
+    setNotifications(p => p.map(n => ({ ...n, read: true })));
+    setGmailReadMap(prev => {
+      const next = { ...prev };
+      inboxFromGmail.forEach((item) => {
+        next[item.readKey] = true;
+      });
+      return next;
+    });
+  }
+
+  async function openMessage(message, readKey) {
+    if (readKey?.startsWith('notif-')) {
+      markRead(readKey.replace('notif-', ''));
+    }
+    if (readKey?.startsWith('gmail-')) {
+      setGmailReadMap(prev => ({ ...prev, [readKey]: true }));
+    }
+
+    setSelectedMessage(message);
+    setReplySuggestions([]);
+    setSuggestionsError('');
+    setIsLoadingSuggestions(true);
+
+    try {
+      const suggestions = await fetchReplySuggestions(message);
+      setReplySuggestions(suggestions);
+    } catch (error) {
+      setSuggestionsError(error?.message || 'Failed to load AI suggestions');
+      setReplySuggestions([]);
+    } finally {
+      setIsLoadingSuggestions(false);
+    }
+  }
 
   function Card({ n }) {
     return (
-      <TouchableOpacity style={[s.notifCard, !n.read && s.notifCardUnread]} onPress={() => markRead(n.id)} activeOpacity={0.8}>
+      <TouchableOpacity
+        style={[s.notifCard, !n.read && s.notifCardUnread]}
+        onPress={() => {
+          openMessage({
+            title: n.title,
+            body: n.body,
+            source: n.source,
+            timestamp: n.timestamp,
+            senderName: n.senderName || '',
+          }, n.readKey);
+        }}
+        activeOpacity={0.8}
+      >
         <View style={{ flexDirection: 'row', gap: 12 }}>
           <View style={s.notifBubble}><Text style={{ fontSize: 18 }}>{n.sourceIcon}</Text></View>
           <View style={{ flex: 1 }}>
             <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
               <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
               {!n.read && <View style={s.unreadDot} />}
+              <TouchableOpacity onPress={() => onMoveToJunk({ key: `notif-${n.id}`, from: 'Inbox', title: n.title, subtitle: n.body, timestamp: n.timestamp })}>
+                <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
+              </TouchableOpacity>
             </View>
             <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }} numberOfLines={2}>{n.body}</Text>
             <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>
@@ -407,385 +601,315 @@ function NotificationsTab() {
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Notifications</Text>
-          <Text style={s.dashSubtitle}>{unread.length} unread · {notifs.length} total</Text>
+          <Text style={s.dashSubtitle}>{unreadCount} unread · {totalCount} total</Text>
         </View>
-        {unread.length > 0 && (
+        {unreadCount > 0 && (
           <TouchableOpacity onPress={markAll} style={s.markAllBtn}>
             <Text style={{ fontSize: 12, color: C.textSecondary, fontWeight: '600' }}>Mark all read</Text>
           </TouchableOpacity>
         )}
       </View>
-      {unread.length > 0 && <>
+
+      {(unreadApp.length > 0 || unreadGmail.length > 0) && <>
         <Text style={s.groupLabel}>UNREAD</Text>
-        {unread.map(n => <Card key={n.id} n={n} />)}
+        {unreadApp.length > 0 && <Text style={[s.groupLabel, { marginTop: 8, fontSize: 11 }]}>FROM APPS</Text>}
+        {unreadApp.map(n => <Card key={n.readKey} n={n} />)}
+        {unreadGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM GMAIL</Text>}
+        {unreadGmail.map(n => (
+          <TouchableOpacity
+            key={n.id}
+            style={s.notifCard}
+            activeOpacity={0.8}
+            onPress={() => openMessage({
+              title: n.title,
+              body: n.body,
+              source: n.source,
+              timestamp: n.timestamp,
+              senderName: n.senderName || '',
+            }, n.readKey)}
+          >
+            <View style={{ flexDirection: 'row', gap: 12 }}>
+              <View style={s.notifBubble}><Text style={{ fontSize: 18 }}>{n.sourceIcon}</Text></View>
+              <View style={{ flex: 1 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
+                  <View style={s.unreadDot} />
+                  <TouchableOpacity onPress={() => onMoveToJunk({ key: n.junkKey, from: 'Inbox', title: n.title, subtitle: n.body, timestamp: n.timestamp })}>
+                    <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
+                  </TouchableOpacity>
+                </View>
+                {!!n.body && <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20, marginTop: 4 }} numberOfLines={2}>{n.body}</Text>}
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, gap: 6, flexWrap: 'wrap' }}>
+                  {n.priority && (
+                    <View style={[s.badge, { backgroundColor: priorityBg(n.priority) }]}>
+                      <Text style={[s.badgeText, { color: priorityColor(n.priority) }]}>
+                        {n.priority.toUpperCase()}
+                      </Text>
+                    </View>
+                  )}
+                  {n.category && n.category !== 'NONE' && (
+                    <View style={[s.badge, { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border }]}>
+                      <Text style={[s.badgeText, { color: C.textMuted }]}>
+                        {n.category.toUpperCase()}
+                      </Text>
+                    </View>
+                  )}
+                  <Text style={{ fontSize: 11, color: C.textMuted }}>{n.source} · {timeAgo(n.timestamp)}</Text>
+                </View>
+              </View>
+            </View>
+          </TouchableOpacity>
+        ))}
       </>}
-      {read.length > 0 && <>
-        <Text style={[s.groupLabel, { marginTop: 16 }]}>EARLIER</Text>
-        {read.map(n => <Card key={n.id} n={n} />)}
+
+      {(readApp.length > 0 || readGmail.length > 0) && <>
+        <Text style={[s.groupLabel, { marginTop: 16 }]}>READ</Text>
+        {readApp.length > 0 && <Text style={[s.groupLabel, { marginTop: 8, fontSize: 11 }]}>FROM APPS</Text>}
+        {readApp.map(n => <Card key={n.readKey} n={n} />)}
+        {readGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM GMAIL</Text>}
+        {readGmail.map(n => (
+          <TouchableOpacity
+            key={n.id}
+            style={s.notifCard}
+            activeOpacity={0.8}
+            onPress={() => openMessage({
+              title: n.title,
+              body: n.body,
+              source: n.source,
+              timestamp: n.timestamp,
+              senderName: n.senderName || '',
+            }, n.readKey)}
+          >
+            <View style={{ flexDirection: 'row', gap: 12 }}>
+              <View style={s.notifBubble}><Text style={{ fontSize: 18 }}>{n.sourceIcon}</Text></View>
+              <View style={{ flex: 1 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
+                  <TouchableOpacity onPress={() => onMoveToJunk({ key: n.junkKey, from: 'Inbox', title: n.title, subtitle: n.body, timestamp: n.timestamp })}>
+                    <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
+                  </TouchableOpacity>
+                </View>
+                {!!n.body && <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20, marginTop: 4 }} numberOfLines={2}>{n.body}</Text>}
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, gap: 6, flexWrap: 'wrap' }}>
+                  {n.priority && (
+                    <View style={[s.badge, { backgroundColor: priorityBg(n.priority) }]}>
+                      <Text style={[s.badgeText, { color: priorityColor(n.priority) }]}>
+                        {n.priority.toUpperCase()}
+                      </Text>
+                    </View>
+                  )}
+                  {n.category && n.category !== 'NONE' && (
+                    <View style={[s.badge, { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border }]}>
+                      <Text style={[s.badgeText, { color: C.textMuted }]}>
+                        {n.category.toUpperCase()}
+                      </Text>
+                    </View>
+                  )}
+                  <Text style={{ fontSize: 11, color: C.textMuted }}>{n.source} · {timeAgo(n.timestamp)}</Text>
+                </View>
+              </View>
+            </View>
+          </TouchableOpacity>
+        ))}
       </>}
+
+      <Modal visible={!!selectedMessage} transparent animationType="slide" onRequestClose={() => setSelectedMessage(null)}>
+        <View style={s.modalOverlay}>
+          <View style={s.modalSheet}>
+            {selectedMessage && <>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
+                <Text style={s.modalTitle}>{selectedMessage.title}</Text>
+                <TouchableOpacity onPress={() => setSelectedMessage(null)}>
+                  <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
+                </TouchableOpacity>
+              </View>
+              <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>
+                {selectedMessage.source} · {timeAgo(selectedMessage.timestamp)}
+              </Text>
+              <View style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12, marginBottom: 14 }}>
+                <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>
+                  {selectedMessage.body || 'No content preview available.'}
+                </Text>
+              </View>
+
+              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>AI SUGGESTED REPLIES</Text>
+              {isLoadingSuggestions && (
+                <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>Generating suggestions...</Text>
+              )}
+              {!isLoadingSuggestions && !!suggestionsError && (
+                <Text style={{ color: C.red, fontSize: 13, marginBottom: 8 }}>{suggestionsError}</Text>
+              )}
+              {!isLoadingSuggestions && !suggestionsError && replySuggestions.length === 0 && (
+                <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>No suggestions available.</Text>
+              )}
+              {replySuggestions.map((reply, idx) => (
+                <TouchableOpacity key={`${idx}-${reply}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8 }}>
+                  <Text style={{ color: C.textPrimary, fontSize: 13, lineHeight: 19 }}>{reply}</Text>
+                </TouchableOpacity>
+              ))}
+            </>}
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 }
 
-
-function toDateLocal(date) {
-  const d = new Date(date);
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
-function toTimeLocal(date) {
-  const d = new Date(date);
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function parseEventTime(dateStr, timeStr) {
-  if (!dateStr || dateStr === 'Unknown date') return null;
-  const [y, m, d] = dateStr.split('-').map(Number);
-  if (!timeStr) return new Date(y, (m || 1) - 1, d || 1);
-  const match = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
-  if (!match) return new Date(y, (m || 1) - 1, d || 1);
-  let [, h, min, ampm] = match;
-  h = parseInt(h, 10);
-  min = parseInt(min, 10);
-  if (ampm.toUpperCase() === 'PM' && h < 12) h += 12;
-  if (ampm.toUpperCase() === 'AM' && h === 12) h = 0;
-  return new Date(y, (m || 1) - 1, d || 1, h, min, 0);
-}
-
-const CALENDAR_API = 'http://localhost:5001';
-
-const webPickerInputStyle = {
-  flex: 1,
-  backgroundColor: C.surfaceAlt,
-  border: `1px solid ${C.border}`,
-  borderRadius: 12,
-  padding: '12px 14px',
-  color: C.textPrimary,
-  fontSize: 14,
-  cursor: 'pointer',
-  minHeight: 48,
-  boxSizing: 'border-box',
-};
-
-function formatDurationFromSeconds(seconds) {
-  if (seconds == null || seconds <= 0) return null;
-  const s = Math.round(seconds);
-  if (s < 60) return `${s} sec`;
-  const mins = Math.floor(s / 60);
-  const secs = s % 60;
-  if (mins < 60) {
-    if (secs === 0) return `${mins} min`;
-    return `${mins} min ${secs} sec`;
-  }
-  const hrs = Math.floor(mins / 60);
-  const remainMins = mins % 60;
-  if (remainMins === 0) return `${hrs} hr`;
-  return `${hrs} hr ${remainMins} min`;
-}
-
-function mapCalendarEvent(e) {
-  const start = new Date(e.start_utc);
-  const dateStr = start.toLocaleDateString('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit' });
-  const timeStr = start.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-  const durationSeconds = e.duration_seconds != null ? Number(e.duration_seconds) : null;
-  const duration = durationSeconds != null
-    ? formatDurationFromSeconds(durationSeconds)
-    : (() => {
-        const end = new Date(e.end_utc);
-        const mins = Math.round((end - start) / 60000);
-        return formatDurationFromSeconds(mins * 60);
-      })();
-  return {
-    id: `cal-${e.id}`,
-    title: e.summary,
-    date: dateStr,
-    time: timeStr,
-    duration,
-    attendees: [],
-    source: 'Google Calendar',
-    sourceIcon: '📅',
-    videoLink: null,
-    notes: e.description,
-  };
-}
-
-function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar }) {
+// ─── Dashboard: Calendar Tab ──────────────────────────────────────────────────
+function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveToJunk }) {
   const [selected, setSelected] = useState(null);
-  const [removing, setRemoving] = useState(false);
-  const [removingAllPast, setRemovingAllPast] = useState(false);
-  const [pastExpanded, setPastExpanded] = useState(false);
-  const [addModalVisible, setAddModalVisible] = useState(false);
-  const [addTitle, setAddTitle] = useState('');
-  const [addStartDate, setAddStartDate] = useState(() => {
-    const d = new Date();
-    d.setMinutes(0);
-    d.setSeconds(0);
-    return d;
+  const [selectedDay, setSelectedDay] = useState(null);
+  const [monthCursor, setMonthCursor] = useState(() => {
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   });
-  const [showDatePicker, setShowDatePicker] = useState(false);
-  const [showTimePicker, setShowTimePicker] = useState(false);
-  const [addDurationHours, setAddDurationHours] = useState('1');
-  const [addDurationMinutes, setAddDurationMinutes] = useState('0');
-  const [addDurationSeconds, setAddDurationSeconds] = useState('0');
-  const [addNotes, setAddNotes] = useState('');
-  const [adding, setAdding] = useState(false);
-  const [addError, setAddError] = useState(null);
 
-  const handleAddEvent = async () => {
-    if (!addTitle.trim()) {
-      setAddError('Title is required');
-      return;
-    }
-    setAdding(true);
-    setAddError(null);
-    try {
-      const h = Math.max(0, parseInt(addDurationHours, 10) || 0);
-      const m = Math.min(59, Math.max(0, parseInt(addDurationMinutes, 10) || 0));
-      const s = Math.min(59, Math.max(0, parseInt(addDurationSeconds, 10) || 0));
-      const durationSeconds = h * 3600 + m * 60 + s;
+  const msgById = React.useMemo(() => {
+    const m = {};
+    (ingestMessages || []).forEach(msg => { m[msg.id] = msg; });
+    return m;
+  }, [ingestMessages, isDeleted]);
 
-      const res = await fetch(`${CALENDAR_API}/calendar/events`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: addTitle.trim(),
-          start_utc: addStartDate.toISOString(),
-          duration_seconds: durationSeconds || 3600,
-          notes: addNotes.trim() || undefined,
-        }),
-      });
-      const data = await res.json();
-      if (data.status === 'success') {
-        setAddModalVisible(false);
-        setShowDatePicker(false);
-        setShowTimePicker(false);
-        setAddTitle('');
-        const next = new Date();
-        next.setMinutes(0);
-        next.setSeconds(0);
-        setAddStartDate(next);
-        setAddDurationHours('1');
-        setAddDurationMinutes('0');
-        setAddDurationSeconds('0');
-        setAddNotes('');
-        onRefreshCalendar?.();
-      } else {
-        setAddError(data.message || 'Failed to add event');
-      }
-    } catch (err) {
-      setAddError(err.message || 'Network error');
-    } finally {
-      setAdding(false);
-    }
-  };
-
-  const handleRemoveEvent = async () => {
-    if (!selected || !selected.id?.startsWith('cal-')) return;
-    const eventId = parseInt(selected.id.replace('cal-', ''), 10);
-    if (isNaN(eventId)) return;
-    setRemoving(true);
-    try {
-      const res = await fetch(`${CALENDAR_API}/calendar/events/${eventId}/remove`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-      const data = await res.json();
-      if (data.status === 'success') {
-        setSelected(null);
-        onRefreshCalendar?.();
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setRemoving(false);
-    }
-  };
-
-  const ingestEvents = ingestDates
-    .filter(d => {
-      const raw = `${d.raw_span || ''}`.toLowerCase();
-      const iso = d.resolved_date || d.parsed_at_utc || '';
-      if (raw.includes('tomorrow')) return false;
-      if (iso.startsWith('2026-02-22')) return false;
-      return true;
-    })
+  const seenByMessage = new Set();
+  const ingestEvents = (ingestDates || [])
+    .filter(d => d && (d.resolved_date || d.parsed_at_utc))
     .map(d => {
-      const iso = d.resolved_date || d.parsed_at_utc || '';
-      const dt = iso ? new Date(iso) : null;
-      const dateStr = dt ? dt.toISOString().slice(0, 10) : 'Unknown date';
-      const timeStr = dt
-        ? dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
-        : '';
+      // Enforce one event per message_id; always use resolved_date when present.
+      if (!d.message_id || seenByMessage.has(d.message_id)) return null;
+      seenByMessage.add(d.message_id);
+
+      const isoRaw = d.resolved_date || d.parsed_at_utc || '';
+      const dt = new Date(isoRaw);
+      const dateStr = Number.isNaN(dt.getTime())
+        ? (isoRaw.includes('T') ? isoRaw.split('T')[0] : isoRaw.slice(0, 10))
+        : dt.toISOString().slice(0, 10);
+      const timeStr = Number.isNaN(dt.getTime())
+        ? ''
+        : dt.toISOString().slice(11, 16);
+
+      const msg = msgById[d.message_id];
+      const isOutlook = msg?.source === 'outlook';
+      const title = isOutlook ? (msg?.summary_phrase || msg?.subject || 'Event') : ((msg?.subject && msg.subject.trim()) || (msg?.snippet && msg.snippet.trim()) || (d.raw_span && d.raw_span.trim()) || 'Event');
+      const rawNote = d.raw_span && d.raw_span.trim();
+      const note = isOutlook ? (msg?.description || msg?.snippet || rawNote) : ((msg?.snippet && msg.snippet.trim()) || rawNote || `From message ${d.message_id}`);
 
       return {
         id: `ing-${d.id}`,
-        title: d.raw_span,
+        junkKey: `cal-${d.id}`,
+        title,
         date: dateStr,
         time: timeStr,
         duration: null,
         attendees: [],
-        source: 'Gmail',
-        sourceIcon: '✉️',
+        source: isOutlook ? 'Outlook' : 'Gmail',
+        sourceIcon: isOutlook ? '📨' : '✉️',
         videoLink: null,
-        notes: `From message ${d.message_id}`,
+        notes: note,
       };
+    })
+    .filter(Boolean);
+
+  const visibleEvents = ingestEvents.filter(e => !isDeleted(e.junkKey));
+
+  const eventMap = React.useMemo(() => {
+    const out = {};
+    visibleEvents.forEach((event) => {
+      if (!out[event.date]) out[event.date] = [];
+      out[event.date].push(event);
     });
+    return out;
+  }, [visibleEvents]);
 
-  const allEvents = [...calendarEvents, ...ingestEvents];
-  const now = new Date();
+  const monthTitle = monthCursor.toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  const firstOfMonth = monthCursor;
+  const startDow = firstOfMonth.getUTCDay();
+  const gridStart = new Date(Date.UTC(firstOfMonth.getUTCFullYear(), firstOfMonth.getUTCMonth(), 1 - startDow));
+  const gridDays = Array.from({ length: 42 }).map((_, i) => {
+    const d = new Date(gridStart);
+    d.setUTCDate(gridStart.getUTCDate() + i);
+    return d;
+  });
 
-  const { upcoming, past } = allEvents.reduce(
-    (acc, e) => {
-      const eventTime = parseEventTime(e.date, e.time);
-      if (eventTime && eventTime < now) {
-        acc.past.push(e);
-      } else {
-        acc.upcoming.push(e);
-      }
-      return acc;
-    },
-    { upcoming: [], past: [] }
-  );
+  function toDateKey(d) {
+    return d.toISOString().slice(0, 10);
+  }
 
-  const sortByDateDesc = (a, b) => {
-    const da = parseEventTime(a.date, a.time)?.getTime() ?? 0;
-    const db = parseEventTime(b.date, b.time)?.getTime() ?? 0;
-    return db - da;
-  };
-  const sortByDateAsc = (a, b) => {
-    const da = parseEventTime(a.date, a.time)?.getTime() ?? 0;
-    const db = parseEventTime(b.date, b.time)?.getTime() ?? 0;
-    return da - db;
-  };
+  const selectedDateKey = selectedDay ? toDateKey(selectedDay) : null;
+  const selectedDayEvents = selectedDateKey ? (eventMap[selectedDateKey] || []) : [];
 
-  const upcomingSorted = [...upcoming].sort(sortByDateAsc);
-  const pastSorted = [...past].sort(sortByDateDesc);
+  function prevMonth() {
+    setMonthCursor((prev) => new Date(Date.UTC(prev.getUTCFullYear(), prev.getUTCMonth() - 1, 1)));
+    setSelectedDay(null);
+  }
 
-  const groupByDate = (events) =>
-    events.reduce((acc, e) => {
-      if (!acc[e.date]) acc[e.date] = [];
-      acc[e.date].push(e);
-      return acc;
-    }, {});
-
-  const upcomingGrouped = groupByDate(upcomingSorted);
-  const pastGrouped = groupByDate(pastSorted);
-
-  const sortedUpcomingDates = Object.keys(upcomingGrouped).sort();
-  const sortedPastDates = Object.keys(pastGrouped).sort().reverse();
-
-  const handleRemoveAllPast = async () => {
-    const calendarPastEvents = past.filter(e => e.id?.startsWith('cal-'));
-    if (calendarPastEvents.length === 0) return;
-    setRemovingAllPast(true);
-    try {
-      for (const e of calendarPastEvents) {
-        const eventId = parseInt(e.id.replace('cal-', ''), 10);
-        if (isNaN(eventId)) continue;
-        const res = await fetch(`${CALENDAR_API}/calendar/events/${eventId}/remove`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({}),
-        });
-        const data = await res.json();
-        if (data.status !== 'success') break;
-      }
-      onRefreshCalendar?.();
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setRemovingAllPast(false);
-    }
-  };
-
-  function EventCard({ e }) {
-    return (
-      <TouchableOpacity style={s.eventCard} onPress={() => setSelected(e)} activeOpacity={0.8}>
-        <View style={{ width: 84, alignItems: 'flex-end' }}>
-          <Text style={{ fontSize: 12, fontWeight: '700', color: C.textPrimary }}>{e.time}</Text>
-          {e.duration && (
-            <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{e.duration}</Text>
-          )}
-        </View>
-        <View style={{ width: 2, height: 40, backgroundColor: C.accent, borderRadius: 2, opacity: 0.5 }} />
-        <View style={{ flex: 1 }}>
-          <Text style={{ fontSize: 14, fontWeight: '600', color: C.textPrimary, marginBottom: 6 }}>
-            {e.title}
-          </Text>
-        </View>
-        <Text style={{ fontSize: 18 }}>{e.sourceIcon}</Text>
-      </TouchableOpacity>
-    );
+  function nextMonth() {
+    setMonthCursor((prev) => new Date(Date.UTC(prev.getUTCFullYear(), prev.getUTCMonth() + 1, 1)));
+    setSelectedDay(null);
   }
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
       <View style={s.dashHeader}>
-        <View>
+        <View style={{ flex: 1 }}>
           <Text style={s.dashTitle}>Calendar</Text>
-          <Text style={s.dashSubtitle}>{upcoming.length} upcoming · {past.length} past</Text>
+          <Text style={s.dashSubtitle}>{ingestEvents.length} events from extracted dates</Text>
         </View>
-        <TouchableOpacity
-          style={[s.addEventBtn, adding && { opacity: 0.6 }]}
-          onPress={() => setAddModalVisible(true)}
-          disabled={adding}
-        >
-          <Text style={s.addEventBtnText}>+ Add</Text>
-        </TouchableOpacity>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+          <TouchableOpacity onPress={prevMonth}><Text style={{ color: C.textSecondary, fontSize: 20 }}>‹</Text></TouchableOpacity>
+          <Text style={{ color: C.textPrimary, fontWeight: '700', fontSize: 14, minWidth: 120, textAlign: 'center' }}>{monthTitle}</Text>
+          <TouchableOpacity onPress={nextMonth}><Text style={{ color: C.textSecondary, fontSize: 20 }}>›</Text></TouchableOpacity>
+        </View>
       </View>
 
-      {sortedUpcomingDates.map((date) => (
-        <View key={date} style={{ marginBottom: 6 }}>
-          <Text style={s.calDateLabel}>{formatDate(date)}</Text>
-          {upcomingGrouped[date].map((e) => (
-            <EventCard key={e.id} e={e} />
+      {ingestEvents.length === 0 && (
+        <Text style={{ color: C.textMuted, fontSize: 13, marginBottom: 12 }}>No extracted dates yet.</Text>
+      )}
+
+      <View style={s.calGridWrap}>
+        <View style={s.calWeekRow}>
+          {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((d, idx) => (
+            <Text key={`${d}-${idx}`} style={s.calWeekLabel}>{d}</Text>
           ))}
         </View>
-      ))}
 
-      {past.length > 0 && (
-        <View style={{ marginTop: 16 }}>
-          <View style={[s.eventCard, { opacity: 0.85, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 }]}>
-            <TouchableOpacity
-              style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 }}
-              onPress={() => setPastExpanded(!pastExpanded)}
-              activeOpacity={0.8}
-            >
-              <Text style={{ fontSize: 20 }}>📂</Text>
-              <View style={{ flex: 1 }}>
-                <Text style={{ fontSize: 14, fontWeight: '600', color: C.textPrimary }}>
-                  Past events
-                </Text>
-                <Text style={{ fontSize: 12, color: C.textMuted, marginTop: 2 }}>
-                  {past.length} event{past.length !== 1 ? 's' : ''} · Tap to {pastExpanded ? 'collapse' : 'expand'}
-                </Text>
-              </View>
-              <Text style={{ fontSize: 18, color: C.textMuted }}>{pastExpanded ? '▼' : '▶'}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={{ paddingVertical: 8, paddingHorizontal: 12, backgroundColor: C.red + '33', borderRadius: 8 }}
-              onPress={handleRemoveAllPast}
-              disabled={removingAllPast}
-            >
-              <Text style={{ fontSize: 12, fontWeight: '600', color: C.red }}>{removingAllPast ? 'Removing…' : 'Delete all past'}</Text>
-            </TouchableOpacity>
-          </View>
-
-          {pastExpanded && (
-            <View style={{ marginTop: 4, marginLeft: 12, paddingLeft: 12, borderLeftWidth: 3, borderLeftColor: C.border }}>
-              {sortedPastDates.map((date) => (
-                <View key={date} style={{ marginBottom: 6, marginTop: 8 }}>
-                  <Text style={[s.calDateLabel, { opacity: 0.8 }]}>{formatDate(date)}</Text>
-                  {pastGrouped[date].map((e) => (
-                    <EventCard key={e.id} e={e} />
+        <View style={s.calGrid}>
+          {gridDays.map((day) => {
+            const key = toDateKey(day);
+            const inMonth = day.getUTCMonth() === monthCursor.getUTCMonth();
+            const dayEvents = eventMap[key] || [];
+            const isSelected = selectedDateKey === key;
+            return (
+              <TouchableOpacity key={key} style={[s.calCell, !inMonth && s.calCellMuted, isSelected && s.calCellSelected]} onPress={() => setSelectedDay(day)} activeOpacity={0.8}>
+                <Text style={[s.calCellNum, !inMonth && s.calCellNumMuted]}>{day.getUTCDate()}</Text>
+                <View style={s.calDotRow}>
+                  {dayEvents.slice(0, 3).map((ev) => (
+                    <View key={`dot-${ev.id}`} style={s.calDot} />
                   ))}
                 </View>
-              ))}
-            </View>
-          )}
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
+
+      {selectedDateKey && (
+        <View style={{ marginTop: 14 }}>
+          <Text style={s.groupLabel}>EVENTS · {formatDate(selectedDateKey)}</Text>
+          {selectedDayEvents.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13, marginBottom: 12 }}>No events on this day.</Text>}
+          {selectedDayEvents.map((e) => (
+            <TouchableOpacity key={e.id} style={s.notifCard} onPress={() => setSelected(e)} activeOpacity={0.8}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                <Text style={{ color: C.textSecondary, fontSize: 12, minWidth: 44 }}>{e.time || 'All day'}</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.notifTitle} numberOfLines={1}>{e.title}</Text>
+                  {!!e.notes && <Text style={{ color: C.textSecondary, fontSize: 12, marginTop: 4 }} numberOfLines={1}>{e.notes}</Text>}
+                </View>
+                <TouchableOpacity onPress={() => onMoveToJunk({ key: e.junkKey, from: 'Calendar', title: e.title, subtitle: e.notes, timestamp: Date.now() })}>
+                  <Text style={{ color: C.textMuted, fontSize: 18, fontWeight: '700' }}>×</Text>
+                </TouchableOpacity>
+              </View>
+            </TouchableOpacity>
+          ))}
         </View>
       )}
 
@@ -795,526 +919,34 @@ function CalendarTab({ ingestDates = [], calendarEvents = [], onRefreshCalendar 
             {selected && <>
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
                 <Text style={s.modalTitle}>{selected.title}</Text>
-                <TouchableOpacity onPress={() => setSelected(null)}>
+                <TouchableOpacity onPress={() => setSelected(null)} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
                   <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
                 </TouchableOpacity>
               </View>
-
               {[
                 ['🕐', `${selected.time}${selected.duration ? ` · ${selected.duration}` : ''}`],
                 ['📅', formatDate(selected.date)],
                 [selected.sourceIcon, selected.source],
-              ].map(([icon, text]) => (
+                selected.attendees.length > 0 ? ['👥', selected.attendees.join(', ')] : null,
+              ].filter(Boolean).map(([icon, text]) => (
                 <View key={text} style={s.modalRow}>
                   <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>{icon}</Text>
                   <Text style={{ fontSize: 14, color: C.textSecondary, flex: 1 }}>{text}</Text>
                 </View>
               ))}
-
+              {selected.videoLink && (
+                <View style={[s.modalRow, { backgroundColor: C.accentSoft, borderRadius: 10, padding: 10, marginTop: 4 }]}>
+                  <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>🔗</Text>
+                  <Text style={{ fontSize: 13, color: C.accent, flex: 1 }} numberOfLines={1}>{selected.videoLink}</Text>
+                </View>
+              )}
               {selected.notes && (
                 <View style={{ marginTop: 16, backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12 }}>
-                  <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 4 }}>
-                    NOTES
-                  </Text>
-                  <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>
-                    {selected.notes}
-                  </Text>
+                  <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 4 }}>NOTES</Text>
+                  <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>{selected.notes}</Text>
                 </View>
-              )}
-
-              {selected.id?.startsWith('cal-') && (
-                <TouchableOpacity
-                  style={[s.addEventSubmitBtn, { marginTop: 20, backgroundColor: C.red }]}
-                  onPress={handleRemoveEvent}
-                  disabled={removing}
-                >
-                  <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>{removing ? 'Removing…' : 'Remove from calendar'}</Text>
-                </TouchableOpacity>
               )}
             </>}
-          </View>
-        </View>
-      </Modal>
-
-      <Modal visible={addModalVisible} transparent animationType="slide" onRequestClose={() => { if (!adding) { setAddModalVisible(false); setShowDatePicker(false); setShowTimePicker(false); } }}>
-        <View style={s.modalOverlay}>
-          <View style={s.modalSheet}>
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-              <Text style={s.modalTitle}>Add Event</Text>
-              <TouchableOpacity onPress={() => { if (!adding) { setAddModalVisible(false); setShowDatePicker(false); setShowTimePicker(false); } }} disabled={adding}>
-                <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
-              </TouchableOpacity>
-            </View>
-
-            {addError && (
-              <View style={{ backgroundColor: C.red + '22', borderRadius: 10, padding: 12, marginBottom: 16, borderWidth: 1, borderColor: C.red }}>
-                <Text style={{ fontSize: 13, color: C.red }}>{addError}</Text>
-              </View>
-            )}
-
-            <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 6 }}>TITLE</Text>
-            <TextInput
-              style={s.addEventInput}
-              placeholder="Event name"
-              placeholderTextColor={C.textMuted}
-              value={addTitle}
-              onChangeText={setAddTitle}
-              editable={!adding}
-            />
-
-            <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 6, marginTop: 14 }}>START DATE & TIME</Text>
-            {Platform.OS === 'web' ? (
-              <View style={{ flexDirection: 'row', gap: 12 }}>
-                <View style={{ flex: 1 }}>
-                  {React.createElement('input', {
-                    type: 'date',
-                    value: toDateLocal(addStartDate),
-                    onChange: (e) => {
-                      const v = e.target.value;
-                      if (v) {
-                        const [y, m, d] = v.split('-').map(Number);
-                        const next = new Date(addStartDate);
-                        next.setFullYear(y);
-                        next.setMonth(m - 1);
-                        next.setDate(d);
-                        setAddStartDate(next);
-                      }
-                    },
-                    onFocus: (e) => {
-                      try {
-                        e.target.showPicker?.();
-                      } catch (_) {}
-                    },
-                    disabled: adding,
-                    style: { ...webPickerInputStyle, width: '100%' },
-                  })}
-                </View>
-                <View style={{ flex: 1 }}>
-                  {React.createElement('input', {
-                    type: 'time',
-                    value: toTimeLocal(addStartDate),
-                    onChange: (e) => {
-                      const v = e.target.value;
-                      if (v) {
-                        const [h, m] = v.split(':').map(Number);
-                        const next = new Date(addStartDate);
-                        next.setHours(h);
-                        next.setMinutes(m);
-                        setAddStartDate(next);
-                      }
-                    },
-                    onFocus: (e) => {
-                      try {
-                        e.target.showPicker?.();
-                      } catch (_) {}
-                    },
-                    disabled: adding,
-                    style: { ...webPickerInputStyle, width: '100%' },
-                  })}
-                </View>
-              </View>
-            ) : (
-              <>
-                <View style={{ flexDirection: 'row', gap: 12 }}>
-                  <TouchableOpacity
-                    style={[s.addEventInput, { flex: 1 }]}
-                    onPress={() => { if (!adding) { setShowTimePicker(false); setShowDatePicker(true); } }}
-                    disabled={adding}
-                  >
-                    <Text style={{ color: C.textPrimary, fontSize: 14 }}>
-                      {addStartDate.toLocaleDateString('en-US', {
-                        weekday: 'short',
-                        month: 'short',
-                        day: 'numeric',
-                        year: 'numeric',
-                      })}
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[s.addEventInput, { flex: 1 }]}
-                    onPress={() => { if (!adding) { setShowDatePicker(false); setShowTimePicker(true); } }}
-                    disabled={adding}
-                  >
-                    <Text style={{ color: C.textPrimary, fontSize: 14 }}>
-                      {addStartDate.toLocaleTimeString('en-US', {
-                        hour: 'numeric',
-                        minute: '2-digit',
-                        hour12: true,
-                      })}
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-
-                {showDatePicker && (
-                  <View style={{ marginTop: 8 }}>
-                    <DateTimePicker
-                      value={addStartDate}
-                      mode="date"
-                      display={Platform.OS === 'ios' ? 'spinner' : 'default'}
-                      onChange={(event, date) => {
-                        if (Platform.OS === 'android') setShowDatePicker(false);
-                        if (event.type === 'set' && date) setAddStartDate(date);
-                      }}
-                    />
-                    {Platform.OS === 'ios' && (
-                      <TouchableOpacity
-                        style={{ marginTop: 12, paddingVertical: 10, alignItems: 'center', backgroundColor: C.accent, borderRadius: 10 }}
-                        onPress={() => setShowDatePicker(false)}
-                      >
-                        <Text style={{ color: '#fff', fontWeight: '600', fontSize: 14 }}>Done</Text>
-                      </TouchableOpacity>
-                    )}
-                  </View>
-                )}
-
-                {showTimePicker && (
-                  <View style={{ marginTop: 8 }}>
-                    <DateTimePicker
-                      value={addStartDate}
-                      mode="time"
-                      display={Platform.OS === 'ios' ? 'spinner' : 'default'}
-                      onChange={(event, date) => {
-                        if (Platform.OS === 'android') setShowTimePicker(false);
-                        if (event.type === 'set' && date) setAddStartDate(date);
-                      }}
-                    />
-                    {Platform.OS === 'ios' && (
-                      <TouchableOpacity
-                        style={{ marginTop: 12, paddingVertical: 10, alignItems: 'center', backgroundColor: C.accent, borderRadius: 10 }}
-                        onPress={() => setShowTimePicker(false)}
-                      >
-                        <Text style={{ color: '#fff', fontWeight: '600', fontSize: 14 }}>Done</Text>
-                      </TouchableOpacity>
-                    )}
-                  </View>
-                )}
-              </>
-            )}
-
-            <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 6, marginTop: 14 }}>DURATION</Text>
-            <View style={{ flexDirection: 'row', gap: 8 }}>
-              <View style={{ flex: 1 }}>
-                <Text style={{ fontSize: 10, color: C.textMuted, marginBottom: 4 }}>Hours</Text>
-                <TextInput
-                  style={s.addEventInput}
-                  placeholder="0"
-                  placeholderTextColor={C.textMuted}
-                  value={addDurationHours}
-                  onChangeText={(v) => setAddDurationHours(v.replace(/\D/g, '').slice(0, 3))}
-                  keyboardType="number-pad"
-                  editable={!adding}
-                />
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={{ fontSize: 10, color: C.textMuted, marginBottom: 4 }}>Minutes (0–59)</Text>
-                <TextInput
-                  style={s.addEventInput}
-                  placeholder="0"
-                  placeholderTextColor={C.textMuted}
-                  value={addDurationMinutes}
-                  onChangeText={(v) => {
-                    const n = v.replace(/\D/g, '').slice(0, 2);
-                    const val = parseInt(n, 10);
-                    setAddDurationMinutes(isNaN(val) ? '' : String(Math.min(59, val)));
-                  }}
-                  keyboardType="number-pad"
-                  editable={!adding}
-                />
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={{ fontSize: 10, color: C.textMuted, marginBottom: 4 }}>Seconds (0–59)</Text>
-                <TextInput
-                  style={s.addEventInput}
-                  placeholder="0"
-                  placeholderTextColor={C.textMuted}
-                  value={addDurationSeconds}
-                  onChangeText={(v) => {
-                    const n = v.replace(/\D/g, '').slice(0, 2);
-                    const val = parseInt(n, 10);
-                    setAddDurationSeconds(isNaN(val) ? '' : String(Math.min(59, val)));
-                  }}
-                  keyboardType="number-pad"
-                  editable={!adding}
-                />
-              </View>
-            </View>
-
-            <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 6, marginTop: 14 }}>NOTES (optional)</Text>
-            <TextInput
-              style={[s.addEventInput, { minHeight: 60, textAlignVertical: 'top' }]}
-              placeholder="Description or notes"
-              placeholderTextColor={C.textMuted}
-              value={addNotes}
-              onChangeText={setAddNotes}
-              multiline
-              editable={!adding}
-            />
-
-            <TouchableOpacity
-              style={[s.addEventSubmitBtn, adding && { opacity: 0.6 }]}
-              onPress={handleAddEvent}
-              disabled={adding}
-            >
-              <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>{adding ? 'Adding…' : 'Add Event'}</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
-    </ScrollView>
-  );
-}
-
-// ─── Dashboard: Emails Tab ───────────────────────────────────────────────────
-function EmailsTab({ emails = [], onRefresh, onSync }) {
-  const [selected, setSelected] = useState(null);
-  const [syncing, setSyncing] = useState(false);
-  const [sending, setSending] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [responseDraft, setResponseDraft] = useState('');
-  const [showSentFeedback, setShowSentFeedback] = useState(false);
-
-  useEffect(() => {
-    if (!selected) setResponseDraft('');
-  }, [selected]);
-
-  const handleDeleteConversation = async () => {
-    if (!selected) return;
-    Alert.alert(
-      'Delete conversation',
-      `Remove this conversation (${selected.count} message${selected.count !== 1 ? 's' : ''})? This cannot be undone.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Delete',
-          style: 'destructive',
-          onPress: async () => {
-            setDeleting(true);
-            try {
-              const isSingle = String(selected.key || '').startsWith('single-');
-              const body = isSingle
-                ? { message_ids: (selected.messages || []).map(m => m.id).filter(Boolean) }
-                : { thread_id: selected.key };
-              const res = await fetch(`${CALENDAR_API}/conversations/delete`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-              });
-              const data = await res.json().catch(() => ({}));
-              if (data.status === 'success') {
-                setSelected(null);
-                onRefresh?.();
-              } else {
-                Alert.alert('Delete failed', data.message || 'Could not delete');
-              }
-            } catch (err) {
-              Alert.alert('Delete failed', err.message || 'Network error');
-            } finally {
-              setDeleting(false);
-            }
-          },
-        },
-      ]
-    );
-  };
-
-  const handleSendResponse = async () => {
-    if (!selected || !responseDraft.trim()) return;
-    const lastMsg = selected.last ?? selected;
-    setSending(true);
-    try {
-      const subject = (lastMsg.subject || selected.subject || '(no subject)');
-      const replySubject = subject.toLowerCase().startsWith('re:') ? subject : `Re: ${subject}`;
-      const res = await fetch(`${CALENDAR_API}/send-email`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sender: lastMsg.sender,
-          subject: replySubject,
-          content: responseDraft.trim(),
-          thread_id: lastMsg.thread_id || undefined,
-          gmail_message_id: lastMsg.gmail_message_id || undefined,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (data.status === 'success') {
-        setResponseDraft('');
-        setShowSentFeedback(true);
-        setTimeout(() => setShowSentFeedback(false), 2500);
-      } else {
-        Alert.alert('Send failed', data.message || 'Could not send email');
-      }
-    } catch (err) {
-      Alert.alert('Send failed', err.message || 'Network error');
-    } finally {
-      setSending(false);
-    }
-  };
-
-  const handleSync = async () => {
-    if (!onSync) return;
-    setSyncing(true);
-    try {
-      const res = await fetch(`${CALENDAR_API}/ingest`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ db_path: 'extracted.db', max_messages: 200 }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (data.status === 'success') {
-        onSync?.();
-      } else {
-        Alert.alert('Sync failed', data.message || 'Could not fetch emails');
-      }
-    } catch (err) {
-      Alert.alert('Sync failed', err.message || 'Network error');
-    } finally {
-      setSyncing(false);
-    }
-  };
-
-  const formatEmailDate = (sentAt) => {
-    if (!sentAt) return '';
-    const d = new Date(sentAt);
-    if (Number.isNaN(d.getTime())) return sentAt;
-    const mins = Math.round((Date.now() - d.getTime()) / 60000);
-    if (mins < 60) return `${mins}m ago`;
-    const hours = Math.round(mins / 60);
-    if (hours < 24) return `${hours}h ago`;
-    const days = Math.round(hours / 24);
-    if (days < 7) return `${days}d ago`;
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: d.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined });
-  };
-
-  const safeEmails = Array.isArray(emails) ? emails : [];
-  const conversations = useMemo(() => {
-    const byThread = {};
-    for (const e of safeEmails) {
-      if (!e || typeof e !== 'object') continue;
-      const key = e.thread_id || `single-${e.id}`;
-      if (!byThread[key]) byThread[key] = [];
-      byThread[key].push(e);
-    }
-    return Object.entries(byThread)
-      .map(([threadKey, msgs]) => {
-        const sorted = [...msgs].sort((a, b) => (new Date(a?.sent_at_utc || 0)).getTime() - (new Date(b?.sent_at_utc || 0)).getTime());
-        const last = sorted[sorted.length - 1];
-        if (!last) return null;
-        const subject = ((sorted[0]?.subject || last?.subject || '(no subject)') + '').replace(/^Re:\s*/i, '');
-        return { key: threadKey, messages: sorted, subject, last, count: sorted.length };
-      })
-      .filter(Boolean)
-      .sort((a, b) => (new Date(b?.last?.sent_at_utc || 0)).getTime() - (new Date(a?.last?.sent_at_utc || 0)).getTime());
-  }, [safeEmails]);
-
-  return (
-    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
-      <View style={s.dashHeader}>
-        <View>
-          <Text style={s.dashTitle}>Emails</Text>
-          <Text style={s.dashSubtitle}>
-            {conversations.length} conversation{conversations.length !== 1 ? 's' : ''} · {safeEmails.length} message{safeEmails.length !== 1 ? 's' : ''}
-          </Text>
-        </View>
-        <View style={{ flexDirection: 'row', gap: 8 }}>
-          {onSync && (
-            <TouchableOpacity style={s.markAllBtn} onPress={handleSync} disabled={syncing}>
-              <Text style={{ color: C.textSecondary, fontSize: 12, fontWeight: '600' }}>{syncing ? 'Syncing…' : 'Sync from Gmail'}</Text>
-            </TouchableOpacity>
-          )}
-          {onRefresh && (
-            <TouchableOpacity style={s.markAllBtn} onPress={onRefresh}>
-              <Text style={{ color: C.textSecondary, fontSize: 12, fontWeight: '600' }}>Refresh</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-      </View>
-
-      {conversations.length === 0 && (
-        <Text style={{ color: C.textMuted, fontSize: 14, marginTop: 8 }}>No emails yet. Run ingestion to sync your inbox.</Text>
-      )}
-
-      {conversations.map((conv) => (
-        <TouchableOpacity
-          key={conv.key}
-          style={s.notifCard}
-          activeOpacity={0.8}
-          onPress={() => setSelected(conv)}
-        >
-          <View style={{ flex: 1 }}>
-            <Text style={s.notifTitle} numberOfLines={1}>{conv.subject || '(no subject)'}</Text>
-            <Text style={{ fontSize: 12, color: C.textSecondary, marginTop: 4 }} numberOfLines={1}>{conv.last?.sender || 'Unknown'}</Text>
-            {conv.last?.snippet ? (
-              <Text style={{ fontSize: 12, color: C.textMuted, marginTop: 6 }} numberOfLines={2}>{conv.last.snippet}</Text>
-            ) : null}
-            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 6, gap: 8 }}>
-              <Text style={{ fontSize: 11, color: C.textMuted }}>{formatEmailDate(conv.last?.sent_at_utc)}</Text>
-              {conv.count > 1 && (
-                <Text style={{ fontSize: 11, color: C.textMuted }}>· {conv.count} messages</Text>
-              )}
-            </View>
-          </View>
-          <Text style={{ fontSize: 18, marginLeft: 8 }}>✉️</Text>
-        </TouchableOpacity>
-      ))}
-
-      <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
-        <View style={s.modalOverlay}>
-          <View style={[s.modalSheet, { maxHeight: '80%' }]}>
-            {selected && (
-              <>
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={s.modalTitle}>{selected.subject || '(no subject)'}</Text>
-                    <Text style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>{selected.count} message{selected.count !== 1 ? 's' : ''}</Text>
-                  </View>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-                    <TouchableOpacity onPress={handleDeleteConversation} disabled={deleting} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-                      <Text style={{ fontSize: 18, color: deleting ? C.textMuted : C.red }}>🗑</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity onPress={() => setSelected(null)} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-                      <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-                <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={true}>
-                  {(selected.messages || []).map((msg, i) => (
-                    <View key={msg.id || i} style={{ marginBottom: 16, paddingBottom: 16, borderBottomWidth: i < (selected.messages?.length || 0) - 1 ? 1 : 0, borderBottomColor: C.border }}>
-                      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                        <Text style={{ fontSize: 13, fontWeight: '600', color: C.textPrimary }}>{msg.sender || 'Unknown'}</Text>
-                        <Text style={{ fontSize: 11, color: C.textMuted }}>{formatEmailDate(msg.sent_at_utc)}</Text>
-                      </View>
-                      <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }} selectable>
-                        {msg.text || msg.snippet || 'No content'}
-                      </Text>
-                    </View>
-                  ))}
-                </ScrollView>
-                <View style={{ marginTop: 16, paddingTop: 12, borderTopWidth: 1, borderTopColor: C.border }}>
-                  <Text style={{ fontSize: 11, fontWeight: '700', color: C.textMuted, marginBottom: 8 }}>RESPONSE</Text>
-                  <TextInput
-                    style={[s.addEventInput, { minHeight: 80 }]}
-                    placeholder="Type your reply..."
-                    placeholderTextColor={C.textMuted}
-                    value={responseDraft}
-                    onChangeText={setResponseDraft}
-                    multiline
-                    editable={!sending}
-                  />
-                  <TouchableOpacity
-                    style={[s.addEventSubmitBtn, { marginTop: 10 }, sending && { opacity: 0.6 }]}
-                    onPress={handleSendResponse}
-                    disabled={sending || !responseDraft.trim()}
-                  >
-                    <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>{sending ? 'Sending…' : 'Send'}</Text>
-                  </TouchableOpacity>
-                  {showSentFeedback && (
-                    <View style={{ backgroundColor: C.green, borderRadius: 10, padding: 12, marginTop: 12, alignItems: 'center' }}>
-                      <Text style={{ color: '#fff', fontWeight: '700', fontSize: 14 }}>Email sent!</Text>
-                    </View>
-                  )}
-                </View>
-              </>
-            )}
           </View>
         </View>
       </Modal>
@@ -1323,14 +955,74 @@ function EmailsTab({ emails = [], onRefresh, onSync }) {
 }
 
 // ─── Dashboard: TODO Tab (links & attachments) ───────────────────────────────
-function TodoTab({ ingestLinks = [], ingestAttachments = [] }) {
-  const links = ingestLinks.slice(0, 3);
-  const attachments = ingestAttachments.slice(0, 20);
+function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveToJunk, userKey = '' }) {
+  const links = ingestLinks.filter(l => !isDeleted(`link-${l.id}`)).slice(0, 3);
+  const isAllowedDocAttachment = (a) => {
+    const mime = String(a?.mime_type || '').trim().toLowerCase();
+    if (
+      mime === 'application/pdf' ||
+      mime === 'application/msword' ||
+      mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ) {
+      return true;
+    }
+    const filename = String(a?.filename || '').trim().toLowerCase();
+    return /\.(pdf|doc|docx)$/i.test(filename);
+  };
+  const attachments = ingestAttachments
+    .filter(a => !isDeleted(`att-${a.id}`))
+    .filter(isAllowedDocAttachment)
+    .slice(0, 20);
+  const senderDisplay = (link) => {
+    if (link?.sender_name && String(link.sender_name).trim()) return String(link.sender_name).trim();
+    const raw = String(link?.sender || '').trim();
+    if (!raw) return '';
+    const m = raw.match(/^(.*)<([^>]+)>$/);
+    if (m) {
+      const name = (m[1] || '').replace(/\"/g, '').trim();
+      return name || (m[2] || '').trim();
+    }
+    return raw;
+  };
+  const hostLabel = (url) => {
+    const value = String(url || '').trim();
+    if (!value) return 'Link';
+    try {
+      const withProtocol = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+      return new URL(withProtocol).hostname.replace(/^www\./i, '');
+    } catch {
+      return value;
+    }
+  };
+  const linkLabel = (link) => {
+    const subject = String(link?.subject || '').trim();
+    if (subject) return subject;
+
+    const sender = senderDisplay(link);
+    if (sender) return sender;
+
+    return hostLabel(link?.url);
+  };
   const openLink = (url) => {
     const target = url?.startsWith('http') ? url : `http://${url}`;
     Linking.openURL(target).catch(() => Alert.alert('Unable to open link', target));
   };
   const openAttachment = (a) => {
+    const source = String(a?.original_path || '').trim();
+
+    if (a?.id != null) {
+      const normalizedUser = String(userKey || '').trim().toLowerCase();
+      const qs = `attachment_id=${encodeURIComponent(String(a.id))}${normalizedUser ? `&user_key=${encodeURIComponent(normalizedUser)}` : ''}`;
+      const previewUrl = `${getBaseUrl()}/attachment_preview?${qs}`;
+      Linking.openURL(previewUrl).catch(() => Alert.alert('Unable to open attachment', previewUrl));
+      return;
+    }
+
+    if (source && /^https?:\/\//i.test(source)) {
+      Linking.openURL(source).catch(() => Alert.alert('Unable to open attachment', source));
+      return;
+    }
+
     Alert.alert('Attachment', a.filename || 'Attachment');
   };
 
@@ -1338,28 +1030,41 @@ function TodoTab({ ingestLinks = [], ingestAttachments = [] }) {
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
       <View style={s.dashHeader}>
         <View>
-          <Text style={s.dashTitle}>TODO</Text>
+          <Text style={s.dashTitle}>Links & Attachments</Text>
           <Text style={s.dashSubtitle}>{links.length} links · {attachments.length} attachments</Text>
         </View>
       </View>
 
       <Text style={s.groupLabel}>Links</Text>
       {links.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13, marginBottom: 12 }}>No links yet.</Text>}
-      {links.map(l => (
+      {links.map((l) => {
+        const friendly = linkLabel(l);
+        return (
         <TouchableOpacity key={`l-${l.id}`} style={s.notifCard} activeOpacity={0.8} onPress={() => openLink(l.url)}>
           <View style={{ flex: 1 }}>
-            <Text style={s.notifTitle} numberOfLines={1}>{l.url}</Text>
-            <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>Msg {l.message_id}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <Text style={s.notifTitle} numberOfLines={1}>{friendly}</Text>
+              <TouchableOpacity onPress={() => onMoveToJunk({ key: `link-${l.id}`, from: 'Links & Attachments', title: friendly, subtitle: l.url, timestamp: Date.now() })}>
+                <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }} numberOfLines={1}>{l.url}</Text>
           </View>
         </TouchableOpacity>
-      ))}
+        );
+      })}
 
       <Text style={[s.groupLabel, { marginTop: 16 }]}>Attachments</Text>
       {attachments.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13 }}>No attachments yet.</Text>}
       {attachments.map(a => (
         <TouchableOpacity key={`a-${a.id}`} style={s.notifCard} activeOpacity={0.8} onPress={() => openAttachment(a)}>
           <View style={{ flex: 1 }}>
-            <Text style={s.notifTitle} numberOfLines={1}>{a.filename || 'Attachment'}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <Text style={s.notifTitle} numberOfLines={1}>{a.filename || 'Attachment'}</Text>
+              <TouchableOpacity onPress={() => onMoveToJunk({ key: `att-${a.id}`, from: 'Links & Attachments', title: a.filename || 'Attachment', subtitle: a.mime_type || '', timestamp: Date.now() })}>
+                <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
+              </TouchableOpacity>
+            </View>
             <Text style={{ fontSize: 12, color: C.textSecondary }} numberOfLines={1}>{a.mime_type || ''}</Text>
             <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 4 }}>Msg {a.message_id}</Text>
           </View>
@@ -1371,42 +1076,88 @@ function TodoTab({ ingestLinks = [], ingestAttachments = [] }) {
 }
 
 // ─── Dashboard: Threads Tab ───────────────────────────────────────────────────
-function ThreadsTab() {
+function ThreadsTab({ ingestMessages = [], isDeleted, onMoveToJunk }) {
   const [selected, setSelected] = useState(null);
+
+  const threads = React.useMemo(() => {
+    const bySender = new Map();
+
+    (ingestMessages || []).forEach((msg) => {
+      const rawSender = `${msg?.sender_name || msg?.sender || ''}`.trim();
+      let sender = rawSender;
+      if (!sender) sender = 'Unknown Sender';
+      if (sender.includes('<')) sender = sender.split('<')[0].trim() || sender;
+
+      const ts = msg?.sent_at_utc ? new Date(msg.sent_at_utc).getTime() : 0;
+      const item = {
+        id: msg.id,
+        source: msg.source,
+        subject: msg.subject || 'No subject',
+        snippet: msg.snippet || '',
+        summary_phrase: msg.summary_phrase || '',
+        description: msg.description || '',
+        sentAt: msg.sent_at_utc || null,
+        ts,
+      };
+
+      if (!bySender.has(sender)) bySender.set(sender, []);
+      bySender.get(sender).push(item);
+    });
+
+    const out = [];
+    bySender.forEach((items, sender) => {
+      const sorted = items.sort((a, b) => b.ts - a.ts);
+      const latest = sorted[0];
+      const isOutlook = latest?.source === 'outlook';
+      out.push({
+        id: `th-${sender}`,
+        contact: sender,
+        source: isOutlook ? 'Outlook' : 'Gmail',
+        sourceIcon: isOutlook ? '📨' : '✉️',
+        timestamp: latest?.ts || 0,
+        latestSubject: isOutlook ? (latest?.summary_phrase || latest?.subject || 'No subject') : (latest?.subject || 'No subject'),
+        latestSnippet: isOutlook ? (latest?.description || latest?.snippet || '') : (latest?.snippet || ''),
+        count: sorted.length,
+        messages: sorted,
+      });
+    });
+
+    return out.sort((a, b) => b.timestamp - a.timestamp).filter(t => !isDeleted(`thread-${t.id}`));
+  }, [ingestMessages]);
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
       <View style={s.dashHeader}>
         <View>
           <Text style={s.dashTitle}>Threads</Text>
-          <Text style={s.dashSubtitle}>{DATA.threads.filter(t => t.unread > 0).length} need attention</Text>
+          <Text style={s.dashSubtitle}>{threads.length} senders grouped by latest email</Text>
         </View>
       </View>
 
-      {DATA.threads.map(t => (
+      {threads.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13 }}>No threads yet.</Text>}
+
+      {threads.map(t => (
         <TouchableOpacity key={t.id} style={s.threadCard} onPress={() => setSelected(t)} activeOpacity={0.8}>
-          <View style={[s.avatar, { backgroundColor: t.avatarColor }]}>
-            <Text style={{ fontSize: 16, fontWeight: '800', color: '#fff' }}>{t.avatar}</Text>
+          <View style={[s.avatar, { backgroundColor: '#334155' }]}> 
+            <Text style={{ fontSize: 16, fontWeight: '800', color: '#fff' }}>{(t.contact || '?').slice(0, 1).toUpperCase()}</Text>
           </View>
           <View style={{ flex: 1, marginLeft: 12 }}>
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
               <Text style={{ fontSize: 15, fontWeight: '700', color: C.textPrimary }}>{t.contact}</Text>
               <Text style={{ fontSize: 11, color: C.textMuted }}>{timeAgo(t.timestamp)}</Text>
             </View>
-            <Text style={{ fontSize: 13, color: C.textSecondary }} numberOfLines={1}>{t.lastMessage}</Text>
+            <Text style={{ fontSize: 13, color: C.textSecondary }} numberOfLines={1}>{t.latestSubject}</Text>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 6 }}>
               <Text style={{ fontSize: 12 }}>{t.sourceIcon}</Text>
               <Text style={{ fontSize: 11, color: C.textMuted }}>{t.source}</Text>
-              {t.openItems.length > 0 && (
-                <View style={s.openBadge}>
-                  <Text style={{ fontSize: 10, color: C.yellow, fontWeight: '700' }}>{t.openItems.length} open</Text>
-                </View>
-              )}
+              <View style={s.openBadge}>
+                <Text style={{ fontSize: 10, color: C.yellow, fontWeight: '700' }}>{t.count} msgs</Text>
+              </View>
             </View>
           </View>
-          {t.unread > 0 && (
-            <View style={s.unreadBadge}><Text style={{ fontSize: 11, color: '#fff', fontWeight: '800' }}>{t.unread}</Text></View>
-          )}
+          <TouchableOpacity onPress={() => onMoveToJunk({ key: `thread-${t.id}`, from: 'Threads', title: t.contact, subtitle: t.latestSubject, timestamp: t.timestamp })}>
+            <Text style={{ color: C.textMuted, fontSize: 18, fontWeight: '700' }}>×</Text>
+          </TouchableOpacity>
         </TouchableOpacity>
       ))}
 
@@ -1416,8 +1167,8 @@ function ThreadsTab() {
             {selected && <>
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-                  <View style={[s.avatar, { backgroundColor: selected.avatarColor }]}>
-                    <Text style={{ fontSize: 16, fontWeight: '800', color: '#fff' }}>{selected.avatar}</Text>
+                  <View style={[s.avatar, { backgroundColor: '#334155' }]}> 
+                    <Text style={{ fontSize: 16, fontWeight: '800', color: '#fff' }}>{(selected.contact || '?').slice(0, 1).toUpperCase()}</Text>
                   </View>
                   <View>
                     <Text style={s.modalTitle}>{selected.contact}</Text>
@@ -1428,22 +1179,12 @@ function ThreadsTab() {
                   <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
                 </TouchableOpacity>
               </View>
-              <View style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12, marginBottom: 14 }}>
-                <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 6 }}>SUMMARY</Text>
-                <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>{selected.summary}</Text>
-              </View>
-              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>OPEN ITEMS</Text>
-              {selected.openItems.map(item => (
-                <View key={item} style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginBottom: 8 }}>
-                  <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: C.accent, marginTop: 6 }} />
-                  <Text style={{ flex: 1, fontSize: 13, color: C.textPrimary, lineHeight: 20 }}>{item}</Text>
-                </View>
-              ))}
-              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginTop: 14, marginBottom: 8 }}>RELATED DATES</Text>
-              {selected.relatedDates.map(d => (
-                <View key={d} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <Text style={{ fontSize: 14 }}>📅</Text>
-                  <Text style={{ fontSize: 13, color: C.textSecondary }}>{d}</Text>
+              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>RECENT EMAILS</Text>
+              {selected.messages.slice(0, 8).map(m => (
+                <View key={`m-${m.id}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8 }}>
+                  <Text style={{ fontSize: 13, color: C.textPrimary, fontWeight: '700' }} numberOfLines={1}>{m.subject}</Text>
+                  {!!m.snippet && <Text style={{ fontSize: 12, color: C.textSecondary, marginTop: 4 }} numberOfLines={2}>{m.snippet}</Text>}
+                  <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>{m.sentAt ? new Date(m.sentAt).toLocaleString() : ''}</Text>
                 </View>
               ))}
             </>}
@@ -1454,71 +1195,75 @@ function ThreadsTab() {
   );
 }
 
+function JunkTab({ deletedItems = [] }) {
+  return (
+    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
+      <View style={s.dashHeader}>
+        <View>
+          <Text style={s.dashTitle}>Junk</Text>
+          <Text style={s.dashSubtitle}>{deletedItems.length} deleted items</Text>
+        </View>
+      </View>
+      {deletedItems.length === 0 && <Text style={{ color: C.textMuted, fontSize: 13 }}>Nothing deleted yet.</Text>}
+      {deletedItems.map(item => (
+        <View key={item.key} style={s.notifCard}>
+          <Text style={s.notifTitle} numberOfLines={1}>{item.title}</Text>
+          {!!item.subtitle && <Text style={{ fontSize: 12, color: C.textSecondary, marginTop: 4 }} numberOfLines={2}>{item.subtitle}</Text>}
+          <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>{item.from} · {timeAgo(item.timestamp || item.deletedAt)}</Text>
+        </View>
+      ))}
+    </ScrollView>
+  );
+}
+
 // ─── Dashboard Shell ──────────────────────────────────────────────────────────
 const TABS = [
   { key: 'notifications', label: 'Inbox', icon: '🔔' },
-  { key: 'emails', label: 'Emails', icon: '✉️' },
+  { key: 'threads', label: 'Threads', icon: '🧵' },
   { key: 'calendar', label: 'Calendar', icon: '📅' },
-  { key: 'todo', label: 'TODO', icon: '📌' },
+  { key: 'todo', label: 'Links & Attachments', icon: '📌' },
+  { key: 'junk', label: 'Junk', icon: '🗑️' },
 ];
 
-function Dashboard({ ingestData, loadSummary }) {
+function Dashboard({ ingestData, onBackToSetup, userKey = '' }) {
+  const [notifItems, setNotifItems] = useState(DATA.notifications.map(n => ({ ...n, read: false })));
+  const [deletedMap, setDeletedMap] = useState({});
+  const [deletedItems, setDeletedItems] = useState([]);
   const [tab, setTab] = useState('notifications');
-  const [calendarEvents, setCalendarEvents] = useState([]);
-  const [emails, setEmails] = useState([]);
-  const unreadCount = DATA.notifications.filter(n => !n.read).length;
+  const unreadCount = notifItems.filter(n => !n.read).length;
 
-  const loadCalendarEvents = () => {
-    fetch(`${CALENDAR_API}/calendar/events`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.status === 'success') {
-          setCalendarEvents(data.events.map(mapCalendarEvent));
-        }
-      })
-      .catch(err => console.error(err));
+  const isDeleted = (key) => !!deletedMap[key];
+  const onMoveToJunk = (item) => {
+    if (!item?.key) return;
+    setDeletedMap(prev => (prev[item.key] ? prev : { ...prev, [item.key]: true }));
+    setDeletedItems(prev => (prev.some(i => i.key === item.key)
+      ? prev
+      : [{ ...item, deletedAt: Date.now() }, ...prev]));
   };
-
-  const loadEmails = () => {
-    fetch(`${CALENDAR_API}/emails`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.status === 'success') {
-          setEmails(Array.isArray(data.emails) ? data.emails : []);
-        }
-      })
-      .catch(err => console.error(err));
-  };
-
-  useEffect(() => {
-    loadSummary?.();
-    if (tab === 'calendar') {
-      loadCalendarEvents();
-    } else if (tab === 'emails') {
-      loadEmails();
-    }
-  }, [tab]);
 
   return (
     <SafeAreaView style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={{ flex: 1, paddingHorizontal: 20 }}>
-        {tab === 'notifications' && <NotificationsTab />}
-        {tab === 'emails' && (
-          <EmailsTab
-            emails={emails.length ? emails : (Array.isArray(ingestData?.messages) ? ingestData.messages : [])}
-            onRefresh={loadEmails}
-            onSync={() => { loadSummary?.(); loadEmails(); }}
-          />
-        )}
-        {tab === 'calendar' && (
-          <CalendarTab
+        <View style={{ alignItems: 'flex-end', paddingTop: 8, marginBottom: 6 }}>
+          <TouchableOpacity style={s.markAllBtn} onPress={onBackToSetup}>
+            <Text style={{ fontSize: 12, color: C.textSecondary, fontWeight: '600' }}>← Back to setup</Text>
+          </TouchableOpacity>
+        </View>
+        {tab === 'notifications' && (
+          <NotificationsTab
+            notifications={notifItems}
+            setNotifications={setNotifItems}
+            ingestMessages={ingestData.messages}
             ingestDates={ingestData.dates}
-            calendarEvents={calendarEvents}
-            onRefreshCalendar={loadCalendarEvents}
+            isDeleted={isDeleted}
+            onMoveToJunk={onMoveToJunk}
           />
         )}
-        {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} />}
+        {tab === 'threads' && <ThreadsTab ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
+        {tab === 'calendar' && <CalendarTab ingestDates={ingestData.dates} ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
+        {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} userKey={userKey} />}
+        {tab === 'junk' && <JunkTab deletedItems={deletedItems} />}
       </View>
       <View style={s.tabBar}>
         {TABS.map(t => {
@@ -1553,13 +1298,41 @@ export default function App() {
   const [notifEnabled, setNotifEnabled] = useState(true);
   const [leadTime, setLeadTime] = useState('1 hour');
   const [ingestData, setIngestData] = useState({ messages: [], dates: [], links: [], attachments: [], meta: {} });
-  // Outlook sign-in state: token is the raw access_token from the Microsoft popup
-  const [outlookSignedIn, setOutlookSignedIn] = useState(false);
-  const [outlookAccessToken, setOutlookAccessToken] = useState(null);
+  const [appAccounts, setAppAccounts] = useState({ gmail: '', calendar: '', outlook: '', imessage: '' });
+  const [userKey, setUserKey] = useState('');
+  const [isConnectingAccounts, setIsConnectingAccounts] = useState(false);
 
-  const handleOutlookSignedIn = (token) => {
+  const [outlookSignedIn, setOutlookSignedIn] = useState(false);
+  const [outlookAccessToken, setOutlookAccessToken] = useState('');
+
+  const normalizedUserKey = (userKey || '').trim().toLowerCase();
+
+  const handleOutlookSignedIn = async (token) => {
     setOutlookAccessToken(token);
     setOutlookSignedIn(true);
+
+    try {
+      const response = await fetch(`${getBaseUrl()}/ingest_outlook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ access_token: token }),
+      });
+
+      const raw = await response.text();
+      let data = null;
+      try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+
+      if (!response.ok) {
+        const msg = data?.message || raw || `HTTP ${response.status}`;
+        throw new Error(msg);
+      }
+      
+      // Load summary to update UI with latest from extracted.db
+      await loadSummary();
+      Alert.alert('Success', 'Outlook connected and data ingested.');
+    } catch (e) {
+      Alert.alert('Outlook Ingest Error', e.message);
+    }
   };
 
   function transition(fn) {
@@ -1579,7 +1352,7 @@ export default function App() {
     switch (current) {
       case 'welcome': return <WelcomeScreen />;
       case 'connect': return <ConnectAppsScreen selected={selectedApps} onToggle={id => setSelectedApps(p => p.includes(id) ? p.filter(a => a !== id) : [...p, id])} />;
-      case 'accounts': return <AppAccountsScreen selectedApps={selectedApps} outlookSignedIn={outlookSignedIn} onOutlookSignedIn={handleOutlookSignedIn} />;
+      case 'accounts': return <AppAccountsScreen selectedApps={selectedApps} accountValues={appAccounts} onChangeAccount={(appId, value) => setAppAccounts(prev => ({ ...prev, [appId]: value }))} outlookSignedIn={outlookSignedIn} onOutlookSignedIn={handleOutlookSignedIn} />;
       case 'whitelist': return <WhitelistScreen contacts={contacts} inputValue={contactInput} onChangeInput={setContactInput}
         onAdd={() => { const t = contactInput.trim(); if (t && !contacts.includes(t)) setContacts(p => [...p, t]); setContactInput(''); }}
         onRemove={name => setContacts(p => p.filter(c => c !== name))} />;
@@ -1589,12 +1362,16 @@ export default function App() {
     }
   }
 
-  const triggerIngestion = async () => {
+  const triggerIngestion = async (showAlert = true) => {
     try {
-      const response = await fetch(`${CALENDAR_API}/ingest`, {
+      if (!normalizedUserKey) {
+        if (showAlert) Alert.alert('Connect account', 'Enter your email first.');
+        return;
+      }
+      const response = await fetch(`${getBaseUrl()}/ingest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ db_path: 'extracted.db' }),
+        body: JSON.stringify({ user_key: normalizedUserKey }),
       });
 
       // Read body even on error to surface backend message
@@ -1624,16 +1401,17 @@ export default function App() {
         latest,
       ].filter(Boolean);
 
-      Alert.alert('Success', lines.join('\n'));
+      if (showAlert) Alert.alert('Success', lines.join('\n'));
     } catch (error) {
-      Alert.alert('Error', error.message || 'Failed to trigger ingestion');
+      if (showAlert) Alert.alert('Error', error.message || 'Failed to trigger ingestion');
       console.error(error);
     }
   };
 
-  const loadSummary = async () => {
+  const loadSummary = async (overrideUserKey = null) => {
     try {
-      const response = await fetch(`${CALENDAR_API}/summary`);
+      const effectiveUserKey = (overrideUserKey || normalizedUserKey || 'outlook_user').trim().toLowerCase();
+      const response = await fetch(`${getBaseUrl()}/summary?user_key=${encodeURIComponent(effectiveUserKey)}`);
       const raw = await response.text();
       let data = null;
       try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
@@ -1663,19 +1441,62 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    if (done) {
-      fetch(`${CALENDAR_API}/ingest`, {
+  const finishSetupAndConnect = async () => {
+    const gmailSelected = selectedApps.includes('gmail');
+    const gmailAccount = (appAccounts.gmail || '').trim().toLowerCase();
+
+    if (!gmailSelected) {
+      // For pure non-gmail setups (like Outlook only)
+      await loadSummary();
+      setDone(true);
+      return;
+    }
+
+    setIsConnectingAccounts(true);
+    try {
+      setUserKey(gmailAccount);
+
+      const response = await fetch(`${getBaseUrl()}/ingest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ db_path: 'extracted.db' }),
-      }).catch(err => console.error(err));
+        body: JSON.stringify({ user_key: gmailAccount, force_reauth: false, reset_cursor: true }),
+      });
+
+      const raw = await response.text();
+      let data = null;
+      try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+
+      if (!response.ok) {
+        const msg = data?.message || `HTTP ${response.status} ${response.statusText}`;
+        throw new Error(msg);
+      }
+
+      await loadSummary(gmailAccount);
+      setDone(true);
+    } catch (error) {
+      Alert.alert('Connect failed', error?.message || 'Unable to connect selected Gmail account.');
+      console.error(error);
+    } finally {
+      setIsConnectingAccounts(false);
     }
-  }, [done]);
+  };
+
+  // Pull summary right away so the dashboard has backend data without waiting on onboarding state.
+  useEffect(() => {
+    if (!done) return;
+    loadSummary();
+    const id = setInterval(() => {
+      if (normalizedUserKey) {
+        triggerIngestion(false);
+      }
+      loadSummary();
+    }, 20000);
+    return () => clearInterval(id);
+  }, [done, normalizedUserKey]);
 
   if (done) return (
     <SafeAreaProvider>
-      <Dashboard ingestData={ingestData} loadSummary={loadSummary} />
+      <Dashboard ingestData={ingestData} onBackToSetup={() => setDone(false)} userKey={normalizedUserKey} />
     </SafeAreaProvider>
   );
 
@@ -1688,7 +1509,7 @@ export default function App() {
           {renderScreen()}
         </Animated.View>
         <View style={s.navRow}>
-          {!isFirst && !isDone && (
+          {!isFirst && (
             <TouchableOpacity style={s.backBtn} onPress={() => transition(() => setStep(p => p - 1))}>
               <Text style={{ color: C.textSecondary, fontSize: 15, fontWeight: '600' }}>← Back</Text>
             </TouchableOpacity>
@@ -1702,25 +1523,11 @@ export default function App() {
           )}
           {isDone && (
             <TouchableOpacity
-              style={[s.nextBtn, { flex: 1, backgroundColor: C.green }]}
-              onPress={async () => {
-                // If the user signed in with Outlook, kick off backend Outlook ingestion
-                // using the access token captured from the Microsoft popup.
-                if (outlookAccessToken) {
-                  try {
-                    await fetch(`${CALENDAR_API}/ingest_outlook`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ access_token: outlookAccessToken }),
-                    });
-                  } catch (e) {
-                    console.warn('Outlook ingest failed:', e);
-                  }
-                }
-                setDone(true);
-              }}
+              style={[s.nextBtn, { flex: 1, backgroundColor: C.green }, isConnectingAccounts && { opacity: 0.65 }]}
+              onPress={finishSetupAndConnect}
+              disabled={isConnectingAccounts}
             >
-              <Text style={{ color: '#0D1A14', fontSize: 15, fontWeight: '800' }}>Open Dashboard →</Text>
+              <Text style={{ color: '#0D1A14', fontSize: 15, fontWeight: '800' }}>{isConnectingAccounts ? 'Connecting account…' : 'Open Dashboard →'}</Text>
             </TouchableOpacity>
           )}
         </View>
@@ -1787,11 +1594,18 @@ const s = StyleSheet.create({
   unreadDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: C.accent, marginLeft: 8 },
   badge: { borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
   badgeText: { fontSize: 10, fontWeight: '800', letterSpacing: 0.5 },
+  calGridWrap: { backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 10, marginBottom: 12 },
+  calWeekRow: { flexDirection: 'row', marginBottom: 8 },
+  calWeekLabel: { flex: 1, textAlign: 'center', color: C.textMuted, fontSize: 11, fontWeight: '700' },
+  calGrid: { flexDirection: 'row', flexWrap: 'wrap' },
+  calCell: { width: '14.2857%', height: 52, alignItems: 'center', justifyContent: 'center', borderRadius: 8, marginBottom: 4 },
+  calCellMuted: { opacity: 0.45 },
+  calCellSelected: { backgroundColor: C.accentSoft, borderWidth: 1, borderColor: C.accent },
+  calCellNum: { color: C.textPrimary, fontSize: 12, fontWeight: '600' },
+  calCellNumMuted: { color: C.textMuted },
+  calDotRow: { flexDirection: 'row', marginTop: 4, minHeight: 6, gap: 2 },
+  calDot: { width: 4, height: 4, borderRadius: 2, backgroundColor: C.accent },
   calDateLabel: { fontSize: 12, fontWeight: '700', color: C.textMuted, letterSpacing: 1, marginBottom: 8, marginTop: 8 },
-  addEventBtn: { backgroundColor: C.accent, borderRadius: 10, paddingVertical: 8, paddingHorizontal: 14, alignSelf: 'flex-end' },
-  addEventBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
-  addEventInput: { backgroundColor: C.surfaceAlt, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12, color: C.textPrimary, fontSize: 14, borderWidth: 1, borderColor: C.border },
-  addEventSubmitBtn: { backgroundColor: C.accent, borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginTop: 20 },
   eventCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.surface, borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: C.border, gap: 12 },
   attendeeChip: { backgroundColor: C.surfaceAlt, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
   threadCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.surface, borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: C.border },

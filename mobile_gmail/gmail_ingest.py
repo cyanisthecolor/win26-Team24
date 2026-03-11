@@ -300,7 +300,8 @@ def fetch_db_snapshot(db_path: str, limit: int = 20) -> Dict[str, List[Dict]]:
         msgs = conn.execute(
             """
             SELECT m.id, m.sender, m.sent_at_utc, substr(m.text, 1, 200) AS snippet,
-                   c.thread_key AS thread_id, m.source_msg_key AS gmail_message_id
+                   c.thread_key AS thread_id, m.source_msg_key AS gmail_message_id,
+                   m.source, m.category, m.priority, m.summary_phrase, m.description
             FROM messages m
             LEFT JOIN conversations c ON m.conversation_id = c.id
             ORDER BY m.source_rowid DESC
@@ -1191,7 +1192,7 @@ def ingest_outlook():
         }
     """
     try:
-        import outlook_ingest as _oi
+        import mobile_gmail.outlook_ingest as _oi
         data = request.json or {}
         access_token = (data.get('access_token') or '').strip()
         if not access_token:
@@ -1200,7 +1201,12 @@ def ingest_outlook():
         db_path = data.get('db_path', 'extracted.db')
         # json_path can be None so we only write to the DB here; the /summary
         # endpoint already serves the data to the frontend.
-        _oi.ingest_all(db_path=db_path, json_path=None, quiet=False, access_token=access_token)
+        _oi.outlook_ingest(
+            access_token=access_token,
+            db_path=db_path,
+            json_path=None,
+            quiet=False,
+        )
         return jsonify({"status": "success", "message": "Outlook ingestion complete."})
     except Exception as e:
         logger.error(f"Error during Outlook ingestion: {e}")
@@ -1257,7 +1263,8 @@ def get_emails():
                        substr(m.text, 1, 300) AS snippet,
                        c.display_name AS subject,
                        c.thread_key AS thread_id,
-                       m.source_msg_key AS gmail_message_id
+                       m.source_msg_key AS gmail_message_id,
+                       m.source, m.category, m.priority, m.summary_phrase, m.description
                 FROM messages m
                 LEFT JOIN conversations c ON m.conversation_id = c.id
                 ORDER BY m.source_rowid DESC
@@ -1287,6 +1294,30 @@ def summary():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/suggest_reply', methods=['POST', 'OPTIONS'])
+def suggest_reply_api():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    return jsonify({
+        "suggestions": [
+            "Thanks for the update, tracking this.",
+            "Sounds good, I will review shortly.",
+            "Understood, let's discuss this later."
+        ]
+    })
+
 if __name__ == "__main__":
     # Run the Flask app for API integration on an alternate port to avoid conflicts
     app.run(debug=True, host="0.0.0.0", port=5001)
+
+@app.route('/suggest_reply', methods=['POST', 'OPTIONS'])
+def suggest_reply_api():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    return jsonify({
+        "suggestions": [
+            "Thanks for the update, tracking this.",
+            "Sounds good, I will review shortly.",
+            "Understood, let's discuss this later."
+        ]
+    })
