@@ -154,7 +154,7 @@ def _fetch_all_messages() -> List[Dict]:
     all_messages: List[Dict] = []
     
     # Fetch from inbox
-    inbox_url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$expand=attachments"
+    inbox_url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
     while inbox_url:
         resp = requests.get(inbox_url, headers=headers)
         if resp.status_code != 200:
@@ -164,7 +164,7 @@ def _fetch_all_messages() -> List[Dict]:
         inbox_url = data.get("@odata.nextLink")
     
     # Fetch from sent items
-    sent_url = "https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages?$expand=attachments"
+    sent_url = "https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages"
     while sent_url:
         resp = requests.get(sent_url, headers=headers)
         if resp.status_code != 200:
