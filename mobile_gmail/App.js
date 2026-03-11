@@ -85,7 +85,7 @@ function timeAgo(ts) {
 function formatDate(dateStr) {
   const d = new Date(dateStr);
   if (Number.isNaN(d.getTime())) return dateStr;
-  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' });
 }
 
 function priorityColor(p) {
@@ -483,7 +483,8 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
         const subject = `${m?.subject || ''}`;
         const snippet = `${m?.snippet || ''}`;
         const isActionLike = actionRe.test(subject) || actionRe.test(snippet);
-        return !dateMessageIds.has(m?.id) || isActionLike;
+        const isSpam = typeof m.category === 'string' && m.category.toUpperCase() === 'SPAM';
+        return (!dateMessageIds.has(m?.id) || isActionLike) && !isSpam;
       })
       .slice(0, 8)
       .map(m => {
@@ -614,7 +615,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
         <Text style={s.groupLabel}>UNREAD</Text>
         {unreadApp.length > 0 && <Text style={[s.groupLabel, { marginTop: 8, fontSize: 11 }]}>FROM APPS</Text>}
         {unreadApp.map(n => <Card key={n.readKey} n={n} />)}
-        {unreadGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM GMAIL</Text>}
+        {unreadGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM OUTLOOK</Text>}
         {unreadGmail.map(n => (
           <TouchableOpacity
             key={n.id}
@@ -666,7 +667,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
         <Text style={[s.groupLabel, { marginTop: 16 }]}>READ</Text>
         {readApp.length > 0 && <Text style={[s.groupLabel, { marginTop: 8, fontSize: 11 }]}>FROM APPS</Text>}
         {readApp.map(n => <Card key={n.readKey} n={n} />)}
-        {readGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM GMAIL</Text>}
+        {readGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM OUTLOOK</Text>}
         {readGmail.map(n => (
           <TouchableOpacity
             key={n.id}
@@ -778,16 +779,17 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
       if (!d.message_id || seenByMessage.has(d.message_id)) return null;
       seenByMessage.add(d.message_id);
 
-      const isoRaw = d.resolved_date || d.parsed_at_utc || '';
-      const dt = new Date(isoRaw);
-      const dateStr = Number.isNaN(dt.getTime())
-        ? (isoRaw.includes('T') ? isoRaw.split('T')[0] : isoRaw.slice(0, 10))
-        : dt.toISOString().slice(0, 10);
-      const timeStr = Number.isNaN(dt.getTime())
-        ? ''
-        : dt.toISOString().slice(11, 16);
+      const isoRaw = String(d.resolved_date || d.parsed_at_utc || '').trim();
+      let dateStr = '';
+      let timeStr = '';
+      if (isoRaw) {
+        const parts = isoRaw.split('T');
+        dateStr = parts[0].slice(0, 10);
+        timeStr = parts.length > 1 && parts[1].length >= 5 ? parts[1].slice(0, 5) : '';
+      }
 
       const msg = msgById[d.message_id];
+      if (msg && isDeleted(`${msg.source || 'gmail'}-${msg.id}`)) return null;
       const isOutlook = msg?.source === 'outlook';
       const title = isOutlook ? (msg?.summary_phrase || msg?.subject || 'Event') : ((msg?.subject && msg.subject.trim()) || (msg?.snippet && msg.snippet.trim()) || (d.raw_span && d.raw_span.trim()) || 'Event');
       const rawNote = d.raw_span && d.raw_span.trim();
@@ -1083,10 +1085,19 @@ function ThreadsTab({ ingestMessages = [], isDeleted, onMoveToJunk }) {
     const bySender = new Map();
 
     (ingestMessages || []).forEach((msg) => {
-      const rawSender = `${msg?.sender_name || msg?.sender || ''}`.trim();
-      let sender = rawSender;
-      if (!sender) sender = 'Unknown Sender';
-      if (sender.includes('<')) sender = sender.split('<')[0].trim() || sender;
+      if (isDeleted(`${msg.source || 'gmail'}-${msg.id}`)) return;
+      let sender = 'Unknown Sender';
+      let sName = (msg?.sender_name || '').trim();
+      let sEmail = (msg?.sender || '').trim();
+      
+      if (sName) {
+        if (sName.includes('<')) sName = sName.split('<')[0].trim();
+        sName = sName.replace(/^["']|["']$/g, '').trim();
+        sender = (sName !== sEmail && !sName.includes('@')) ? sName : sName.split('@')[0];
+      } else if (sEmail) {
+        if (sEmail.includes('<')) sEmail = sEmail.split('<')[0].trim();
+        sender = sEmail.split('@')[0];
+      }
 
       const ts = msg?.sent_at_utc ? new Date(msg.sent_at_utc).getTime() : 0;
       const item = {
@@ -1179,14 +1190,16 @@ function ThreadsTab({ ingestMessages = [], isDeleted, onMoveToJunk }) {
                   <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
                 </TouchableOpacity>
               </View>
-              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>RECENT EMAILS</Text>
-              {selected.messages.slice(0, 8).map(m => (
-                <View key={`m-${m.id}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8 }}>
-                  <Text style={{ fontSize: 13, color: C.textPrimary, fontWeight: '700' }} numberOfLines={1}>{m.subject}</Text>
-                  {!!m.snippet && <Text style={{ fontSize: 12, color: C.textSecondary, marginTop: 4 }} numberOfLines={2}>{m.snippet}</Text>}
-                  <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>{m.sentAt ? new Date(m.sentAt).toLocaleString() : ''}</Text>
-                </View>
-              ))}
+              <Text style={{ fontSize: 13, color: C.textPrimary, fontWeight: '700', marginBottom: 12, marginTop: 12, letterSpacing: 0.5, borderBottomWidth: 1, borderBottomColor: C.border, paddingBottom: 4 }}>Recent Dialogues</Text>
+              <ScrollView style={{ maxHeight: 400 }}>
+                {selected.messages.slice(0, 8).map(m => (
+                  <View key={`m-${m.id}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8 }}>
+                    <Text style={{ fontSize: 13, color: C.textPrimary, fontWeight: '700', marginBottom: 4 }} numberOfLines={1}>{m.summary_phrase || m.subject || 'No subject'}</Text>
+                    {!!(m.description || m.snippet) && <Text style={{ fontSize: 12, color: C.textSecondary, lineHeight: 18 }} numberOfLines={3}>{m.description || m.snippet}</Text>}
+                    <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 8, textAlign: 'right' }}>{m.sentAt ? new Date(m.sentAt).toLocaleString() : ''}</Text>
+                  </View>
+                ))}
+              </ScrollView>
             </>}
           </View>
         </View>

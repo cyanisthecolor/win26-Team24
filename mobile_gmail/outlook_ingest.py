@@ -5,6 +5,7 @@ import requests
 import json
 import argparse
 import sys
+import re
 from datetime import datetime
 from typing import Dict, List
 
@@ -17,6 +18,25 @@ ACCESS_TOKEN = None
 
 openai.api_key = API_KEY
 _call_openai_with_instruction = None
+
+URL_RE = re.compile(
+    r"(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:'\".,<>?«»“”‘’]))"
+)
+
+def extract_urls(text: str) -> List[str]:
+    urls = []
+    for m in URL_RE.finditer(text):
+        u = m.group(1).strip().rstrip(".,;:!\"]}")
+        if u.startswith("www."):
+            u = "https://" + u
+        urls.append(u)
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 # for classification of individual messages
 def classify_message(subject: str, body: str, model: str = 'gpt-4o-mini') -> Dict[str, str]:
@@ -134,7 +154,7 @@ def _fetch_all_messages() -> List[Dict]:
     all_messages: List[Dict] = []
     
     # Fetch from inbox
-    inbox_url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+    inbox_url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$expand=attachments"
     while inbox_url:
         resp = requests.get(inbox_url, headers=headers)
         if resp.status_code != 200:
@@ -144,7 +164,7 @@ def _fetch_all_messages() -> List[Dict]:
         inbox_url = data.get("@odata.nextLink")
     
     # Fetch from sent items
-    sent_url = "https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages"
+    sent_url = "https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages?$expand=attachments"
     while sent_url:
         resp = requests.get(sent_url, headers=headers)
         if resp.status_code != 200:
@@ -192,6 +212,24 @@ def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quie
                 description TEXT   
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS extracted_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                url TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS extracted_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                filename TEXT,
+                mime_type TEXT,
+                original_path TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
 
         try:
             _ensure_columns(conn)
@@ -199,6 +237,9 @@ def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quie
             pass
         
         # Remove all existing Outlook content from the database before re-ingesting
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("DELETE FROM extracted_links WHERE message_id IN (SELECT id FROM messages WHERE source = 'outlook')")
+        conn.execute("DELETE FROM extracted_attachments WHERE message_id IN (SELECT id FROM messages WHERE source = 'outlook')")
         conn.execute("DELETE FROM conversations WHERE source = 'outlook'")
         conn.execute("DELETE FROM messages WHERE source = 'outlook'")
         conn.commit()
@@ -219,8 +260,10 @@ def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quie
             body = msg.get("body", {}).get("content", "")
             read_status = msg.get("isRead", False)
             ai_summary = classify_message(subj, body)
-
-
+            
+            if ai_summary["category"].upper() == "SPAM":
+                continue
+            
             if ai_summary["category"].upper() == "SPAM":
                 continue
 
@@ -262,7 +305,7 @@ def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quie
                 }
                 json_items.append(json_entry)
 
-            conn.execute("""
+            cursor = conn.execute("""
                     INSERT INTO messages (
                         source, source_msg_key, source_rowid, conversation_id, sender, sender_name,
                         is_from_me, sent_at_utc, text, category, priority, summary_phrase, description
@@ -282,6 +325,24 @@ def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quie
                     ai_summary["phrase"], 
                     ai_summary["description"]
                 ))
+            message_id = cursor.lastrowid
+            
+            # Extract and insert links
+            for url in extract_urls(body):
+                conn.execute(
+                    "INSERT INTO extracted_links(message_id, url) VALUES(?, ?)", 
+                    (message_id, url)
+                )
+            
+            # Extract and insert attachments
+            for attachment in msg.get("attachments", []):
+                filename = attachment.get("name", "Unknown File")
+                mime_type = attachment.get("contentType", "application/octet-stream")
+                attachment_id = attachment.get("id", "")
+                conn.execute(
+                    "INSERT INTO extracted_attachments(message_id, filename, mime_type, original_path) VALUES(?, ?, ?, ?)",
+                    (message_id, filename, mime_type, f"outlook_attachment_id:{attachment_id}")
+                )
 
         conn.commit()
         conn.close()
@@ -369,7 +430,10 @@ def ingest_calendar_items(
         now_str = now_utc.strftime("%Y-%m-%d %H:%M UTC")
         # Look up to 1 year ahead for calendar events
         end_utc = now_utc.replace(year=now_utc.year + 1)
-        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        headers = {
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Prefer": 'outlook.timezone="Pacific Standard Time"'
+        }
 
         # ------------------------------------------------------------------
         # Set up / migrate extracted.db
@@ -497,7 +561,7 @@ def ingest_calendar_items(
             """, (
                 f"outlook_cal_{event.get('id', '')}",
                 subject,
-                start[:10] if start else "",
+                start,
                 start
             ))
 
