@@ -1,897 +1,1078 @@
-import os
-import openai
-import sqlite3
-import requests
+import base64
+import html
 import json
-import argparse
-import sys
+import logging
+import os
 import re
-from datetime import datetime
-from typing import Dict, List
+import sqlite3
+import time
+import webbrowser
+from datetime import datetime, timezone
+from email.utils import parseaddr
+from typing import Dict, List, Optional, Tuple
 
-from outlook_manager import API_KEY 
+import requests
+from dateparser.search import search_dates
+from flask import Flask, Response, jsonify, request
 
-CLIENT_ID = "fde8d6d4-cb6f-4ad5-862f-0ab740a0bec8"
-CLIENT_SECRET = "gux8Q~2BYmIH_mqOHS8fh-s6fUqh~CYsNHMnebJg"
-REFRESH_TOKEN = "M.C558_BAY.0.U.-Cl5YV9G25zFECodweaq*1R0rdbGcpsAEZIUccTZRaVf!ohL*wbpr99tgp5k*UQqD5ynbzs*hYLhmw4PvVT2xzp9quo!YFYlTMKJF6T97xMD1uaCn81!uO3cVpZ3Ynao960bYN9U!5w2OU5cbCQmqclJdMzCPFGKZz6GdkTm09V0wNeSXiEPcp3zUfBTeGK1xT2krgQibt73zalWWr!*Z03uL6VMiAleClbntbhx7Bjx0KyEFyh5FFIq89PL51mMZOX*cGuoB1vtz8PrPMzdYkQxHzmjo3*lst4zB!MbZEhw75QMoxmNSRFK0ZTYl7lHlcJc4WVieSXVGv8617th7W1aQqmRX2oJLrJ0KXSZT!XvnM5WdMale9q!uY008V4!jJGeo!Ajh8zmMluZLsC6ZsLQ$"
-ACCESS_TOKEN = None
 
-openai.api_key = API_KEY
-_call_openai_with_instruction = None
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+app = Flask(__name__)
+
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+
+OUTLOOK_CLIENT_ID = os.environ.get("OUTLOOK_CLIENT_ID", "").strip()
+OUTLOOK_TENANT_ID = os.environ.get("OUTLOOK_TENANT_ID", "common").strip() or "common"
+OUTLOOK_SCOPES = os.environ.get(
+    "OUTLOOK_SCOPES",
+    "offline_access User.Read Mail.Read",
+).strip()
+OUTLOOK_TIMEOUT_SECONDS = int(os.environ.get("OUTLOOK_TIMEOUT_SECONDS", "30"))
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 URL_RE = re.compile(
-    r"(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:'\".,<>?«»“”‘’]))"
+    r"""(?xi)
+    \b(
+      https?://[^\s<>()"]+ |
+      www\.[^\s<>()"]+
+    )
+    """
 )
+
+DATE_KEYWORDS = [
+    "today", "tomorrow", "tonight", "yesterday",
+    "morning", "noon", "afternoon", "evening", "night", "now",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "week", "month", "year", "am", "pm", "due", "deadline", "submit", "meet", "meeting",
+]
+
+ALLOWED_ATTACHMENT_EXTENSIONS = {".pdf", ".doc", ".docx"}
+ALLOWED_ATTACHMENT_MIME_TYPES = {
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
+def normalize_user_key(user_key: Optional[str]) -> Optional[str]:
+    raw = (user_key or "").strip().lower()
+    if not raw:
+        return None
+    cleaned = re.sub(r"[^a-z0-9._-]", "_", raw)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned or None
+
+
+def resolve_outlook_client_id(override_client_id: Optional[str] = None) -> str:
+    values = [
+        (override_client_id or "").strip(),
+        (os.environ.get("OUTLOOK_CLIENT_ID") or "").strip(),
+        (os.environ.get("AZURE_CLIENT_ID") or "").strip(),
+        (os.environ.get("MS_CLIENT_ID") or "").strip(),
+        OUTLOOK_CLIENT_ID,
+    ]
+    for value in values:
+        if value:
+            return value
+    return ""
+
+
+def resolve_user_paths(user_key: Optional[str], db_path: Optional[str] = None) -> Tuple[str, str]:
+    normalized = normalize_user_key(user_key)
+    if normalized:
+        token_path = f"token_outlook_{normalized}.json"
+        resolved_db_path = db_path or f"extracted_{normalized}.db"
+    else:
+        token_path = "token_outlook.json"
+        resolved_db_path = db_path or "extracted.db"
+    return token_path, resolved_db_path
+
+
+def open_sqlite_rw(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.row_factory = sqlite3.Row
+    ensure_base_schema(conn)
+    ensure_messages_schema(conn)
+    return conn
+
+
+def ensure_base_schema(conn: sqlite3.Connection) -> None:
+    has_messages = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone()
+    if has_messages:
+        return
+
+    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+    if not os.path.exists(schema_path):
+        raise FileNotFoundError(f"schema.sql not found at {schema_path}")
+
+    with open(schema_path, "r", encoding="utf-8") as f:
+        schema_sql = f.read()
+    conn.executescript(schema_sql)
+    conn.commit()
+
+
+def ensure_messages_schema(conn: sqlite3.Connection) -> None:
+    cols = conn.execute("PRAGMA table_info(messages)").fetchall()
+    col_names = {c["name"] for c in cols}
+    changed = False
+
+    if "sender_name" not in col_names:
+        conn.execute("ALTER TABLE messages ADD COLUMN sender_name TEXT")
+        changed = True
+    if "account_key" not in col_names:
+        conn.execute("ALTER TABLE messages ADD COLUMN account_key TEXT")
+        changed = True
+    if "account_email" not in col_names:
+        conn.execute("ALTER TABLE messages ADD COLUMN account_email TEXT")
+        changed = True
+
+    if changed:
+        conn.commit()
+
+
+def get_last_cursor(conn: sqlite3.Connection, source: str) -> int:
+    row = conn.execute(
+        "SELECT last_rowid FROM sync_state WHERE source = ?",
+        (source,),
+    ).fetchone()
+    return int(row["last_rowid"]) if row else 0
+
+
+def set_last_cursor(conn: sqlite3.Connection, source: str, cursor: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO sync_state(source, last_rowid, updated_at)
+        VALUES(?, ?, datetime('now'))
+        ON CONFLICT(source) DO UPDATE SET
+          last_rowid=excluded.last_rowid,
+          updated_at=datetime('now')
+        """,
+        (source, cursor),
+    )
+
+
+def reset_cursor(conn: sqlite3.Connection, source: str) -> None:
+    conn.execute("DELETE FROM sync_state WHERE source = ?", (source,))
+
+
+def upsert_conversation(conn: sqlite3.Connection, source: str, thread_key: str, display_name: Optional[str]) -> int:
+    conn.execute(
+        """
+        INSERT INTO conversations(source, thread_key, display_name)
+        VALUES(?, ?, ?)
+        ON CONFLICT(source, thread_key) DO UPDATE SET
+          display_name=COALESCE(excluded.display_name, conversations.display_name)
+        """,
+        (source, thread_key, display_name),
+    )
+    row = conn.execute(
+        "SELECT id FROM conversations WHERE source=? AND thread_key=?",
+        (source, thread_key),
+    ).fetchone()
+    return int(row["id"])
+
+
+def insert_message(
+    conn: sqlite3.Connection,
+    source: str,
+    source_msg_key: str,
+    source_rowid: int,
+    conversation_id: int,
+    sender: Optional[str],
+    sender_name: Optional[str],
+    account_key: Optional[str],
+    account_email: Optional[str],
+    sent_at_utc: str,
+    text: str,
+) -> Optional[int]:
+    try:
+        conn.execute(
+            """
+            INSERT INTO messages(source, source_msg_key, source_rowid, conversation_id, sender, sender_name, account_key, account_email, is_from_me, sent_at_utc, text)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (source, source_msg_key, source_rowid, conversation_id, sender, sender_name, account_key, account_email, sent_at_utc, text),
+        )
+    except sqlite3.IntegrityError:
+        return None
+
+    row = conn.execute(
+        "SELECT id FROM messages WHERE source=? AND source_msg_key=?",
+        (source, source_msg_key),
+    ).fetchone()
+    return int(row["id"])
+
 
 def extract_urls(text: str) -> List[str]:
     urls = []
-    for m in URL_RE.finditer(text):
-        u = m.group(1).strip().rstrip(".,;:!\"]}")
-        if u.startswith("www."):
-            u = "https://" + u
-        urls.append(u)
-    seen = set()
+    for m in URL_RE.finditer(text or ""):
+        value = m.group(1).strip().rstrip(".,;:!)]}\"")
+        if value.startswith("www."):
+            value = "https://" + value
+        urls.append(value)
     out = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
+    seen = set()
+    for value in urls:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
     return out
 
-# for classification of individual messages
-def classify_message(subject: str, body: str, model: str = 'gpt-4o-mini') -> Dict[str, str]:
-    """Use OpenAI to classify a single email into priority/category/phrase/description."""
-    system = (
-        "Provide a JSON object with keys: 'priority' (HIGH, MEDIUM, LOW), "
-        "'category' (WORK, SOCIAL, SUGGESTION, SPAM, AUTOMATED), "
-        "'phrase' (a short action-oriented phrase describing what the recipient needs to do or be aware of — "
-        "write it as an imperative action if action is required, e.g. 'Reply to meeting invite', "
-        "'Review budget proposal', 'Confirm attendance for Friday dinner'; "
-        "for automated/informational emails write a brief awareness note, e.g. 'New sign-in detected'), "
-        "WORK is related to job tasks and administrative information. This is when someone directly asks you for something that needs to be done, or is very important to complete."
-        "SOCIAL is related to friends/family planning and organizing, and is strictly non-work related. This is when someone is asking to meet up, or share personal news, or anything that is not work related but still important to keep track of."
-        "AUTOMATED is for messages that are automatically generated and don't require direct action, but may still be important to be aware of. This includes things like receipts, account notifications, or any message that is clearly generated by a system rather than a person. They can often be LOW priority unless they contain important information."
-        "ANY message that feels like it was generated by a bot or system rather than a human should be categorized as AUTOMATED, even if it is asking for something to be done OR contains a suggestion. \n"
-        "SUGGESTION is related to potential future benefits (e.g. networking, sales, etc) or activities that could be beneficial to do but aren't strictly required."
-        "SPAM is junk email. Anything that seems like it could be a scam, phishing, or just generally unwanted should be categorized as SPAM. \n"
-        "LOW priority is for emails that don't require immediate attention, or unimportant, scammy or automated messages. They can often addressed at a later time. Anything automated or bot-generated should be LOW. \n"
-        "MEDIUM priority is for emails that are important but not urgent. They should be addressed in a timely manner, but don't require immediate action. This might include emails sent out to larger groups but NOT bot-generated emails. \n" \
-        "HIGH priority is for emails that require immediate attention. They are often time-sensitive and may have significant consequences if not addressed promptly. \n"
-        "Any messages that feels like SCAM or PHISHING should be categorized as LOW, even if they are technically asking for something to be done. \n"
-        "and 'description' (one sentence explaining the email). \n" 
-        "Return only the JSON."
-    )
 
-    user = "Subject: {subject}\nBody: {body}\n".format(subject=subject, body=body)
+def looks_like_real_date(raw_span: str) -> bool:
+    s = (raw_span or "").strip().lower()
+    if len(s) < 3:
+        return False
+    if any(c.isdigit() for c in s):
+        has_sep = any(sep in s for sep in ["/", "-", ":", "."])
+        has_keyword = any(k in s for k in DATE_KEYWORDS)
+        return has_sep or has_keyword
+    if any(k in s for k in DATE_KEYWORDS):
+        return True
+    return s in {"tomorrow", "today", "tonight", "yesterday"}
 
-    try:
-        resp = openai.ChatCompletion.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.1,
-            max_tokens=400,
-        )
-        resp = resp['choices'][0]['message']['content'].strip()
-        clean = resp.strip().removeprefix("```json").removesuffix("```").strip()
-        return json.loads(clean)
-    except Exception as e:
-        print(f"Error calling OpenAI API: {e}", file=sys.stderr)
-        print("Error in message classification. Defaulting to LOW priority WORK category.", file=sys.stderr)
-        return {"priority": "LOW", "category": "WORK", "phrase": subject or "", "description": body[:150]}
 
-GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/messages"
-
-def refresh_outlook_token(client_id: str | None = None, client_secret: str | None = None, refresh_token: str | None = None) -> str | None:
-    client_id = client_id or os.getenv("MICROSOFT_CLIENT_ID") or CLIENT_ID
-    client_secret = client_secret or os.getenv("MICROSOFT_CLIENT_SECRET")
-    refresh_token = refresh_token or os.getenv("MICROSOFT_REFRESH_TOKEN")
-
-    if not client_secret or not refresh_token:
-        return None
-
-    url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-    
-    data = {
-        'client_id': client_id,
-        'refresh_token': refresh_token,
-        'grant_type': 'refresh_token',
-        'scope': 'https://graph.microsoft.com/.default'
+def extract_dates(text: str, base_dt: datetime):
+    text = (text or "")[:10000]
+    settings = {
+        "RELATIVE_BASE": base_dt,
+        "PREFER_DATES_FROM": "current_period",
+        "SKIP_TOKENS": ["http", "https", "www"],
     }
-    
-    response = requests.post(url, data=data)
-    tokens = response.json()
-    
-    if 'access_token' in tokens:
-        print("Token refreshed successfully!")
-        return tokens['access_token']
-    else:
-        print("Error refreshing token:", tokens.get('error_description'))
-        return None
+    found = search_dates(text, settings=settings, languages=["en"])
+    if not found:
+        return []
+
+    out = []
+    for raw, dt in found:
+        if not looks_like_real_date(raw):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=base_dt.tzinfo)
+        resolved_utc = dt.astimezone(timezone.utc)
+        resolved_local = dt.astimezone(base_dt.tzinfo)
+        out.append((raw, resolved_utc, resolved_local))
+    return out
 
 
-def resolve_access_token(cli_token: str | None) -> str | None:
-    if cli_token:
-        return cli_token
-
-    env_token = os.getenv("OUTLOOK_ACCESS_TOKEN")
-    if env_token:
-        return env_token
-
-    return refresh_outlook_token()
+def is_allowed_document_attachment(filename: Optional[str], mime_type: Optional[str]) -> bool:
+    lower_mime = (mime_type or "").strip().lower()
+    if lower_mime in ALLOWED_ATTACHMENT_MIME_TYPES:
+        return True
+    ext = os.path.splitext((filename or "").strip().lower())[1]
+    return ext in ALLOWED_ATTACHMENT_EXTENSIONS
 
 
-def _ensure_columns(conn: sqlite3.Connection) -> None:
-    """Add the columns to ``messages`` if they do not already
-    exist.  The operation is idempotent.
-    """
-    columns_to_add = [
-        "category TEXT",
-        "priority TEXT",
-        "summary_phrase TEXT",
-        "description TEXT",
-        "sender_name TEXT"
-    ]
-    
-    for column_def in columns_to_add:
-        try:
-            conn.execute(f"ALTER TABLE messages ADD COLUMN {column_def}")
-            conn.commit()
-        except sqlite3.OperationalError as exc:
-            pass
-    
-
-
-def _fetch_all_messages() -> List[Dict]:
-    """Retrieve messages from inbox and sent items only (excluding trash/deleted).
-    
-    Fetches from both inbox and sentitems folders, following @odata.nextLink
-    pages until the service runs out of results.
-    """
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    all_messages: List[Dict] = []
-    
-    # Fetch from inbox
-    inbox_url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
-    while inbox_url:
-        resp = requests.get(inbox_url, headers=headers)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Graph request failed {resp.status_code}: {resp.text}")
-        data = resp.json()
-        all_messages.extend(data.get("value", []))
-        inbox_url = data.get("@odata.nextLink")
-    
-    # Fetch from sent items
-    sent_url = "https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages"
-    while sent_url:
-        resp = requests.get(sent_url, headers=headers)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Graph request failed {resp.status_code}: {resp.text}")
-        data = resp.json()
-        all_messages.extend(data.get("value", []))
-        sent_url = data.get("@odata.nextLink")
-    
-    return all_messages
-
-
-# ingestion
-
-def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quiet: bool = False) -> None:
-    """Fetch every mail message, classify it and insert into the database.
-
-    Spam messages are skipped; everything else is stored in the shared
-    ``messages`` table with a ``category`` value.
-    """
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY,
-                source TEXT,
-                thread_key TEXT,
-                display_name TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY,
-                source TEXT,
-                source_msg_key TEXT,
-                source_rowid INTEGER,
-                conversation_id INTEGER,
-                sender TEXT,
-                sender_name TEXT,
-                is_from_me INTEGER,
-                sent_at_utc TEXT,
-                text TEXT,
-                category TEXT,
-                priority TEXT,      
-                summary_phrase TEXT, 
-                description TEXT   
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS extracted_links (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                url TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS extracted_attachments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                filename TEXT,
-                mime_type TEXT,
-                original_path TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-
-        try:
-            _ensure_columns(conn)
-        except sqlite3.OperationalError:
-            pass
-        
-        # Remove all existing Outlook content from the database before re-ingesting
-        conn.execute("PRAGMA foreign_keys = ON;")
-        conn.execute("DELETE FROM extracted_links WHERE message_id IN (SELECT id FROM messages WHERE source = 'outlook')")
-        conn.execute("DELETE FROM extracted_attachments WHERE message_id IN (SELECT id FROM messages WHERE source = 'outlook')")
-        conn.execute("DELETE FROM conversations WHERE source = 'outlook'")
-        conn.execute("DELETE FROM messages WHERE source = 'outlook'")
-        conn.commit()
-        
-        if not quiet:
-            print("fetching messages from Outlook...")
-        messages = _fetch_all_messages()
-        if not quiet:
-            print(f"retrieved {len(messages)} messages")
-
-        json_items = []
-
-        for msg in messages:
-            subj = msg.get("subject", "")
-            sender = msg.get("from", {}).get("emailAddress", {}).get("address", "")
-            sender_obj = msg.get("from", {}).get("emailAddress", {})
-            sender_name = sender_obj.get("name", "Unknown")
-            body = msg.get("body", {}).get("content", "")
-            read_status = msg.get("isRead", False)
-            ai_summary = classify_message(subj, body)
-            
-            if ai_summary["category"].upper() == "SPAM":
-                continue
-            
-            if ai_summary["category"].upper() == "SPAM":
-                continue
-
-            thread_key = msg.get("conversationId") or msg.get("id")
-
-            cursor = conn.execute(
-                "INSERT INTO conversations (source, thread_key, display_name) VALUES (?, ?, ?)",
-                ("outlook", thread_key, subj)
-            )
-            conv_id = cursor.lastrowid
-
-
-            sent_at_utc = msg.get("sentDateTime") or msg.get("receivedDateTime")
-
-            rowid = int(datetime.fromisoformat(sent_at_utc.rstrip("Z")).timestamp())
-
-            new_id = f"todo_{cursor.lastrowid}"
-
-            if json_path:
-                is_automated = ai_summary["category"].upper() == "AUTOMATED"
-                raw_phrase = ai_summary["phrase"]
-                display_phrase = f"[AUTOMATED] {raw_phrase}" if is_automated else raw_phrase
-                truncated_title = (display_phrase[:57] + "...") if len(display_phrase) > 60 else display_phrase
-                json_entry = {
-                    "platform":"outlook", 
-                    "id": msg.get("id"),
-                    "title": truncated_title,
-                    "phrase": f"{display_phrase} ({sender_name})",
-                    "description": ai_summary["description"],
-                    "body": f"From {sender_name}: {ai_summary['description']}",
-                    "date": sent_at_utc[:10] if sent_at_utc else "",
-                    "timestamp": sent_at_utc,
-                    "notes": f"From: {sender_name} | Subject: {subj}",
-                    "source": "Outlook",
-                    "sourceIcon": "📧",
-                    "priority": ai_summary["priority"].upper(),
-                    "category": ai_summary["category"].upper(),
-                    "read": read_status
-                }
-                json_items.append(json_entry)
-
-            cursor = conn.execute("""
-                    INSERT INTO messages (
-                        source, source_msg_key, source_rowid, conversation_id, sender, sender_name,
-                        is_from_me, sent_at_utc, text, category, priority, summary_phrase, description
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    "outlook", 
-                    msg.get("id"), 
-                    rowid,
-                    conv_id, 
-                    sender,
-                    sender_name,
-                    0,
-                    sent_at_utc,
-                    body, 
-                    ai_summary["category"], 
-                    ai_summary["priority"], 
-                    ai_summary["phrase"], 
-                    ai_summary["description"]
-                ))
-            message_id = cursor.lastrowid
-            
-            # Extract and insert links
-            for url in extract_urls(body):
-                conn.execute(
-                    "INSERT INTO extracted_links(message_id, url) VALUES(?, ?)", 
-                    (message_id, url)
-                )
-            
-            # Extract and insert attachments
-            for attachment in msg.get("attachments", []):
-                filename = attachment.get("name", "Unknown File")
-                mime_type = attachment.get("contentType", "application/octet-stream")
-                attachment_id = attachment.get("id", "")
-                conn.execute(
-                    "INSERT INTO extracted_attachments(message_id, filename, mime_type, original_path) VALUES(?, ?, ?, ?)",
-                    (message_id, filename, mime_type, f"outlook_attachment_id:{attachment_id}")
-                )
-
-        conn.commit()
-        conn.close()
-
-        if json_path:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump({"notifications": json_items}, f, indent=2)
-
-        if not quiet:
-            print("ingestion complete")
-    except Exception as e:
-        if not quiet:
-            print(f"ingest_all error: {e}", file=sys.stderr)
-
-
-def _extract_event_from_email(
-    subject: str, body: str, email_sent_datetime: str, model: str = "gpt-4o-mini"
-) -> dict | None:
-    """Use OpenAI to detect if an email mentions a specific future event with a date/time.
-
-    ``email_sent_datetime`` should be the send date of the email (not today) so that
-    relative day-words like 'Friday' or 'next Monday' are resolved correctly relative
-    to when the email was written.
-
-    Returns a dict with keys title, start, end, location, description if an event
-    is found, or None if the email contains no clear upcoming event.
-    """
-    system = (
-        f"The email was sent on (UTC): {email_sent_datetime}\n"
-        "You are an assistant that extracts calendar-worthy event information from emails. "
-        "When resolving relative date/time words (e.g. 'Friday', 'next Monday', 'tomorrow', "
-        "'this weekend'), resolve them relative to the EMAIL SEND DATE above, NOT today's date. "
-        "If the email references a specific event that has a date and/or time "
-        "(e.g. a meeting, appointment, deadline, party, call, interview, flight, etc.), "
-        "return a JSON object with these keys:\n"
-        "  'title': short name for the event\n"
-        "  'start': ISO 8601 datetime string (or date string if time unknown)\n"
-        "  'end': ISO 8601 datetime string (empty string if unknown)\n"
-        "  'location': location string (empty string if unknown)\n"
-        "  'description': one sentence describing the event\n"
-        "If the email does NOT contain a specific event with a clear date/time "
-        "reference, return exactly: {\"event\": false}\n"
-        "Return ONLY valid JSON, no extra text."
-    )
-    user = f"Subject: {subject}\nBody: {body[:2000]}\n"
-
-    try:
-        resp = openai.ChatCompletion.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.1,
-            max_tokens=300,
+def insert_extractions(conn: sqlite3.Connection, message_id: int, text: str, sent_at_utc: str) -> None:
+    base_dt = datetime.fromisoformat(sent_at_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
+    for url in extract_urls(text):
+        conn.execute("INSERT INTO extracted_links(message_id, url) VALUES(?, ?)", (message_id, url))
+    for raw, resolved_utc, resolved_local in extract_dates(text, base_dt):
+        conn.execute(
+            "INSERT INTO extracted_dates(message_id, raw_span, parsed_at_utc, resolved_date, confidence) VALUES(?, ?, ?, ?, ?)",
+            (
+                message_id,
+                raw,
+                resolved_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
+                resolved_local.isoformat(timespec="seconds"),
+                None,
+            ),
         )
-        content = resp["choices"][0]["message"]["content"].strip()
-        clean = content.removeprefix("```json").removesuffix("```").strip()
-        parsed = json.loads(clean)
-        if parsed.get("event") is False or not parsed.get("start"):
-            return None
-        return parsed
-    except Exception as e:
-        print(f"Error extracting event from email: {e}", file=sys.stderr)
+
+
+def insert_attachment_meta(conn: sqlite3.Connection, message_id: int, filename: str, mime: str, outlook_ref: str) -> None:
+    if not is_allowed_document_attachment(filename, mime):
+        return
+    conn.execute(
+        """
+        INSERT INTO extracted_attachments(message_id, filename, mime_type, original_path)
+        VALUES(?, ?, ?, ?)
+        """,
+        (message_id, filename, mime, outlook_ref),
+    )
+
+
+def strip_html_to_text(content: str) -> str:
+    no_script = re.sub(r"<script[\\s\\S]*?</script>", " ", content or "", flags=re.I)
+    no_style = re.sub(r"<style[\\s\\S]*?</style>", " ", no_script, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", no_style)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def is_likely_spam_message(subject: str, body_preview: str, body_text: str, sender_name: str, sender_email: str) -> bool:
+    subject_l = (subject or "").lower()
+    preview_l = (body_preview or "").lower()
+    body_l = (body_text or "").lower()
+    sender_l = f"{sender_name or ''} {sender_email or ''}".lower()
+    text = f"{subject_l} {preview_l} {body_l} {sender_l}"
+
+    high_confidence_patterns = [
+        r"\blottery\b", r"\bjackpot\b", r"\byou\s+have\s+won\b", r"\bcongratulation(?:s)?\b",
+        r"\bclaim\s+your\s+prize\b", r"\bprocessing\s+fee\b", r"\bgift\s*card\b",
+        r"\bwire\s+transfer\b", r"\bbank\s+account\s+number\b", r"\bmother\s+maiden\b",
+        r"\bdriver\s+passport\b", r"\bscam\b", r"\bphishing\b", r"\bclick\s+here\s+to\s+verify\b",
+        r"\b\$\s*\d+(?:[\.,]\d+)?\s*(?:million|billion)\b", r"\b\d+(?:[\.,]\d+)?\s*(?:million|billion)\s+dollar\b",
+        r"\burgent\s*!{0,3}\b", r"\bact\s+now\b", r"\blimited\s+time\b",
+    ]
+    if any(re.search(p, text, flags=re.I) for p in high_confidence_patterns):
+        return True
+
+    suspicious_sender_patterns = [
+        r"\bnoreply@", r"\bno-reply@", r"\bmailer-daemon@", r"\bbounce@", r"\bpromo@", r"\bnotification@",
+    ]
+    if any(re.search(p, sender_l, flags=re.I) for p in suspicious_sender_patterns):
+        if re.search(r"offer|deal|sale|discount|verify|security alert|prize|won", text, flags=re.I):
+            return True
+
+    return False
+
+
+def parse_iso_to_utc_ms(value: str) -> int:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return int(dt.timestamp() * 1000)
+
+
+def token_endpoint() -> str:
+    return f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/token"
+
+
+def device_code_endpoint() -> str:
+    return f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/devicecode"
+
+
+def load_token_file(token_path: str) -> Optional[Dict]:
+    if not os.path.exists(token_path):
+        return None
+    try:
+        with open(token_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
         return None
 
 
-def ingest_calendar_items(
-    db_path: str = "extracted.db",
-    json_path: str = "data.json",
-    quiet: bool = False,
-) -> None:
-    """Populate the 'events' key in data.json AND the calendar_events table in
-    extracted.db from two sources:
+def save_token_file(token_path: str, payload: Dict) -> None:
+    with open(token_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    1. Outlook Calendar : events fetched from the Graph calendarView API.
-    2. Outlook Email    : emails scanned by OpenAI for date/time references that
-       imply a future event.
 
-    Rows are upserted by event id so re-running is safe.
-    The data.json 'notifications' key written by ingest_all() is preserved.
-    """
-    try:
-        now_utc = datetime.utcnow()
-        now_str = now_utc.strftime("%Y-%m-%d %H:%M UTC")
-        # Look up to 1 year ahead for calendar events
-        end_utc = now_utc.replace(year=now_utc.year + 1)
-        headers = {
-            "Authorization": f"Bearer {ACCESS_TOKEN}",
-            "Prefer": 'outlook.timezone="Pacific Standard Time"'
+def request_token_refresh(refresh_token: str, client_id: str) -> Dict:
+    data = {
+        "client_id": client_id,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "scope": OUTLOOK_SCOPES,
+    }
+    resp = requests.post(token_endpoint(), data=data, timeout=OUTLOOK_TIMEOUT_SECONDS)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Outlook token refresh failed: {resp.status_code} {resp.text}")
+    return resp.json()
+
+
+def request_device_code(client_id: str) -> Dict:
+    data = {"client_id": client_id, "scope": OUTLOOK_SCOPES}
+    resp = requests.post(device_code_endpoint(), data=data, timeout=OUTLOOK_TIMEOUT_SECONDS)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Outlook device code start failed: {resp.status_code} {resp.text}")
+    return resp.json()
+
+
+def poll_device_code(device_flow: Dict, client_id: str) -> Dict:
+    interval = int(device_flow.get("interval", 5))
+    expires_in = int(device_flow.get("expires_in", 900))
+    deadline = time.time() + expires_in
+
+    logger.info(device_flow.get("message") or "Open Microsoft device login URL and enter the code.")
+    verification_url = (
+        (device_flow.get("verification_uri_complete") or "").strip()
+        or (device_flow.get("verification_uri") or "").strip()
+    )
+    if verification_url:
+        try:
+            webbrowser.open(verification_url, new=2, autoraise=True)
+            logger.info(f"Opened browser for Outlook sign-in: {verification_url}")
+        except Exception as e:
+            logger.warning(f"Could not auto-open browser for Outlook sign-in: {e}")
+
+    while time.time() < deadline:
+        time.sleep(max(2, interval))
+        data = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "client_id": client_id,
+            "device_code": device_flow.get("device_code", ""),
+        }
+        resp = requests.post(token_endpoint(), data=data, timeout=OUTLOOK_TIMEOUT_SECONDS)
+        payload = resp.json()
+        if "access_token" in payload:
+            return payload
+        err = payload.get("error")
+        if err in {"authorization_pending", "slow_down"}:
+            continue
+        raise RuntimeError(f"Outlook device auth failed: {resp.status_code} {payload}")
+
+    raise TimeoutError("Outlook device login timed out")
+
+
+def get_outlook_access_token(token_path: str, force_reauth: bool = False, client_id: Optional[str] = None) -> Dict:
+    effective_client_id = resolve_outlook_client_id(client_id)
+    if not effective_client_id:
+        raise RuntimeError(
+            "Outlook auth requires a client id. Set OUTLOOK_CLIENT_ID (or AZURE_CLIENT_ID/MS_CLIENT_ID), "
+            "or pass client_id in POST /ingest."
+        )
+
+    if force_reauth and os.path.exists(token_path):
+        os.remove(token_path)
+
+    now = int(time.time())
+    token_data = load_token_file(token_path) or {}
+    access_token = token_data.get("access_token")
+    expires_at = int(token_data.get("expires_at", 0) or 0)
+    if access_token and expires_at > now + 60:
+        return token_data
+
+    refresh_token = token_data.get("refresh_token")
+    if refresh_token:
+        refreshed = request_token_refresh(refresh_token, effective_client_id)
+        refreshed["refresh_token"] = refreshed.get("refresh_token") or refresh_token
+        refreshed["expires_at"] = int(time.time()) + int(refreshed.get("expires_in", 3600))
+        save_token_file(token_path, refreshed)
+        return refreshed
+
+    flow = request_device_code(effective_client_id)
+    token_payload = poll_device_code(flow, effective_client_id)
+    token_payload["expires_at"] = int(time.time()) + int(token_payload.get("expires_in", 3600))
+    save_token_file(token_path, token_payload)
+    return token_payload
+
+
+def graph_get_json(path: str, access_token: str, params: Optional[Dict] = None) -> Dict:
+    url = f"{GRAPH_BASE}{path}"
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {access_token}"},
+        params=params,
+        timeout=OUTLOOK_TIMEOUT_SECONDS,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Graph GET failed: {resp.status_code} {resp.text}")
+    return resp.json()
+
+
+def graph_get_bytes(path: str, access_token: str) -> bytes:
+    url = f"{GRAPH_BASE}{path}"
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=OUTLOOK_TIMEOUT_SECONDS,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Graph bytes GET failed: {resp.status_code} {resp.text}")
+    return resp.content
+
+
+def fetch_outlook_profile(access_token: str) -> Dict:
+    data = graph_get_json("/me", access_token, params={"$select": "mail,userPrincipalName,displayName"})
+    return {
+        "email": data.get("mail") or data.get("userPrincipalName"),
+        "display_name": data.get("displayName") or "",
+    }
+
+
+def list_messages_since(access_token: str, after_seconds: int, max_pages: int = 8) -> List[Dict]:
+    after_dt = datetime.fromtimestamp(after_seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = {
+        "$select": "id,conversationId,receivedDateTime,sentDateTime,from,subject,bodyPreview,body,hasAttachments,internetMessageId,parentFolderId",
+        "$orderby": "receivedDateTime DESC",
+        "$filter": f"receivedDateTime ge {after_dt}",
+        "$top": "50",
+    }
+
+    def fetch_folder(folder_name: str) -> List[Dict]:
+        rows = []
+        next_url = f"{GRAPH_BASE}/me/mailFolders/{folder_name}/messages"
+        page = 0
+        while next_url and page < max_pages:
+            page += 1
+            resp = requests.get(
+                next_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params=params if page == 1 else None,
+                timeout=OUTLOOK_TIMEOUT_SECONDS,
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Graph message list failed ({folder_name}): {resp.status_code} {resp.text}")
+            data = resp.json()
+            rows.extend(data.get("value", []) or [])
+            next_url = data.get("@odata.nextLink")
+        return rows
+
+    inbox_rows = fetch_folder("inbox")
+    sent_rows = fetch_folder("sentitems")
+
+    out = []
+    seen_ids = set()
+    for msg in [*inbox_rows, *sent_rows]:
+        message_id = (msg.get("id") or "").strip()
+        if not message_id or message_id in seen_ids:
+            continue
+        seen_ids.add(message_id)
+        out.append(msg)
+
+    return out
+
+
+def list_message_attachments(access_token: str, message_id: str) -> List[Tuple[str, str, str]]:
+    data = graph_get_json(
+        f"/me/messages/{message_id}/attachments",
+        access_token,
+        params={"$select": "id,name,contentType,isInline"},
+    )
+    out = []
+    for att in data.get("value", []) or []:
+        if att.get("isInline"):
+            continue
+        att_id = (att.get("id") or "").strip()
+        name = (att.get("name") or "").strip()
+        content_type = (att.get("contentType") or "application/octet-stream").strip()
+        if not att_id or not name:
+            continue
+        out.append((name, content_type, att_id))
+    return out
+
+
+def ingest_outlook(
+    out_db_path: str,
+    source: str = "outlook",
+    reset_cursor_flag: bool = False,
+    force_reauth: bool = False,
+    token_path: str = "token_outlook.json",
+    account_key: Optional[str] = None,
+    client_id: Optional[str] = None,
+) -> Dict[str, int]:
+    conn = open_sqlite_rw(out_db_path)
+
+    token_data = get_outlook_access_token(token_path=token_path, force_reauth=force_reauth, client_id=client_id)
+    access_token = token_data.get("access_token", "")
+    if not access_token:
+        raise RuntimeError("Outlook auth succeeded but access_token is missing")
+
+    profile = fetch_outlook_profile(access_token)
+    account_email = profile.get("email")
+
+    if reset_cursor_flag:
+        reset_cursor(conn, source)
+        conn.commit()
+
+    last_ms = get_last_cursor(conn, source)
+    last_dt = datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc) if last_ms else datetime(1970, 1, 1, tzinfo=timezone.utc)
+    safety_lookback_seconds = 3 * 24 * 60 * 60
+    after_seconds = max(0, int(last_dt.timestamp()) - safety_lookback_seconds)
+
+    messages = list_messages_since(access_token, after_seconds=after_seconds)
+    if not messages:
+        conn.close()
+        return {
+            "processed": 0,
+            "inserted": 0,
+            "account_email": account_email,
+            "after_seconds": after_seconds,
         }
 
-        # ------------------------------------------------------------------
-        # Set up / migrate extracted.db
-        # ------------------------------------------------------------------
-        conn = sqlite3.connect(db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS calendar_events (
-                id          TEXT PRIMARY KEY,
-                source      TEXT,
-                title       TEXT,
-                start_utc   TEXT,
-                end_utc     TEXT,
-                date        TEXT,
-                location    TEXT,
-                organizer   TEXT,
-                attendees   TEXT,
-                is_all_day  INTEGER DEFAULT 0,
-                description TEXT,
-                email_subject TEXT,
-                email_date  TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS extracted_dates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id TEXT,
-                raw_span TEXT,
-                resolved_date TEXT,
-                parsed_at_utc TEXT
-            )
-        """)
-        conn.commit()
-        
-        # Remove all existing Outlook calendar/email events before re-ingesting
-        conn.execute("DELETE FROM calendar_events WHERE source IN ('outlook_calendar', 'outlook_email')")
-        conn.execute("DELETE FROM extracted_dates WHERE message_id LIKE 'outlook_cal_%'")
-        conn.commit()
+    max_internal_ms_seen = last_ms
+    inserted_count = 0
 
-        json_events: List[Dict] = []
-
-        calendar_url = (
-            "https://graph.microsoft.com/v1.0/me/calendarView"
-            f"?startDateTime={now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-            f"&endDateTime={end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-            "&$orderby=start/dateTime"
-            "&$top=100"
-        )
-
-        calendar_events: List[Dict] = []
-        while calendar_url:
-            resp = requests.get(calendar_url, headers=headers)
-            if resp.status_code != 200:
-                if not quiet:
-                    print(
-                        f"Calendar API failed {resp.status_code}: {resp.text}",
-                        file=sys.stderr,
-                    )
-                break
-            data = resp.json()
-            calendar_events.extend(data.get("value", []))
-            calendar_url = data.get("@odata.nextLink")
-
-        if not quiet:
-            print(f"retrieved {len(calendar_events)} calendar events")
-
-        for event in calendar_events:
-            subject = event.get("subject", "No Title")
-            start = event.get("start", {}).get("dateTime", "")
-            end = event.get("end", {}).get("dateTime", "")
-            location = event.get("location", {}).get("displayName", "")
-            organizer = (
-                event.get("organizer", {})
-                .get("emailAddress", {})
-                .get("name", "")
-            )
-            is_all_day = event.get("isAllDay", False)
-            body_preview = event.get("bodyPreview", "")
-            attendees = [
-                a.get("emailAddress", {}).get("name", "")
-                for a in event.get("attendees", [])
-            ]
-
-            json_events.append(
-                {
-                    "platform": "outlook_calendar",
-                    "id": event.get("id", ""),
-                    "title": subject,
-                    "start": start,
-                    "end": end,
-                    "date": start[:10] if start else "",
-                    "location": location,
-                    "organizer": organizer,
-                    "attendees": attendees,
-                    "isAllDay": is_all_day,
-                    "description": body_preview,
-                    "source": "Outlook Calendar",
-                    "sourceIcon": "📅",
-                }
-            )
-            conn.execute("""
-                INSERT OR REPLACE INTO calendar_events
-                    (id, source, title, start_utc, end_utc, date, location,
-                     organizer, attendees, is_all_day, description, email_subject, email_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                event.get("id", ""),
-                "outlook_calendar",
-                subject,
-                start,
-                end,
-                start[:10] if start else "",
-                location,
-                organizer,
-                json.dumps(attendees),
-                1 if is_all_day else 0,
-                body_preview,
-                None,
-                None,
-            ))
-            
-            # also insert into extracted_dates for the UI summary endpoint
-            conn.execute("""
-                INSERT INTO extracted_dates (message_id, raw_span, resolved_date, parsed_at_utc)
-                VALUES (?, ?, ?, ?)
-            """, (
-                f"outlook_cal_{event.get('id', '')}",
-                subject,
-                start,
-                start
-            ))
-
-        # ------------------------------------------------------------------
-        # pt 2: I want to scan emails for event mentions using OpenAI + current time
-        # ------------------------------------------------------------------
-        if not quiet:
-            print("scanning emails for event mentions...")
-
-        try:
-            email_messages = _fetch_all_messages()
-        except Exception as fetch_err:
-            email_messages = []
-            if not quiet:
-                print(
-                    f"could not fetch emails for event extraction: {fetch_err}",
-                    file=sys.stderr,
-                )
-
-        for msg in email_messages:
-            subj = msg.get("subject", "")
-            body = msg.get("body", {}).get("content", "")
-            sender_obj = msg.get("from", {}).get("emailAddress", {})
-            sender_name = sender_obj.get("name", "Unknown")
-            sent_at = msg.get("sentDateTime") or msg.get("receivedDateTime", "")
-
-            # Resolve relative date words ("Friday", "tomorrow") against the
-            # email's own send date, not the current wall-clock time.
-            email_sent_str = (
-                sent_at[:16].replace("T", " ") + " UTC" if sent_at else now_str
-            )
-            extracted = _extract_event_from_email(subj, body, email_sent_str)
-            if extracted:
-                ev_start = extracted.get("start", "")
-                ev_end = extracted.get("end", "")
-                json_events.append(
-                    {
-                        "platform": "outlook_email",
-                        "id": msg.get("id", ""),
-                        "title": extracted.get("title", subj),
-                        "start": ev_start,
-                        "end": ev_end,
-                        "date": (ev_start or "")[:10],
-                        "location": extracted.get("location", ""),
-                        "organizer": sender_name,
-                        "attendees": [],
-                        "isAllDay": False,
-                        "description": extracted.get("description", ""),
-                        "source": "Outlook Email",
-                        "sourceIcon": "📧",
-                        "emailSubject": subj,
-                        "emailDate": sent_at[:10] if sent_at else "",
-                    }
-                )
-                conn.execute("""
-                    INSERT OR REPLACE INTO calendar_events
-                        (id, source, title, start_utc, end_utc, date, location,
-                         organizer, attendees, is_all_day, description, email_subject, email_date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    msg.get("id", ""),
-                    "outlook_email",
-                    extracted.get("title", subj),
-                    ev_start,
-                    ev_end,
-                    (ev_start or "")[:10],
-                    extracted.get("location", ""),
-                    sender_name,
-                    json.dumps([]),
-                    0,
-                    extracted.get("description", ""),
-                    subj,
-                    sent_at[:10] if sent_at else "",
-                ))
-
-                conn.execute("""
-                    INSERT INTO extracted_dates (message_id, raw_span, resolved_date, parsed_at_utc)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    msg.get("id", ""),
-                    extracted.get("title", subj),
-                    (ev_start or "")[:10],
-                    ev_start
-                ))
-
-        if not quiet:
-            print(
-                f"event extraction complete: {len(json_events)} events total "
-                f"({len(calendar_events)} from calendar, "
-                f"{len(json_events) - len(calendar_events)} from emails)"
-            )
-
-        conn.commit()
-        conn.close()
-
-        # Part 3 – Merge into data.json under the 'events' key
-        if json_path:
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                existing = {}
-
-            existing["events"] = json_events
-
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=2)
-
-    except Exception as e:
-        if not quiet:
-            print(f"ingest_calendar_items error: {e}", file=sys.stderr)
-
-
-
-
-
-
-
-
-def generate_people_profiles(db_path: str = "extracted.db", json_path: str = "data.json", quiet: bool = False) -> None:
-    """Generate person profiles from messages and calendar events.
-    
-    For each unique person (identified by email from senders, organizers, and attendees),
-    creates a summary with their interaction history and upcoming events.
-    Writes to both extracted.db (people table) and data.json (people key).
-    """
     try:
-        conn = sqlite3.connect(db_path)
-        
-        # Add sender_name column if it doesn't exist
-        try:
-            conn.execute("ALTER TABLE messages ADD COLUMN sender_name TEXT")
+        if conn.in_transaction:
             conn.commit()
-        except sqlite3.OperationalError:
-            pass
-        
-        # Create people table
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS people (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT UNIQUE NOT NULL,
-                name TEXT,
-                summary TEXT,
-                notification_count INTEGER DEFAULT 0,
-                event_count INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now'))
+        conn.execute("BEGIN")
+
+        for msg in messages:
+            received = (msg.get("receivedDateTime") or "").strip()
+            if not received:
+                continue
+
+            internal_ms = parse_iso_to_utc_ms(received)
+            max_internal_ms_seen = max(max_internal_ms_seen, internal_ms)
+
+            from_obj = (msg.get("from") or {}).get("emailAddress") or {}
+            sender_name = (from_obj.get("name") or "").strip()
+            sender_email = (from_obj.get("address") or "").strip()
+            sender = f"{sender_name} <{sender_email}>" if sender_name and sender_email else sender_email or sender_name
+
+            subject = (msg.get("subject") or "").strip()
+            body_preview = (msg.get("bodyPreview") or "").strip()
+            body_obj = msg.get("body") or {}
+            body_content = strip_html_to_text(body_obj.get("content") or "")
+            body_text = body_content or body_preview
+
+            if is_likely_spam_message(subject, body_preview, body_text, sender_name, sender_email):
+                continue
+
+            combined = (f"Subject: {subject}\n" if subject else "") + body_text
+            if not combined.strip():
+                continue
+
+            thread_key = (msg.get("conversationId") or msg.get("id") or "").strip()
+            source_msg_key = (msg.get("id") or "").strip()
+            if not source_msg_key:
+                continue
+
+            sent_at_utc = datetime.fromtimestamp(internal_ms / 1000, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+            conv_id = upsert_conversation(conn, source, thread_key, display_name=subject)
+            msg_id_db = insert_message(
+                conn,
+                source=source,
+                source_msg_key=source_msg_key,
+                source_rowid=internal_ms,
+                conversation_id=conv_id,
+                sender=sender,
+                sender_name=sender_name or sender_email or sender,
+                account_key=normalize_user_key(account_key),
+                account_email=account_email,
+                sent_at_utc=sent_at_utc,
+                text=combined,
             )
-        """)
+            if msg_id_db is None:
+                continue
+
+            inserted_count += 1
+            insert_extractions(conn, msg_id_db, combined, sent_at_utc)
+
+            if msg.get("hasAttachments"):
+                for filename, mime, attachment_id in list_message_attachments(access_token, source_msg_key):
+                    reference = f"outlook_attachment_id:{source_msg_key}:{attachment_id}"
+                    insert_attachment_meta(conn, msg_id_db, filename, mime, reference)
+
+        set_last_cursor(conn, source, max_internal_ms_seen)
         conn.commit()
-        
-        # Extract unique people and merge by name/email match
-        raw_people = []  # list of (email, name) tuples
-        
-        # From message senders (prefer sender_name over email)
-        cursor = conn.execute("""
-            SELECT DISTINCT sender, sender_name FROM messages 
-            WHERE sender IS NOT NULL AND sender != ''
-        """)
-        for sender, sender_name in cursor.fetchall():
-            if sender:
-                name = sender_name if sender_name and sender_name != "Unknown" else sender
-                raw_people.append((sender, name))
-        
-        # From calendar organizers
-        cursor = conn.execute("""
-            SELECT DISTINCT organizer FROM calendar_events
-            WHERE organizer IS NOT NULL AND organizer != ''
-        """)
-        for (organizer,) in cursor.fetchall():
-            if organizer:
-                raw_people.append((organizer, organizer))
-        
-        # Merge people with matching email or name
-        people_map = {}  # canonical_email -> canonical_name
-        email_to_canonical = {}  # maps any email to canonical email
-        name_to_canonical = {}  # maps any name to canonical email (for dedup by name)
-        
-        for email, name in raw_people:
-            # Check if this email or name already maps to a person
-            canonical_email = email_to_canonical.get(email) or name_to_canonical.get(name)
-            
-            if canonical_email:
-                # Merge with existing person
-                if name and name != "Unknown" and (name_to_canonical.get(name) is None):
-                    name_to_canonical[name] = canonical_email
-                if email not in email_to_canonical:
-                    email_to_canonical[email] = canonical_email
-            else:
-                # New person
-                canonical_email = email
-                email_to_canonical[email] = canonical_email
-                if name and name != "Unknown":
-                    name_to_canonical[name] = canonical_email
-                people_map[canonical_email] = name if name and name != "Unknown" else email
-        
-        # Build per-person notification and event lists
-        people_data = {email: {"notifications": [], "events": []} for email in people_map}
-        
-        # Gather notifications per person using canonical emails
-        cursor = conn.execute("""
-            SELECT sender, category, priority, summary_phrase, description, sent_at_utc
-            FROM messages
-            WHERE sender IS NOT NULL AND sender != ''
-            ORDER BY sent_at_utc DESC
-        """)
-        for sender, category, priority, phrase, description, sent_at in cursor.fetchall():
-            canonical = email_to_canonical.get(sender)
-            if canonical and canonical in people_data:
-                people_data[canonical]["notifications"].append({
-                    "category": category,
-                    "priority": priority,
-                    "phrase": phrase,
-                    "description": description,
-                    "date": sent_at[:10] if sent_at else ""
-                })
-        
-        # Gather events per person using canonical emails
-        cursor = conn.execute("""
-            SELECT organizer, title, start_utc, location, description
-            FROM calendar_events
-            WHERE organizer IS NOT NULL AND organizer != ''
-            ORDER BY start_utc DESC
-        """)
-        for organizer, title, start_utc, location, description in cursor.fetchall():
-            canonical = name_to_canonical.get(organizer) or email_to_canonical.get(organizer)
-            if canonical and canonical in people_data:
-                people_data[canonical]["events"].append({
-                    "title": title,
-                    "date": start_utc[:10] if start_utc else "",
-                    "location": location,
-                    "description": description
-                })
-        
-        # Clear existing people entries
-        conn.execute("DELETE FROM people")
-        conn.commit()
-        
-        json_people = []
-        
-        for email, name in people_map.items():
-            notifications = people_data[email]["notifications"]
-            events = people_data[email]["events"]
-            
-            # Generate summary from notifications if available
-            if notifications:
-                summary_items = [n.get("phrase", n.get("category", "Interaction")) for n in notifications[:3]]
-                summary = f"Communicated about: {', '.join(summary_items)}"
-            else:
-                summary = f"Calendar contact"
-            
-            # Insert into database
-            conn.execute("""
-                INSERT INTO people (email, name, summary, notification_count, event_count)
-                VALUES (?, ?, ?, ?, ?)
-            """, (email, name, summary, len(notifications), len(events)))
-            
-            # Prepare JSON entry
-            json_people.append({
-                "email": email,
-                "name": name,
-                "summary": summary,
-                "notificationCount": len(notifications),
-                "eventCount": len(events),
-                "recentNotifications": notifications[:5],
-                "recentEvents": events[:5]
-            })
-        
-        conn.commit()
+        return {
+            "processed": len(messages),
+            "inserted": inserted_count,
+            "account_email": account_email,
+            "after_seconds": after_seconds,
+        }
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
         conn.close()
-        
-        # Write to data.json
-        if json_path:
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                existing = {}
-            
-            existing["people"] = json_people
-            
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=2)
-        
-        if not quiet:
-            print(f"generated profiles for {len(json_people)} people")
-    
-    except Exception as e:
-        if not quiet:
-            print(f"generate_people_profiles error: {e}", file=sys.stderr)
 
 
-def outlook_ingest(
-    access_token: str | None = None,
-    db_path: str = "extracted.db",
-    json_path: str = "data.json",
-    quiet: bool = False,
-) -> None:
-    """Run full Outlook ingestion (messages, calendar/event extraction, people).
+def get_db_summary(db_path: str, account_key: Optional[str] = None) -> Dict[str, Optional[str]]:
+    conn = open_sqlite_rw(db_path)
+    try:
+        norm_key = normalize_user_key(account_key)
+        if norm_key:
+            messages = conn.execute("SELECT COUNT(*) AS c FROM messages WHERE source='outlook' AND account_key = ?", (norm_key,)).fetchone()["c"]
+            dates = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM extracted_dates d
+                JOIN messages m ON m.id = d.message_id
+                WHERE m.source='outlook' AND m.account_key = ?
+                """,
+                (norm_key,),
+            ).fetchone()["c"]
+            links = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM extracted_links l
+                JOIN messages m ON m.id = l.message_id
+                WHERE m.source='outlook' AND m.account_key = ?
+                """,
+                (norm_key,),
+            ).fetchone()["c"]
+            attachments = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM extracted_attachments a
+                JOIN messages m ON m.id = a.message_id
+                WHERE m.source='outlook' AND m.account_key = ?
+                """,
+                (norm_key,),
+            ).fetchone()["c"]
+            latest_row = conn.execute(
+                "SELECT sent_at_utc FROM messages WHERE source='outlook' AND account_key = ? ORDER BY source_rowid DESC LIMIT 1",
+                (norm_key,),
+            ).fetchone()
+        else:
+            messages = conn.execute("SELECT COUNT(*) AS c FROM messages WHERE source='outlook'").fetchone()["c"]
+            dates = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM extracted_dates d
+                JOIN messages m ON m.id = d.message_id
+                WHERE m.source='outlook'
+                """
+            ).fetchone()["c"]
+            links = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM extracted_links l
+                JOIN messages m ON m.id = l.message_id
+                WHERE m.source='outlook'
+                """
+            ).fetchone()["c"]
+            attachments = conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM extracted_attachments a
+                JOIN messages m ON m.id = a.message_id
+                WHERE m.source='outlook'
+                """
+            ).fetchone()["c"]
+            latest_row = conn.execute(
+                "SELECT sent_at_utc FROM messages WHERE source='outlook' ORDER BY source_rowid DESC LIMIT 1"
+            ).fetchone()
 
-    Pass `access_token` from mobile_gmail/App.js sign-in to avoid personal refresh
-    tokens. If `access_token` is omitted, falls back to environment/refresh flow.
-    """
-    global ACCESS_TOKEN
+        latest_sent_at = latest_row["sent_at_utc"] if latest_row else None
+        return {
+            "messages": int(messages),
+            "dates": int(dates),
+            "links": int(links),
+            "attachments": int(attachments),
+            "latest_sent_at": latest_sent_at,
+        }
+    finally:
+        conn.close()
 
-    ACCESS_TOKEN = resolve_access_token(access_token)
-    if not ACCESS_TOKEN:
-        raise RuntimeError(
-            "No Outlook access token available. Pass access_token from mobile_gmail/App.js sign-in "
-            "or set OUTLOOK_ACCESS_TOKEN."
+
+def fetch_db_snapshot(db_path: str, limit: int = 20, account_key: Optional[str] = None) -> Dict[str, List[Dict]]:
+    conn = open_sqlite_rw(db_path)
+    try:
+        norm_key = normalize_user_key(account_key)
+        if norm_key:
+            msgs = conn.execute(
+                """
+                SELECT id, sender, sender_name, sent_at_utc, text, substr(text, 1, 200) AS snippet
+                FROM messages
+                WHERE source='outlook' AND account_key = ?
+                ORDER BY source_rowid DESC
+                LIMIT ?
+                """,
+                (norm_key, limit),
+            ).fetchall()
+            dates = conn.execute(
+                """
+                SELECT d.id, d.message_id, d.raw_span, d.resolved_date, d.parsed_at_utc
+                FROM extracted_dates d
+                JOIN messages m ON m.id = d.message_id
+                WHERE m.source='outlook' AND m.account_key = ?
+                ORDER BY d.id DESC
+                LIMIT ?
+                """,
+                (norm_key, limit),
+            ).fetchall()
+            links = conn.execute(
+                """
+                SELECT l.id, l.message_id, l.url, m.sender_name, m.sender, m.text
+                FROM extracted_links l
+                JOIN messages m ON m.id = l.message_id
+                WHERE m.source='outlook' AND m.account_key = ?
+                ORDER BY l.id DESC
+                LIMIT ?
+                """,
+                (norm_key, limit),
+            ).fetchall()
+            attachments = conn.execute(
+                """
+                SELECT a.id, a.message_id, a.filename, a.mime_type, a.original_path
+                FROM extracted_attachments a
+                JOIN messages m ON m.id = a.message_id
+                WHERE m.source='outlook' AND m.account_key = ?
+                ORDER BY a.id DESC
+                LIMIT ?
+                """,
+                (norm_key, limit),
+            ).fetchall()
+        else:
+            msgs = conn.execute(
+                """
+                SELECT id, sender, sender_name, sent_at_utc, text, substr(text, 1, 200) AS snippet
+                FROM messages
+                WHERE source='outlook'
+                ORDER BY source_rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            dates = conn.execute(
+                """
+                SELECT d.id, d.message_id, d.raw_span, d.resolved_date, d.parsed_at_utc
+                FROM extracted_dates d
+                JOIN messages m ON m.id = d.message_id
+                WHERE m.source='outlook'
+                ORDER BY d.id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            links = conn.execute(
+                """
+                SELECT l.id, l.message_id, l.url, m.sender_name, m.sender, m.text
+                FROM extracted_links l
+                JOIN messages m ON m.id = l.message_id
+                WHERE m.source='outlook'
+                ORDER BY l.id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            attachments = conn.execute(
+                """
+                SELECT a.id, a.message_id, a.filename, a.mime_type, a.original_path
+                FROM extracted_attachments a
+                JOIN messages m ON m.id = a.message_id
+                WHERE m.source='outlook'
+                ORDER BY a.id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        def rows_to_dict(rows):
+            return [dict(r) for r in rows]
+
+        def derive_subject(text_val: Optional[str]) -> Optional[str]:
+            if not text_val:
+                return None
+            prefix = "Subject: "
+            idx = text_val.find(prefix)
+            if idx != -1:
+                rest = text_val[idx + len(prefix):]
+                first_line = rest.splitlines()[0].strip()
+                return first_line or None
+            for line in text_val.splitlines():
+                line = line.strip()
+                if line:
+                    return line
+            return None
+
+        msg_dicts = rows_to_dict(msgs)
+        for m in msg_dicts:
+            m["subject"] = derive_subject(m.get("text"))
+
+        link_dicts = rows_to_dict(links)
+        for l in link_dicts:
+            l["subject"] = derive_subject(l.get("text"))
+            l.pop("text", None)
+
+        attachment_dicts = [
+            a for a in rows_to_dict(attachments)
+            if is_allowed_document_attachment(a.get("filename"), a.get("mime_type"))
+        ]
+
+        return {
+            "messages": msg_dicts,
+            "dates": rows_to_dict(dates),
+            "links": link_dicts,
+            "attachments": attachment_dicts,
+        }
+    finally:
+        conn.close()
+
+
+@app.route("/ingest", methods=["POST"])
+def ingest():
+    try:
+        payload = request.json or {}
+        user_key = payload.get("user_key")
+        client_id = (payload.get("client_id") or "").strip() or None
+        db_path_payload = payload.get("db_path")
+        token_path, db_path = resolve_user_paths(user_key=user_key, db_path=db_path_payload)
+
+        reset_flag = bool(payload.get("reset_cursor"))
+        force_reauth_flag = bool(payload.get("force_reauth"))
+
+        stats = ingest_outlook(
+            db_path,
+            reset_cursor_flag=reset_flag,
+            force_reauth=force_reauth_flag,
+            token_path=token_path,
+            account_key=user_key,
+            client_id=client_id,
         )
+        summary = get_db_summary(db_path, account_key=user_key)
+        return jsonify({"status": "success", "message": "Outlook emails ingested successfully.", "ingest": stats, "summary": summary})
+    except Exception as e:
+        logger.error(f"Error during Outlook ingestion: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-    ingest_all(db_path=db_path, json_path=json_path, quiet=quiet)
-    ingest_calendar_items(db_path=db_path, json_path=json_path, quiet=quiet)
-    generate_people_profiles(db_path=db_path, json_path=json_path, quiet=quiet)
+
+@app.route("/summary", methods=["GET"])
+def summary():
+    try:
+        user_key = request.args.get("user_key")
+        db_path_raw = request.args.get("db_path")
+        _, db_path = resolve_user_paths(user_key=user_key, db_path=db_path_raw)
+        limit_raw = request.args.get("limit", "20")
+        try:
+            limit = max(1, min(500, int(limit_raw)))
+        except ValueError:
+            limit = 20
+        snap = fetch_db_snapshot(db_path, limit=limit, account_key=user_key)
+        stats = get_db_summary(db_path, account_key=user_key)
+        return jsonify({"status": "success", "summary": stats, "data": snap})
+    except Exception as e:
+        logger.error(f"Error during summary fetch: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/lookup_message", methods=["GET"])
+def lookup_message():
+    try:
+        user_key = normalize_user_key(request.args.get("user_key"))
+        db_path_raw = request.args.get("db_path")
+        _, db_path = resolve_user_paths(user_key=user_key, db_path=db_path_raw)
+        q = (request.args.get("q") or "").strip()
+        if not q:
+            return jsonify({"status": "error", "message": "Query parameter q is required."}), 400
+
+        conn = open_sqlite_rw(db_path)
+        try:
+            if user_key:
+                rows = conn.execute(
+                    """
+                    SELECT id, sender, sent_at_utc, substr(text, 1, 300) AS snippet
+                    FROM messages
+                    WHERE source='outlook' AND account_key = ? AND text LIKE ?
+                    ORDER BY source_rowid DESC
+                    LIMIT 50
+                    """,
+                    (user_key, f"%{q}%"),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, sender, sent_at_utc, substr(text, 1, 300) AS snippet
+                    FROM messages
+                    WHERE source='outlook' AND text LIKE ?
+                    ORDER BY source_rowid DESC
+                    LIMIT 50
+                    """,
+                    (f"%{q}%",),
+                ).fetchall()
+
+            out = []
+            for r in rows:
+                dates = conn.execute(
+                    """
+                    SELECT id, raw_span, resolved_date, parsed_at_utc
+                    FROM extracted_dates
+                    WHERE message_id = ?
+                    ORDER BY id DESC
+                    """,
+                    (r["id"],),
+                ).fetchall()
+                out.append({"message": dict(r), "dates": [dict(d) for d in dates]})
+            return jsonify({"status": "success", "count": len(out), "results": out})
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error during lookup_message: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/attachment_preview", methods=["GET"])
+def attachment_preview():
+    try:
+        attachment_id_raw = (request.args.get("attachment_id") or "").strip()
+        if not attachment_id_raw:
+            return jsonify({"status": "error", "message": "attachment_id is required"}), 400
+
+        try:
+            attachment_id = int(attachment_id_raw)
+        except ValueError:
+            return jsonify({"status": "error", "message": "attachment_id must be an integer"}), 400
+
+        user_key = normalize_user_key(request.args.get("user_key"))
+        client_id = (request.args.get("client_id") or "").strip() or None
+        db_path_raw = request.args.get("db_path")
+        _, db_path = resolve_user_paths(user_key=user_key, db_path=db_path_raw)
+
+        conn = open_sqlite_rw(db_path)
+        try:
+            if user_key:
+                row = conn.execute(
+                    """
+                    SELECT a.filename, a.mime_type, a.original_path
+                    FROM extracted_attachments a
+                    JOIN messages m ON m.id = a.message_id
+                    WHERE a.id = ? AND m.source='outlook' AND m.account_key = ?
+                    LIMIT 1
+                    """,
+                    (attachment_id, user_key),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT a.filename, a.mime_type, a.original_path
+                    FROM extracted_attachments a
+                    JOIN messages m ON m.id = a.message_id
+                    WHERE a.id = ? AND m.source='outlook'
+                    LIMIT 1
+                    """,
+                    (attachment_id,),
+                ).fetchone()
+        finally:
+            conn.close()
+
+        if not row:
+            return jsonify({"status": "error", "message": "Attachment not found"}), 404
+
+        original_path = (row["original_path"] or "").strip()
+        prefix = "outlook_attachment_id:"
+        if not original_path.startswith(prefix):
+            return jsonify({"status": "error", "message": "Attachment preview source is unsupported"}), 400
+
+        rest = original_path[len(prefix):]
+        parts = rest.split(":", 1)
+        if len(parts) != 2:
+            return jsonify({"status": "error", "message": "Invalid Outlook attachment reference"}), 400
+
+        message_id, outlook_attachment_id = parts[0], parts[1]
+        token_path, _ = resolve_user_paths(user_key=user_key, db_path=db_path_raw)
+        token_data = get_outlook_access_token(token_path=token_path, force_reauth=False, client_id=client_id)
+        access_token = token_data.get("access_token", "")
+        if not access_token:
+            return jsonify({"status": "error", "message": "Missing Outlook access token"}), 500
+
+        blob = graph_get_bytes(f"/me/messages/{message_id}/attachments/{outlook_attachment_id}/$value", access_token)
+        mime_type = row["mime_type"] or "application/octet-stream"
+        filename = (row["filename"] or "attachment").replace('"', "")
+        headers = {"Content-Disposition": f"inline; filename=\"{filename}\""}
+        return Response(blob, mimetype=mime_type, headers=headers)
+    except Exception as e:
+        logger.error(f"Error during attachment preview fetch: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/routes", methods=["GET"])
+def routes():
+    rows = []
+    for rule in app.url_map.iter_rules():
+        methods = sorted([m for m in rule.methods if m not in {"HEAD", "OPTIONS"}])
+        rows.append({"rule": str(rule), "methods": methods, "endpoint": rule.endpoint})
+    rows.sort(key=lambda x: x["rule"])
+    return jsonify({"status": "success", "routes": rows})
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--token", help="Microsoft access token to use")
-    parser.add_argument("--quiet", action="store_true", help="suppress log output, only emit JSON")
-    args = parser.parse_args()
-
-    try:
-        outlook_ingest(access_token=args.token, quiet=args.quiet)
-        # notifications is a list of actionable to-dos (already written to data.json by filter_emails)
-        #print(f"Summary from OpenAI: {notifications}", file=sys.stderr)
-        # Print notifications as JSON for frontend/Node.js
-        #print(json.dumps({"notifications": notifications}))
-    except Exception as e:
-        print(f"error: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc(file=sys.stderr)
-        print(json.dumps({"notifications": []}))
+    app.run(host="0.0.0.0", port=int(os.environ.get("OUTLOOK_INGEST_PORT", "5002")), debug=False)
