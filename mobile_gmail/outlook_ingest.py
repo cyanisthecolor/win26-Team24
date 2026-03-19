@@ -16,7 +16,6 @@ from dateparser.search import search_dates
 from flask import Flask, Response, jsonify, request
 
 
-from mobile_gmail.outlook_manager import API_KEY 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
@@ -485,80 +484,6 @@ def graph_get_bytes(path: str, access_token: str) -> bytes:
         raise RuntimeError(f"Graph bytes GET failed: {resp.status_code} {resp.text}")
     return resp.content
 
-            cursor = conn.execute(
-                "INSERT INTO conversations (source, thread_key, display_name) VALUES (?, ?, ?)",
-                ("outlook", thread_key, subj)
-            )
-            conv_id = cursor.lastrowid
-
-
-            sent_at_utc = msg.get("sentDateTime") or msg.get("receivedDateTime")
-
-            rowid = int(datetime.fromisoformat(sent_at_utc.rstrip("Z")).timestamp())
-
-            new_id = f"todo_{cursor.lastrowid}"
-
-            if json_path:
-                is_automated = ai_summary["category"].upper() == "AUTOMATED"
-                raw_phrase = ai_summary["phrase"]
-                display_phrase = f"[AUTOMATED] {raw_phrase}" if is_automated else raw_phrase
-                truncated_title = (display_phrase[:57] + "...") if len(display_phrase) > 60 else display_phrase
-                json_entry = {
-                    "platform":"outlook", 
-                    "id": msg.get("id"),
-                    "title": truncated_title,
-                    "phrase": f"{display_phrase} ({sender_name})",
-                    "description": ai_summary["description"],
-                    "body": f"From {sender_name}: {ai_summary['description']}",
-                    "date": sent_at_utc[:10] if sent_at_utc else "",
-                    "timestamp": sent_at_utc,
-                    "notes": f"From: {sender_name} | Subject: {subj}",
-                    "source": "Outlook",
-                    "sourceIcon": "📧",
-                    "priority": ai_summary["priority"].upper(),
-                    "category": ai_summary["category"].upper(),
-                    "read": read_status
-                }
-                json_items.append(json_entry)
-
-            cursor = conn.execute("""
-                    INSERT INTO messages (
-                        source, source_msg_key, source_rowid, conversation_id, sender, sender_name,
-                        is_from_me, sent_at_utc, text, category, priority, summary_phrase, description, account_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'outlook_user')
-                """, (
-                    "outlook", 
-                    msg.get("id"), 
-                    rowid,
-                    conv_id, 
-                    sender,
-                    sender_name,
-                    0,
-                    sent_at_utc,
-                    body, 
-                    ai_summary["category"], 
-                    ai_summary["priority"], 
-                    ai_summary["phrase"], 
-                    ai_summary["description"]
-                ))
-            message_id = cursor.lastrowid
-            
-            # Extract and insert links
-            for url in extract_urls(body):
-                conn.execute(
-                    "INSERT INTO extracted_links(message_id, url) VALUES(?, ?)", 
-                    (message_id, url)
-                )
-            
-            # Extract and insert attachments
-            for attachment in msg.get("attachments", []):
-                filename = attachment.get("name", "Unknown File")
-                mime_type = attachment.get("contentType", "application/octet-stream")
-                attachment_id = attachment.get("id", "")
-                conn.execute(
-                    "INSERT INTO extracted_attachments(message_id, filename, mime_type, original_path) VALUES(?, ?, ?, ?)",
-                    (message_id, filename, mime_type, f"outlook_attachment_id:{attachment_id}")
-                )
 
 def fetch_outlook_profile(access_token: str) -> Dict:
     data = graph_get_json("/me", access_token, params={"$select": "mail,userPrincipalName,displayName"})
