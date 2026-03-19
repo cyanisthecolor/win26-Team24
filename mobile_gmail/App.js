@@ -484,6 +484,16 @@ function DoneScreen({ connectedCount, contactCount }) {
 
 // ─── Dashboard: Notifications Tab ─────────────────────────────────────────────
 function NotificationsTab({ notifications, setNotifications, ingestMessages = [], ingestDates = [], isDeleted, onMoveToJunk }) {
+  const [sortMode, setSortMode] = useState('time'); // 'time' | 'priority'
+  const PRIORITY_ORDER = { high: 0, medium: 1, low: 2 };
+
+  function sortItems(items) {
+    if (sortMode === 'priority') {
+      return [...items].sort((a, b) => (PRIORITY_ORDER[a.priority] ?? 3) - (PRIORITY_ORDER[b.priority] ?? 3));
+    }
+    return [...items].sort((a, b) => b.timestamp - a.timestamp);
+  }
+
   const notifs = notifications;
   const [selectedMessage, setSelectedMessage] = useState(null);
   const [replySuggestions, setReplySuggestions] = useState([]);
@@ -532,14 +542,16 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
       }));
   }, [notifs, isDeleted]);
 
-  const unreadApp = appInbox.filter(n => !n.read);
-  const readApp = appInbox.filter(n => n.read);
-  const unreadGmail = inboxFromEmail.filter(n => !gmailReadMap[n.readKey]);
-  const readGmail = inboxFromEmail.filter(n => !!gmailReadMap[n.readKey]);
+  const unreadApp = sortItems(appInbox.filter(n => !n.read));
+  const readApp = sortItems(appInbox.filter(n => n.read));
+  const unreadGmail = sortItems(inboxFromEmail.filter(n => !gmailReadMap[n.readKey]));
+  const readGmail = sortItems(inboxFromEmail.filter(n => !!gmailReadMap[n.readKey]));
   const unreadCount = unreadApp.length + unreadGmail.length;
   const totalCount = appInbox.length + inboxFromEmail.length;
 
   function markRead(id) { setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n)); }
+  function markUnread(id) { setNotifications(p => p.map(n => n.id === id ? { ...n, read: false } : n)); }
+  function markGmailUnread(readKey) { setGmailReadMap(prev => { const next = { ...prev }; delete next[readKey]; return next; }); }
   function markAll() {
     setNotifications(p => p.map(n => ({ ...n, read: true })));
     setGmailReadMap(prev => {
@@ -559,7 +571,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
       setGmailReadMap(prev => ({ ...prev, [readKey]: true }));
     }
 
-    setSelectedMessage(message);
+    setSelectedMessage({ ...message, readKey });
     setReplySuggestions([]);
     setSuggestionsError('');
     setIsLoadingSuggestions(true);
@@ -596,15 +608,18 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
             <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
               <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
               {!n.read && <View style={s.unreadDot} />}
+              {n.read && (
+                <TouchableOpacity onPress={() => markUnread(n.id)} style={{ marginLeft: 8 }}>
+                  <Text style={{ fontSize: 10, color: C.accent, fontWeight: '700' }}>MARK UNREAD</Text>
+                </TouchableOpacity>
+              )}
               <TouchableOpacity onPress={() => onMoveToJunk({ key: `notif-${n.id}`, from: 'Inbox', title: n.title, subtitle: n.body, timestamp: n.timestamp })}>
                 <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
               </TouchableOpacity>
             </View>
             <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }} numberOfLines={2}>{n.body}</Text>
-            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>
-              <View style={[s.badge, { backgroundColor: priorityBg(n.priority) }]}>
-                <Text style={[s.badgeText, { color: priorityColor(n.priority) }]}>{n.priority.toUpperCase()}</Text>
-              </View>
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, gap: 6 }}>
+              <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: priorityColor(n.priority) }} />
               <Text style={{ fontSize: 11, color: C.textMuted }}>{n.source} · {timeAgo(n.timestamp)}</Text>
             </View>
           </View>
@@ -620,11 +635,27 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
           <Text style={s.dashTitle}>Notifications</Text>
           <Text style={s.dashSubtitle}>{unreadCount} unread · {totalCount} total</Text>
         </View>
-        {unreadCount > 0 && (
-          <TouchableOpacity onPress={markAll} style={s.markAllBtn}>
-            <Text style={{ fontSize: 12, color: C.textSecondary, fontWeight: '600' }}>Mark all read</Text>
-          </TouchableOpacity>
-        )}
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <View style={{ flexDirection: 'row', backgroundColor: C.surfaceAlt, borderRadius: 10, borderWidth: 1, borderColor: C.border, overflow: 'hidden' }}>
+            <TouchableOpacity
+              onPress={() => setSortMode('time')}
+              style={{ paddingVertical: 6, paddingHorizontal: 10, backgroundColor: sortMode === 'time' ? C.accent : 'transparent' }}
+            >
+              <Text style={{ fontSize: 11, fontWeight: '700', color: sortMode === 'time' ? '#fff' : C.textMuted }}>⏱ Time</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => setSortMode('priority')}
+              style={{ paddingVertical: 6, paddingHorizontal: 10, backgroundColor: sortMode === 'priority' ? C.accent : 'transparent' }}
+            >
+              <Text style={{ fontSize: 11, fontWeight: '700', color: sortMode === 'priority' ? '#fff' : C.textMuted }}>🔺 Priority</Text>
+            </TouchableOpacity>
+          </View>
+          {unreadCount > 0 && (
+            <TouchableOpacity onPress={markAll} style={s.markAllBtn}>
+              <Text style={{ fontSize: 12, color: C.textSecondary, fontWeight: '600' }}>Mark all read</Text>
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
 
       {(unreadApp.length > 0 || unreadGmail.length > 0) && <>
@@ -686,6 +717,9 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
               <View style={{ flex: 1 }}>
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                   <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
+                  <TouchableOpacity onPress={() => markGmailUnread(n.readKey)} style={{ marginLeft: 8 }}>
+                    <Text style={{ fontSize: 10, color: C.accent, fontWeight: '700' }}>MARK UNREAD</Text>
+                  </TouchableOpacity>
                   <TouchableOpacity onPress={() => onMoveToJunk({ key: n.junkKey, from: 'Inbox', title: n.title, subtitle: n.body, timestamp: n.timestamp })}>
                     <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
                   </TouchableOpacity>
@@ -699,15 +733,31 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
       </>}
 
       <Modal visible={!!selectedMessage} transparent animationType="slide" onRequestClose={() => setSelectedMessage(null)}>
-        <View style={s.modalOverlay}>
+        
+        <TouchableOpacity style={s.modalOverlay} activeOpacity={1} onPress={() => setSelectedMessage(null)}>
+
           <View style={s.modalSheet}>
             {selectedMessage && <>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
-                <Text style={s.modalTitle}>{selectedMessage.title}</Text>
+             <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <Text style={s.modalTitle}>{selectedMessage.title}</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                <TouchableOpacity
+                  onPress={() => {
+                    if (selectedMessage.readKey?.startsWith('notif-')) {
+                      markUnread(selectedMessage.readKey.replace('notif-', ''));
+                    } else if (selectedMessage.readKey) {
+                      markGmailUnread(selectedMessage.readKey);
+                    }
+                    setSelectedMessage(null);
+                  }}
+                >
+                  <Text style={{ fontSize: 11, color: C.accent, fontWeight: '700' }}>MARK UNREAD</Text>
+                </TouchableOpacity>
                 <TouchableOpacity onPress={() => setSelectedMessage(null)}>
                   <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
                 </TouchableOpacity>
               </View>
+            </View>
               <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>
                 {selectedMessage.source} · {timeAgo(selectedMessage.timestamp)}
               </Text>
@@ -717,7 +767,14 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
                 </Text>
               </View>
 
-              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>AI SUGGESTED REPLIES</Text>
+              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 12 }}>AI SUGGESTED REPLIES</Text>
+
+              {replySuggestions.map((reply, idx) => (
+                <TouchableOpacity key={`${idx}-${reply}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <Text style={{ color: C.textPrimary, fontSize: 13, lineHeight: 19, flex: 1 }}>{reply}</Text>
+                  <Text style={{ color: C.textMuted, fontSize: 12, marginLeft: 8 }}>›</Text>
+                </TouchableOpacity>
+              ))}
               {isLoadingSuggestions && (
                 <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>Generating suggestions...</Text>
               )}
@@ -727,14 +784,9 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
               {!isLoadingSuggestions && !suggestionsError && replySuggestions.length === 0 && (
                 <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>No suggestions available.</Text>
               )}
-              {replySuggestions.map((reply, idx) => (
-                <TouchableOpacity key={`${idx}-${reply}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8 }}>
-                  <Text style={{ color: C.textPrimary, fontSize: 13, lineHeight: 19 }}>{reply}</Text>
-                </TouchableOpacity>
-              ))}
             </>}
           </View>
-        </View>
+        </TouchableOpacity>
       </Modal>
     </ScrollView>
   );
@@ -897,43 +949,43 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
         </View>
       )}
 
-      <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
-        <View style={s.modalOverlay}>
-          <View style={s.modalSheet}>
-            {selected && <>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
-                <Text style={s.modalTitle}>{selected.title}</Text>
-                <TouchableOpacity onPress={() => setSelected(null)} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-                  <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
-                </TouchableOpacity>
-              </View>
-              {[
-                ['🕐', `${selected.time}${selected.duration ? ` · ${selected.duration}` : ''}`],
-                ['📅', formatDate(selected.date)],
-                [selected.sourceIcon, selected.source],
-                selected.attendees.length > 0 ? ['👥', selected.attendees.join(', ')] : null,
-              ].filter(Boolean).map(([icon, text]) => (
-                <View key={text} style={s.modalRow}>
-                  <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>{icon}</Text>
-                  <Text style={{ fontSize: 14, color: C.textSecondary, flex: 1 }}>{text}</Text>
-                </View>
-              ))}
-              {selected.videoLink && (
-                <View style={[s.modalRow, { backgroundColor: C.accentSoft, borderRadius: 10, padding: 10, marginTop: 4 }]}>
-                  <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>🔗</Text>
-                  <Text style={{ fontSize: 13, color: C.accent, flex: 1 }} numberOfLines={1}>{selected.videoLink}</Text>
-                </View>
-              )}
-              {selected.notes && (
-                <View style={{ marginTop: 16, backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12 }}>
-                  <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 4 }}>NOTES</Text>
-                  <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>{selected.notes}</Text>
-                </View>
-              )}
-            </>}
+ <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
+    <TouchableOpacity style={s.modalOverlay} activeOpacity={1} onPress={() => setSelected(null)}>
+      <TouchableOpacity activeOpacity={1} onPress={() => {}} style={s.modalSheet}>
+        {selected && <>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
+            <Text style={s.modalTitle}>{selected.title}</Text>
+            <TouchableOpacity onPress={() => setSelected(null)} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+              <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
+            </TouchableOpacity>
           </View>
-        </View>
-      </Modal>
+          {[
+            ['🕐', `${selected.time}${selected.duration ? ` · ${selected.duration}` : ''}`],
+            ['📅', formatDate(selected.date)],
+            [selected.sourceIcon, selected.source],
+            selected.attendees.length > 0 ? ['👥', selected.attendees.join(', ')] : null,
+          ].filter(Boolean).map(([icon, text]) => (
+            <View key={text} style={s.modalRow}>
+              <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>{icon}</Text>
+              <Text style={{ fontSize: 14, color: C.textSecondary, flex: 1 }}>{text}</Text>
+            </View>
+          ))}
+          {selected.videoLink && (
+            <View style={[s.modalRow, { backgroundColor: C.accentSoft, borderRadius: 10, padding: 10, marginTop: 4 }]}>
+              <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>🔗</Text>
+              <Text style={{ fontSize: 13, color: C.accent, flex: 1 }} numberOfLines={1}>{selected.videoLink}</Text>
+            </View>
+          )}
+          {selected.notes && (
+            <View style={{ marginTop: 16, backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12 }}>
+              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 4 }}>NOTES</Text>
+              <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>{selected.notes}</Text>
+            </View>
+          )}
+        </>}
+      </TouchableOpacity>
+    </TouchableOpacity>
+  </Modal>
     </ScrollView>
   );
 }
@@ -1235,7 +1287,7 @@ const TABS = [
   { key: 'notifications', label: 'Inbox', icon: '🔔' },
   { key: 'threads', label: 'Threads', icon: '🧵' },
   { key: 'calendar', label: 'Calendar', icon: '📅' },
-  { key: 'todo', label: 'Links & Attachments', icon: '📌' },
+  { key: 'todo', label: 'Files', icon: '📌' },
   { key: 'junk', label: 'Junk', icon: '🗑️' },
 ];
 
