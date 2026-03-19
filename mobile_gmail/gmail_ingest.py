@@ -5,6 +5,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.request
 from email.mime.text import MIMEText
@@ -18,6 +19,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from flask import Flask, request, jsonify, Response
 import logging
 
@@ -25,6 +27,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",  # create/update events
 ]
 
 URL_RE = re.compile(
@@ -67,6 +70,12 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
+
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        return Response(status=204)
 
 AUTO_INGEST_INTERVAL_SECONDS = int(os.environ.get("AUTO_INGEST_INTERVAL_SECONDS", "60"))
 
@@ -1428,6 +1437,160 @@ def ingest():
                 "Delete the token file (token.json or token_<your-email>.json in the backend folder) and sign in again when the app asks."
             )
         return jsonify({"status": "error", "message": msg}), 500
+
+
+@app.route('/add_calendar_event', methods=['POST'])
+def add_calendar_event():
+    """Add a manual calendar event to the DB (same shape as ingested calendar events)."""
+    try:
+        payload = request.json or {}
+        user_key = (payload.get('user_key') or '').strip()
+        if not user_key:
+            return jsonify({"status": "error", "message": "user_key is required"}), 400
+        title = (payload.get('title') or '').strip() or "New event"
+        date_str = (payload.get('date') or '').strip()  # YYYY-MM-DD
+        time_str = (payload.get('time') or '').strip()  # optional HH:MM or HH:MM AM/PM
+        description = (payload.get('description') or '').strip()
+        sync_to_google = payload.get('sync_to_google', False) in (True, 'true', '1')
+
+        if not date_str:
+            return jsonify({"status": "error", "message": "date is required (YYYY-MM-DD)"}), 400
+
+        _, db_path = resolve_user_paths(user_key=user_key, db_path=None)
+        norm_key = normalize_user_key(user_key)
+        if not norm_key:
+            return jsonify({"status": "error", "message": "Invalid user_key"}), 400
+
+        # Parse date (YYYY-MM-DD) and optional time (HH:MM or H:MM)
+        try:
+            parts = date_str.split("-")
+            if len(parts) != 3:
+                raise ValueError("date must be YYYY-MM-DD")
+            year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+            dt = datetime(year, month, day, 12, 0, 0, tzinfo=timezone.utc)
+            if time_str:
+                time_str = time_str.strip().upper()
+                if "AM" in time_str or "PM" in time_str:
+                    from dateparser import parse as dateparser_parse
+                    parsed = dateparser_parse(f"{date_str} {time_str}", settings={"TIMEZONE": "UTC", "RETURN_AS_TIMEZONE_AWARE": True})
+                    if parsed:
+                        dt = parsed
+                else:
+                    tparts = time_str.replace(":", " ").split()
+                    if len(tparts) >= 2:
+                        h, m = int(tparts[0]), int(tparts[1]) if len(tparts) > 1 else 0
+                        dt = datetime(year, month, day, h, m, 0, tzinfo=timezone.utc)
+        except (ValueError, TypeError, IndexError):
+            return jsonify({"status": "error", "message": "Invalid date or time (use YYYY-MM-DD and optional HH:MM)"}), 400
+
+        start_utc_rfc = datetime_to_rfc3339_utc(dt)
+        source_msg_key = f"manual-{uuid.uuid4().hex[:12]}"
+        source_rowid = int(dt.timestamp() * 1000)
+
+        conn = open_sqlite_rw(db_path)
+        try:
+            conv_id = upsert_conversation(
+                conn,
+                source="calendar",
+                thread_key=source_msg_key,
+                display_name=title,
+            )
+            text = f"Subject: {title}\n"
+            if description:
+                text += f"\n{description.strip()}\n"
+            text += f"\nStart: {start_utc_rfc}\n"
+            inserted_msg_id = insert_message(
+                conn,
+                source="calendar",
+                source_msg_key=source_msg_key,
+                source_rowid=source_rowid,
+                conversation_id=conv_id,
+                sender=None,
+                sender_name=None,
+                account_key=norm_key,
+                account_email=norm_key,
+                sent_at_utc=start_utc_rfc,
+                text=text,
+            )
+            if inserted_msg_id is None:
+                row = conn.execute(
+                    "SELECT id FROM messages WHERE source=? AND source_msg_key=?",
+                    ("calendar", source_msg_key),
+                ).fetchone()
+                inserted_msg_id = int(row["id"]) if row else None
+            if inserted_msg_id is None:
+                conn.rollback()
+                return jsonify({"status": "error", "message": "Failed to insert message"}), 500
+            conn.execute("DELETE FROM extracted_dates WHERE message_id = ?", (inserted_msg_id,))
+            conn.execute(
+                """
+                INSERT INTO extracted_dates(message_id, raw_span, parsed_at_utc, resolved_date, confidence)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (inserted_msg_id, title, start_utc_rfc, start_utc_rfc, 1.0),
+            )
+            conn.commit()
+            logger.info(f"Added calendar event: title={title!r} date={date_str} user_key={norm_key} sync_to_google={sync_to_google}")
+
+            # Optionally create the event in Google Calendar
+            google_event_id = None
+            if sync_to_google:
+                try:
+                    token_path, _ = resolve_user_paths(user_key=user_key, db_path=None)
+                    cal_service = calendar_auth(token_path=token_path)
+                    has_time = bool(time_str)
+                    if has_time:
+                        end_dt = dt + timedelta(hours=1)
+                        end_utc_rfc = datetime_to_rfc3339_utc(end_dt)
+                        event_body = {
+                            "summary": title,
+                            "description": description or None,
+                            "start": {"dateTime": start_utc_rfc, "timeZone": "UTC"},
+                            "end": {"dateTime": end_utc_rfc, "timeZone": "UTC"},
+                        }
+                    else:
+                        date_only = dt.strftime("%Y-%m-%d")
+                        end_date = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+                        event_body = {
+                            "summary": title,
+                            "description": description or None,
+                            "start": {"date": date_only},
+                            "end": {"date": end_date},
+                        }
+                    created = cal_service.events().insert(calendarId="primary", body=event_body).execute()
+                    google_event_id = created.get("id")
+                    logger.info(f"Created Google Calendar event: id={google_event_id}")
+                except HttpError as cal_err:
+                    err_content = (cal_err.content or b"").decode("utf-8", errors="replace")
+                    logger.error(f"Failed to add event to Google Calendar: {cal_err.resp.status} {err_content}")
+                    if cal_err.resp.status == 403 or "insufficient" in err_content.lower() or "scope" in err_content.lower() or "permission" in err_content.lower():
+                        msg = (
+                            "Your sign-in doesn’t have permission to add events to Google Calendar. "
+                            "Delete your token file (token.json or token_<your-email>.json in the backend folder), "
+                            "then open the app again and sign in when prompted to grant calendar access."
+                        )
+                    else:
+                        msg = f"Event saved locally but Google Calendar failed: {cal_err!s}"
+                    return jsonify({"status": "error", "message": msg}), 500
+                except Exception as cal_err:
+                    logger.error(f"Failed to add event to Google Calendar: {cal_err}")
+                    return jsonify({
+                        "status": "error",
+                        "message": f"Event saved locally but Google Calendar failed: {cal_err!s}",
+                    }), 500
+
+            return jsonify({
+                "status": "success",
+                "message": "Event added" + (" and added to Google Calendar" if google_event_id else ""),
+                "event_id": inserted_msg_id,
+                "start_utc": start_utc_rfc,
+                "google_event_id": google_event_id,
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error adding calendar event: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route('/summary', methods=['GET'])

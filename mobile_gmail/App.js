@@ -926,13 +926,21 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
 }
 
 // ─── Dashboard: Calendar Tab ──────────────────────────────────────────────────
-function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveToJunk }) {
+function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveToJunk, userKeys = {}, onRefresh }) {
   const [selected, setSelected] = useState(null);
   const [selectedDay, setSelectedDay] = useState(null);
   const [monthCursor, setMonthCursor] = useState(() => {
     const now = new Date();
     return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   });
+  const [addEventVisible, setAddEventVisible] = useState(false);
+  const [addTitle, setAddTitle] = useState('');
+  const [addDate, setAddDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [addTime, setAddTime] = useState('');
+  const [addDescription, setAddDescription] = useState('');
+  const [addToGoogleCalendar, setAddToGoogleCalendar] = useState(true);
+  const [addEventSaving, setAddEventSaving] = useState(false);
+  const [addEventError, setAddEventError] = useState('');
 
   const msgById = React.useMemo(() => {
     const m = {};
@@ -1020,6 +1028,53 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
     setSelectedDay(null);
   }
 
+  const handleAddEvent = async () => {
+    const userKey = (userKeys?.gmail || userKeys?.calendar || '').trim().toLowerCase();
+    if (!userKey) {
+      setAddEventError('Connect a Google account in setup to add events.');
+      return;
+    }
+    if (!addTitle.trim()) {
+      setAddEventError('Title is required.');
+      return;
+    }
+    setAddEventSaving(true);
+    setAddEventError('');
+    try {
+      const res = await fetch(`${getBaseUrl()}/add_calendar_event`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_key: userKey,
+          title: addTitle.trim(),
+          date: addDate,
+          time: addTime.trim() || undefined,
+          description: addDescription.trim() || undefined,
+          sync_to_google: addToGoogleCalendar,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const errMsg = data?.message || `Failed (${res.status})`;
+        setAddEventError(errMsg);
+        Alert.alert('Could not add event', errMsg);
+        return;
+      }
+      setAddEventVisible(false);
+      setAddTitle('');
+      setAddTime('');
+      setAddDescription('');
+      setAddDate(new Date().toISOString().slice(0, 10));
+      if (typeof onRefresh === 'function') onRefresh();
+      const successMsg = data?.google_event_id ? 'Event added to the app and to Google Calendar.' : 'Event added to your calendar.';
+      Alert.alert('Added', successMsg);
+    } catch (e) {
+      setAddEventError(e?.message || 'Request failed');
+    } finally {
+      setAddEventSaving(false);
+    }
+  };
+
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 32, paddingTop: 8 }}>
       <View style={s.dashHeader}>
@@ -1028,6 +1083,9 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
           <Text style={s.dashSubtitle}>{ingestEvents.length} events from extracted dates</Text>
         </View>
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+          <TouchableOpacity onPress={() => { setAddEventError(''); setAddEventVisible(true); }} style={{ backgroundColor: C.accent, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10 }}>
+            <Text style={{ color: '#fff', fontWeight: '700', fontSize: 13 }}>+ Add event</Text>
+          </TouchableOpacity>
           <TouchableOpacity onPress={prevMonth}><Text style={{ color: C.textSecondary, fontSize: 20 }}>‹</Text></TouchableOpacity>
           <Text style={{ color: C.textPrimary, fontWeight: '700', fontSize: 14, minWidth: 120, textAlign: 'center' }}>{monthTitle}</Text>
           <TouchableOpacity onPress={nextMonth}><Text style={{ color: C.textSecondary, fontSize: 20 }}>›</Text></TouchableOpacity>
@@ -1123,6 +1181,75 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
       </TouchableOpacity>
     </TouchableOpacity>
   </Modal>
+
+      <Modal visible={addEventVisible} transparent animationType="slide" onRequestClose={() => setAddEventVisible(false)}>
+        <View style={s.modalOverlay}>
+          <TouchableWithoutFeedback onPress={() => setAddEventVisible(false)}>
+            <View style={{ flex: 1 }} />
+          </TouchableWithoutFeedback>
+          <View style={s.modalSheet}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <Text style={s.modalTitle}>Add event</Text>
+              <TouchableOpacity onPress={() => setAddEventVisible(false)} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+                <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>Title</Text>
+            <TextInput
+              style={[s.textInput, { marginBottom: 12 }]}
+              placeholder="Event title"
+              placeholderTextColor={C.textMuted}
+              value={addTitle}
+              onChangeText={setAddTitle}
+            />
+            <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>Date (YYYY-MM-DD)</Text>
+            <TextInput
+              style={[s.textInput, { marginBottom: 12 }]}
+              placeholder="2025-03-20"
+              placeholderTextColor={C.textMuted}
+              value={addDate}
+              onChangeText={setAddDate}
+            />
+            <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>Time (optional, e.g. 14:30 or 2:30 PM)</Text>
+            <TextInput
+              style={[s.textInput, { marginBottom: 12 }]}
+              placeholder="14:30"
+              placeholderTextColor={C.textMuted}
+              value={addTime}
+              onChangeText={setAddTime}
+            />
+            <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>Description (optional)</Text>
+            <TextInput
+              style={[s.textInput, { minHeight: 60, textAlignVertical: 'top', marginBottom: 12 }]}
+              placeholder="Notes..."
+              placeholderTextColor={C.textMuted}
+              multiline
+              value={addDescription}
+              onChangeText={setAddDescription}
+            />
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 16 }}>
+              <Switch value={addToGoogleCalendar} onValueChange={setAddToGoogleCalendar} trackColor={{ false: C.border, true: C.accentSoft }} thumbColor={addToGoogleCalendar ? C.accent : C.textMuted} />
+              <Text style={{ fontSize: 14, color: C.textPrimary, marginLeft: 10 }}>Add to Google Calendar</Text>
+            </View>
+            {!!addEventError && <Text style={{ color: C.red, fontSize: 12, marginBottom: 8 }}>{addEventError}</Text>}
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <TouchableOpacity
+                style={{ flex: 1, backgroundColor: C.accent, borderRadius: 10, paddingVertical: 12, alignItems: 'center' }}
+                onPress={handleAddEvent}
+                disabled={addEventSaving}
+              >
+                <Text style={{ color: '#fff', fontWeight: '700', fontSize: 14 }}>{addEventSaving ? 'Adding…' : 'Add event'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={{ paddingVertical: 12, paddingHorizontal: 16, justifyContent: 'center' }}
+                onPress={() => setAddEventVisible(false)}
+              >
+                <Text style={{ color: C.textMuted, fontSize: 14, fontWeight: '600' }}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 }
@@ -1428,7 +1555,7 @@ const TABS = [
   { key: 'junk', label: 'Junk', icon: '🗑️' },
 ];
 
-function Dashboard({ ingestData, onBackToSetup, userKeys = { gmail: '', outlook: '' } }) {
+function Dashboard({ ingestData, onBackToSetup, userKeys = { gmail: '', outlook: '', calendar: '' }, onRefreshCalendar }) {
   const [notifItems, setNotifItems] = useState(DATA.notifications.map(n => ({ ...n, read: false })));
   const [deletedMap, setDeletedMap] = useState({});
   const [deletedItems, setDeletedItems] = useState([]);
@@ -1465,7 +1592,7 @@ function Dashboard({ ingestData, onBackToSetup, userKeys = { gmail: '', outlook:
           />
         )}
         {tab === 'threads' && <ThreadsTab ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
-        {tab === 'calendar' && <CalendarTab ingestDates={ingestData.dates} ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
+        {tab === 'calendar' && <CalendarTab ingestDates={ingestData.dates} ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} userKeys={userKeys} onRefresh={onRefreshCalendar} />}
         {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} userKeys={userKeys} />}
         {tab === 'junk' && <JunkTab deletedItems={deletedItems} />}
       </View>
@@ -1762,7 +1889,8 @@ export default function App() {
       <Dashboard
         ingestData={ingestData}
         onBackToSetup={() => setDone(false)}
-        userKeys={{ gmail: normalizedGmailUserKey, outlook: normalizedOutlookUserKey }}
+        userKeys={{ gmail: normalizedGmailUserKey, outlook: normalizedOutlookUserKey, calendar: normalizedCalendarUserKey || normalizedGmailUserKey }}
+        onRefreshCalendar={loadSummary}
       />
     </SafeAreaProvider>
   );
