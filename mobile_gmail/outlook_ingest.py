@@ -9,7 +9,7 @@ import re
 from datetime import datetime
 from typing import Dict, List
 
-from outlook_manager import API_KEY 
+from mobile_gmail.outlook_manager import API_KEY 
 
 CLIENT_ID = "fde8d6d4-cb6f-4ad5-862f-0ab740a0bec8"
 CLIENT_SECRET = "gux8Q~2BYmIH_mqOHS8fh-s6fUqh~CYsNHMnebJg"
@@ -308,8 +308,8 @@ def ingest_all(db_path: str = "extracted.db", json_path: str = "data.json", quie
             cursor = conn.execute("""
                     INSERT INTO messages (
                         source, source_msg_key, source_rowid, conversation_id, sender, sender_name,
-                        is_from_me, sent_at_utc, text, category, priority, summary_phrase, description
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        is_from_me, sent_at_utc, text, category, priority, summary_phrase, description, account_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'outlook_user')
                 """, (
                     "outlook", 
                     msg.get("id"), 

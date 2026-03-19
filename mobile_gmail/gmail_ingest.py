@@ -338,6 +338,8 @@ def insert_attachment_meta(conn: sqlite3.Connection, message_id: int, filename: 
         (message_id, filename, mime, f"gmail_attachment_id:{attachment_id}"),
     )
 
+def normalize_user_key(k):
+    return k.strip().lower() if k else None
 
 def is_allowed_document_attachment(filename: Optional[str], mime_type: Optional[str]) -> bool:
     lower_mime = (mime_type or "").strip().lower()
@@ -360,8 +362,8 @@ def get_db_summary(db_path: str, account_key: Optional[str] = None) -> Dict[str,
                 """
                 SELECT COUNT(*) AS c
                 FROM extracted_dates d
-                JOIN messages m ON m.id = d.message_id
-                WHERE m.account_key = ?
+                LEFT JOIN messages m ON CAST(m.id AS TEXT) = d.message_id OR m.source_msg_key = d.message_id
+                WHERE m.account_key = ? OR d.message_id LIKE 'outlook_cal_%'
                 """,
                 (norm_key,),
             ).fetchone()["c"]
@@ -435,27 +437,18 @@ def get_db_summary(db_path: str, account_key: Optional[str] = None) -> Dict[str,
 def fetch_db_snapshot(db_path: str, limit: int = 20, account_key: Optional[str] = None) -> Dict[str, List[Dict]]:
     """Return recent rows from messages, extracted_dates, extracted_links, and attachments."""
     conn = open_sqlite_rw(db_path)
+    norm_key = normalize_user_key(account_key)
     try:
-        msgs = conn.execute(
-            """
-            SELECT m.id, m.sender, m.sent_at_utc, substr(m.text, 1, 200) AS snippet,
-                   c.thread_key AS thread_id, m.source_msg_key AS gmail_message_id,
-                   m.source, m.category, m.priority, m.summary_phrase, m.description
-            FROM messages m
-            LEFT JOIN conversations c ON m.conversation_id = c.id
-            ORDER BY m.source_rowid DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-
         if norm_key:
             msgs = conn.execute(
                 """
-                SELECT id, sender, sender_name, sent_at_utc, text, substr(text, 1, 200) AS snippet
-                FROM messages
-                WHERE account_key = ?
-                ORDER BY source_rowid DESC
+                SELECT m.id, m.sender, m.sent_at_utc, substr(m.text, 1, 200) AS snippet,
+                       c.thread_key AS thread_id, m.source_msg_key AS gmail_message_id,
+                       m.source, m.category, m.priority, m.summary_phrase, m.description
+                FROM messages m
+                LEFT JOIN conversations c ON m.conversation_id = c.id
+                WHERE m.account_key = ?
+                ORDER BY m.source_rowid DESC
                 LIMIT ?
                 """,
                 (norm_key, limit),
@@ -487,8 +480,8 @@ def fetch_db_snapshot(db_path: str, limit: int = 20, account_key: Optional[str] 
                 """
                 SELECT d.id, d.message_id, d.raw_span, d.resolved_date, d.parsed_at_utc
                 FROM extracted_dates d
-                JOIN messages m ON m.id = d.message_id
-                WHERE m.account_key = ?
+                LEFT JOIN messages m ON CAST(m.id AS TEXT) = d.message_id OR m.source_msg_key = d.message_id
+                WHERE m.account_key = ? OR d.message_id LIKE 'outlook_cal_%'
                 ORDER BY d.id DESC
                 LIMIT ?
                 """,
@@ -938,7 +931,7 @@ def ingest_gmail(out_db_path: str, source: str = "gmail", user_id: str = "me") -
         conn.close()
 
 
-def start_auto_ingest_worker(db_path: str = "extracted.db", interval_seconds: int = AUTO_INGEST_INTERVAL_SECONDS) -> None:
+def start_auto_ingest_worker(db_path: str = "extracted.db", interval_seconds: int = 300) -> None:
     def _worker() -> None:
         while True:
             try:
@@ -1130,6 +1123,10 @@ def ingest_calendar_events(out_db_path: str, source: str = "gcal") -> Dict[str, 
         conn.close()
 
 
+class Person(TypedDict):
+    email: str
+    optional: NotRequired[bool]
+
 class Event(TypedDict):
     start: datetime
     end: datetime
@@ -1137,10 +1134,6 @@ class Event(TypedDict):
     description: str
     location: NotRequired[str]
     attendees: NotRequired[list[Person]]
-
-class Person(TypedDict):
-    email: str
-    optional: NotRequired[bool]
 
 def make_event(calendar, calendarId: str, event: Event):
     return calendar.events().insert(
@@ -1605,7 +1598,7 @@ def summary():
     try:
         user_key = request.args.get('user_key')
         db_path_raw = request.args.get('db_path')
-        _, db_path = resolve_user_paths(user_key=user_key, db_path=db_path_raw)
+        db_path = db_path_raw or "extracted.db"
         limit_raw = request.args.get('limit', '20')
         try:
             limit = max(1, min(500, int(limit_raw)))

@@ -790,10 +790,24 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
 
       const msg = msgById[d.message_id];
       if (msg && isDeleted(`${msg.source || 'gmail'}-${msg.id}`)) return null;
-      const isOutlook = msg?.source === 'outlook';
-      const title = isOutlook ? (msg?.summary_phrase || msg?.subject || 'Event') : ((msg?.subject && msg.subject.trim()) || (msg?.snippet && msg.snippet.trim()) || (d.raw_span && d.raw_span.trim()) || 'Event');
-      const rawNote = d.raw_span && d.raw_span.trim();
-      const note = isOutlook ? (msg?.description || msg?.snippet || rawNote) : ((msg?.snippet && msg.snippet.trim()) || rawNote || `From message ${d.message_id}`);
+      
+      const isOutlookCalEvent = typeof d.message_id === 'string' && d.message_id.startsWith('outlook_cal_');
+      const isOutlook = isOutlookCalEvent || (msg?.source === 'outlook');
+      
+      let title = 'Event';
+      let note = '';
+      
+      if (isOutlookCalEvent) {
+        title = d.raw_span || 'Calendar Event';
+        note = 'From Outlook Calendar';
+      } else if (isOutlook) {
+        title = msg?.summary_phrase || msg?.subject || 'Event';
+        note = msg?.description || msg?.snippet || (d.raw_span && d.raw_span.trim());
+      } else {
+        title = (msg?.subject && msg.subject.trim()) || (msg?.snippet && msg.snippet.trim()) || (d.raw_span && d.raw_span.trim()) || 'Event';
+        const rawNote = d.raw_span && d.raw_span.trim();
+        note = (msg?.snippet && msg.snippet.trim()) || rawNote || `From message ${d.message_id}`;
+      }
 
       return {
         id: `ing-${d.id}`,
@@ -803,8 +817,8 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
         time: timeStr,
         duration: null,
         attendees: [],
-        source: isOutlook ? 'Outlook' : 'Gmail',
-        sourceIcon: isOutlook ? '📨' : '✉️',
+        source: isOutlookCalEvent ? 'Outlook Calendar' : (isOutlook ? 'Outlook Email' : 'Gmail'),
+        sourceIcon: isOutlookCalEvent ? '📅' : (isOutlook ? '📨' : '✉️'),
         videoLink: null,
         notes: note,
       };
@@ -1487,8 +1501,10 @@ export default function App() {
       await loadSummary(gmailAccount);
       setDone(true);
     } catch (error) {
-      Alert.alert('Connect failed', error?.message || 'Unable to connect selected Gmail account.');
+      Alert.alert('Connect failed', error?.message || 'Unable to connect selected Gmail account. Continuing to dashboard anyway.');
       console.error(error);
+      await loadSummary(gmailAccount);
+      setDone(true);
     } finally {
       setIsConnectingAccounts(false);
     }
