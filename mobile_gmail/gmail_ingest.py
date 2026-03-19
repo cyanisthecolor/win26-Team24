@@ -66,6 +66,7 @@ app = Flask(__name__)
 
 @app.after_request
 def add_cors_headers(response):
+    """Handle add cors headers."""
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
@@ -81,6 +82,7 @@ AUTO_INGEST_INTERVAL_SECONDS = int(os.environ.get("AUTO_INGEST_INTERVAL_SECONDS"
 
 
 def normalize_user_key(user_key: Optional[str]) -> Optional[str]:
+    """Handle normalize user key."""
     raw = (user_key or "").strip().lower()
     if not raw:
         return None
@@ -90,6 +92,7 @@ def normalize_user_key(user_key: Optional[str]) -> Optional[str]:
 
 
 def resolve_user_paths(user_key: Optional[str], db_path: Optional[str] = None) -> Tuple[str, str]:
+    """Resolve user paths."""
     normalized = normalize_user_key(user_key)
     if normalized:
         token_path = f"token_{normalized}.json"
@@ -124,6 +127,7 @@ def parse_iso_datetime_to_utc(value: Optional[str]) -> Optional[datetime]:
 
 
 def fallback_reply_suggestions(subject: str, body: str) -> List[str]:
+    """Handle fallback reply suggestions."""
     text = f"{subject} {body}".lower()
     if any(k in text for k in ["verify", "security", "password", "login", "sign-in"]):
         return [
@@ -145,6 +149,7 @@ def fallback_reply_suggestions(subject: str, body: str) -> List[str]:
 
 
 def ai_reply_suggestions(subject: str, body: str, sender_name: str = "") -> List[str]:
+    """Handle ai reply suggestions."""
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return fallback_reply_suggestions(subject, body)
@@ -199,6 +204,7 @@ def ai_reply_suggestions(subject: str, body: str, sender_name: str = "") -> List
 
 # Modify the `looks_like_real_date` function to ensure valid spans like "tomorrow" and "Feb 22nd" are not filtered out.
 def looks_like_real_date(raw: str) -> bool:
+    """Handle looks like real date."""
     s = (raw or "").lower().strip()
 
     # Too short means almost always garbage
@@ -231,6 +237,7 @@ def looks_like_real_date(raw: str) -> bool:
 
 
 def open_sqlite_rw(path: str) -> sqlite3.Connection:
+    """Open sqlite rw."""
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
@@ -240,6 +247,7 @@ def open_sqlite_rw(path: str) -> sqlite3.Connection:
 
 
 def ensure_base_schema(conn: sqlite3.Connection) -> None:
+    """Ensure base schema is available."""
     has_messages = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
     ).fetchone()
@@ -258,6 +266,7 @@ def ensure_base_schema(conn: sqlite3.Connection) -> None:
 
 
 def ensure_messages_schema(conn: sqlite3.Connection) -> None:
+    """Ensure messages schema is available."""
     cols = conn.execute("PRAGMA table_info(messages)").fetchall()
     col_names = {c["name"] for c in cols}
     changed = False
@@ -289,6 +298,7 @@ def ensure_messages_schema(conn: sqlite3.Connection) -> None:
 
 
 def get_last_cursor(conn: sqlite3.Connection, source: str) -> int:
+    """Return last cursor."""
     row = conn.execute(
         "SELECT last_rowid FROM sync_state WHERE source = ?",
         (source,),
@@ -297,6 +307,7 @@ def get_last_cursor(conn: sqlite3.Connection, source: str) -> int:
 
 
 def set_last_cursor(conn: sqlite3.Connection, source: str, cursor: int) -> None:
+    """Set last cursor."""
     conn.execute(
         """
         INSERT INTO sync_state(source, last_rowid, updated_at)
@@ -310,10 +321,12 @@ def set_last_cursor(conn: sqlite3.Connection, source: str, cursor: int) -> None:
 
 
 def reset_cursor(conn: sqlite3.Connection, source: str) -> None:
+    """Reset cursor."""
     conn.execute("DELETE FROM sync_state WHERE source = ?", (source,))
 
 
 def upsert_conversation(conn: sqlite3.Connection, source: str, thread_key: str, display_name: Optional[str]) -> int:
+    """Handle upsert conversation."""
     conn.execute(
         """
         INSERT INTO conversations(source, thread_key, display_name)
@@ -343,6 +356,7 @@ def insert_message(
     sent_at_utc: str,
     text: str,
 ) -> Optional[int]:
+    """Insert message."""
     try:
         conn.execute(
             """
@@ -362,6 +376,7 @@ def insert_message(
 
 
 def extract_urls(text: str) -> List[str]:
+    """Extract urls."""
     urls = []
     for m in URL_RE.finditer(text):
         u = m.group(1).strip().rstrip(".,;:!)\"]}")
@@ -437,6 +452,7 @@ def extract_dates(text: str, base_dt: datetime) -> List[Tuple[str, datetime, dat
 
 # Ensure the `insert_extractions` function handles all extracted dates properly.
 def insert_extractions(conn: sqlite3.Connection, message_id: int, text: str, sent_at_utc: str) -> None:
+    """Insert extractions."""
     base_dt = datetime.fromisoformat(sent_at_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
 
     for url in extract_urls(text):
@@ -457,6 +473,7 @@ def insert_extractions(conn: sqlite3.Connection, message_id: int, text: str, sen
 
 
 def insert_attachment_meta(conn: sqlite3.Connection, message_id: int, filename: str, mime: str, attachment_id: str) -> None:
+    """Insert attachment meta."""
     if not is_allowed_document_attachment(filename, mime):
         return
 
@@ -470,6 +487,7 @@ def insert_attachment_meta(conn: sqlite3.Connection, message_id: int, filename: 
 
 
 def is_allowed_document_attachment(filename: Optional[str], mime_type: Optional[str]) -> bool:
+    """Check whether allowed document attachment."""
     lower_mime = (mime_type or "").strip().lower()
     if lower_mime in ALLOWED_ATTACHMENT_MIME_TYPES:
         return True
@@ -802,9 +820,11 @@ def fetch_db_snapshot(
             ).fetchall()
 
         def rows_to_dict(rows: List[sqlite3.Row]) -> List[Dict]:
+            """Handle rows to dict."""
             return [dict(r) for r in rows]
 
         def derive_subject(text_val: Optional[str]) -> Optional[str]:
+            """Handle derive subject."""
             if not text_val:
                 return None
             prefix = "Subject: "
@@ -847,6 +867,7 @@ def fetch_db_snapshot(
 
 def gmail_auth(creds_path: str = "credentials.json", token_path: str = "token.json", force_reauth: bool = False):
     # Reauth only when explicitly requested.
+    """Handle gmail auth."""
     if force_reauth and os.path.exists(token_path):
         os.remove(token_path)
 
@@ -891,6 +912,7 @@ def calendar_auth(creds_path: str = "credentials.json", token_path: str = "token
 
 
 def header_map(headers: List[Dict[str, str]]) -> Dict[str, str]:
+    """Handle header map."""
     out = {}
     for h in headers:
         k = (h.get("name") or "").lower()
@@ -901,11 +923,13 @@ def header_map(headers: List[Dict[str, str]]) -> Dict[str, str]:
 
 
 def b64url_decode(data: str) -> bytes:
+    """Handle b64url decode."""
     padding = "=" * (-len(data) % 4)
     return base64.urlsafe_b64decode(data + padding)
 
 
 def walk_parts(payload: Dict) -> Iterable[Dict]:
+    """Handle walk parts."""
     stack = [payload]
     while stack:
         p = stack.pop()
@@ -915,6 +939,7 @@ def walk_parts(payload: Dict) -> Iterable[Dict]:
 
 
 def extract_best_text(payload: Dict) -> str:
+    """Extract best text."""
     text_plain = []
     text_html = []
 
@@ -948,6 +973,7 @@ def extract_best_text(payload: Dict) -> str:
 
 
 def extract_attachment_metas(payload: Dict) -> List[Tuple[str, str, str]]:
+    """Extract attachment metas."""
     out = []
     for part in walk_parts(payload):
         filename = part.get("filename") or ""
@@ -961,7 +987,9 @@ def extract_attachment_metas(payload: Dict) -> List[Tuple[str, str, str]]:
 
 # Modify the `list_message_ids_since` function to ensure it retrieves the correct emails.
 def list_message_ids_since(service, user_id: str, after_seconds: int, max_pages: int = 25) -> Tuple[List[str], str]:
+    """List message ids since"""
     def run_query(query: Optional[str], include_spam_trash: bool) -> List[str]:
+        """Handle run query."""
         ids: List[str] = []
         page_token = None
         for _ in range(max_pages):
@@ -1012,6 +1040,7 @@ def ingest_gmail(
     token_path: str = "token.json",
     account_key: Optional[str] = None,
 ) -> Dict[str, int]:
+    """Handle ingest gmail."""
     conn = open_sqlite_rw(out_db_path)
     service = gmail_auth(token_path=token_path, force_reauth=force_reauth)
 
@@ -1318,7 +1347,9 @@ def ingest_calendar_events(
 
 
 def start_auto_ingest_worker(db_path: str = "extracted.db", interval_seconds: int = AUTO_INGEST_INTERVAL_SECONDS) -> None:
+    """Handle start auto ingest worker."""
     def _worker() -> None:
+        """Handle  worker."""
         while True:
             try:
                 stats = ingest_gmail(db_path, reset_cursor_flag=False, force_reauth=False)

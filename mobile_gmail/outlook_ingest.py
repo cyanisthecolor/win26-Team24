@@ -23,6 +23,7 @@ app = Flask(__name__)
 
 @app.after_request
 def add_cors_headers(response):
+    """Handle add cors headers."""
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
@@ -65,6 +66,7 @@ ALLOWED_ATTACHMENT_MIME_TYPES = {
 
 
 def normalize_user_key(user_key: Optional[str]) -> Optional[str]:
+    """Handle normalize user key."""
     raw = (user_key or "").strip().lower()
     if not raw:
         return None
@@ -74,6 +76,7 @@ def normalize_user_key(user_key: Optional[str]) -> Optional[str]:
 
 
 def resolve_outlook_client_id(override_client_id: Optional[str] = None) -> str:
+    """Resolve outlook client id."""
     values = [
         (override_client_id or "").strip(),
         (os.environ.get("OUTLOOK_CLIENT_ID") or "").strip(),
@@ -88,6 +91,7 @@ def resolve_outlook_client_id(override_client_id: Optional[str] = None) -> str:
 
 
 def resolve_user_paths(user_key: Optional[str], db_path: Optional[str] = None) -> Tuple[str, str]:
+    """Resolve user paths."""
     normalized = normalize_user_key(user_key)
     if normalized:
         token_path = f"token_outlook_{normalized}.json"
@@ -99,6 +103,7 @@ def resolve_user_paths(user_key: Optional[str], db_path: Optional[str] = None) -
 
 
 def open_sqlite_rw(path: str) -> sqlite3.Connection:
+    """Open sqlite rw."""
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
@@ -108,6 +113,7 @@ def open_sqlite_rw(path: str) -> sqlite3.Connection:
 
 
 def ensure_base_schema(conn: sqlite3.Connection) -> None:
+    """Ensure base schema is available."""
     has_messages = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
     ).fetchone()
@@ -125,6 +131,7 @@ def ensure_base_schema(conn: sqlite3.Connection) -> None:
 
 
 def ensure_messages_schema(conn: sqlite3.Connection) -> None:
+    """Ensure messages schema is available."""
     cols = conn.execute("PRAGMA table_info(messages)").fetchall()
     col_names = {c["name"] for c in cols}
     changed = False
@@ -144,6 +151,7 @@ def ensure_messages_schema(conn: sqlite3.Connection) -> None:
 
 
 def get_last_cursor(conn: sqlite3.Connection, source: str) -> int:
+    """Return last cursor."""
     row = conn.execute(
         "SELECT last_rowid FROM sync_state WHERE source = ?",
         (source,),
@@ -152,6 +160,7 @@ def get_last_cursor(conn: sqlite3.Connection, source: str) -> int:
 
 
 def set_last_cursor(conn: sqlite3.Connection, source: str, cursor: int) -> None:
+    """Set last cursor."""
     conn.execute(
         """
         INSERT INTO sync_state(source, last_rowid, updated_at)
@@ -165,10 +174,12 @@ def set_last_cursor(conn: sqlite3.Connection, source: str, cursor: int) -> None:
 
 
 def reset_cursor(conn: sqlite3.Connection, source: str) -> None:
+    """Reset cursor."""
     conn.execute("DELETE FROM sync_state WHERE source = ?", (source,))
 
 
 def upsert_conversation(conn: sqlite3.Connection, source: str, thread_key: str, display_name: Optional[str]) -> int:
+    """Handle upsert conversation."""
     conn.execute(
         """
         INSERT INTO conversations(source, thread_key, display_name)
@@ -198,6 +209,7 @@ def insert_message(
     sent_at_utc: str,
     text: str,
 ) -> Optional[int]:
+    """Insert message."""
     try:
         conn.execute(
             """
@@ -217,6 +229,7 @@ def insert_message(
 
 
 def extract_urls(text: str) -> List[str]:
+    """Extract urls."""
     urls = []
     for m in URL_RE.finditer(text or ""):
         value = m.group(1).strip().rstrip(".,;:!)]}\"")
@@ -233,6 +246,7 @@ def extract_urls(text: str) -> List[str]:
 
 
 def looks_like_real_date(raw_span: str) -> bool:
+    """Handle looks like real date."""
     s = (raw_span or "").strip().lower()
     if len(s) < 3:
         return False
@@ -246,6 +260,7 @@ def looks_like_real_date(raw_span: str) -> bool:
 
 
 def extract_dates(text: str, base_dt: datetime):
+    """Extract dates."""
     text = (text or "")[:10000]
     settings = {
         "RELATIVE_BASE": base_dt,
@@ -269,6 +284,7 @@ def extract_dates(text: str, base_dt: datetime):
 
 
 def is_allowed_document_attachment(filename: Optional[str], mime_type: Optional[str]) -> bool:
+    """Check whether allowed document attachment."""
     lower_mime = (mime_type or "").strip().lower()
     if lower_mime in ALLOWED_ATTACHMENT_MIME_TYPES:
         return True
@@ -277,6 +293,7 @@ def is_allowed_document_attachment(filename: Optional[str], mime_type: Optional[
 
 
 def insert_extractions(conn: sqlite3.Connection, message_id: int, text: str, sent_at_utc: str) -> None:
+    """Insert extractions."""
     base_dt = datetime.fromisoformat(sent_at_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
     for url in extract_urls(text):
         conn.execute("INSERT INTO extracted_links(message_id, url) VALUES(?, ?)", (message_id, url))
@@ -294,6 +311,7 @@ def insert_extractions(conn: sqlite3.Connection, message_id: int, text: str, sen
 
 
 def insert_attachment_meta(conn: sqlite3.Connection, message_id: int, filename: str, mime: str, outlook_ref: str) -> None:
+    """Insert attachment meta."""
     if not is_allowed_document_attachment(filename, mime):
         return
     conn.execute(
@@ -306,6 +324,7 @@ def insert_attachment_meta(conn: sqlite3.Connection, message_id: int, filename: 
 
 
 def strip_html_to_text(content: str) -> str:
+    """Handle strip html to text."""
     no_script = re.sub(r"<script[\\s\\S]*?</script>", " ", content or "", flags=re.I)
     no_style = re.sub(r"<style[\\s\\S]*?</style>", " ", no_script, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", no_style)
@@ -315,6 +334,7 @@ def strip_html_to_text(content: str) -> str:
 
 
 def is_likely_spam_message(subject: str, body_preview: str, body_text: str, sender_name: str, sender_email: str) -> bool:
+    """Check whether likely spam message."""
     subject_l = (subject or "").lower()
     preview_l = (body_preview or "").lower()
     body_l = (body_text or "").lower()
@@ -343,19 +363,23 @@ def is_likely_spam_message(subject: str, body_preview: str, body_text: str, send
 
 
 def parse_iso_to_utc_ms(value: str) -> int:
+    """Handle parse iso to utc ms."""
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return int(dt.timestamp() * 1000)
 
 
 def token_endpoint() -> str:
+    """Handle token endpoint."""
     return f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/token"
 
 
 def device_code_endpoint() -> str:
+    """Handle device code endpoint."""
     return f"https://login.microsoftonline.com/{OUTLOOK_TENANT_ID}/oauth2/v2.0/devicecode"
 
 
 def load_token_file(token_path: str) -> Optional[Dict]:
+    """Load token file."""
     if not os.path.exists(token_path):
         return None
     try:
@@ -366,11 +390,13 @@ def load_token_file(token_path: str) -> Optional[Dict]:
 
 
 def save_token_file(token_path: str, payload: Dict) -> None:
+    """Save token file."""
     with open(token_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def request_token_refresh(refresh_token: str, client_id: str) -> Dict:
+    """Handle request token refresh."""
     data = {
         "client_id": client_id,
         "grant_type": "refresh_token",
@@ -384,6 +410,7 @@ def request_token_refresh(refresh_token: str, client_id: str) -> Dict:
 
 
 def request_device_code(client_id: str) -> Dict:
+    """Handle request device code."""
     data = {"client_id": client_id, "scope": OUTLOOK_SCOPES}
     resp = requests.post(device_code_endpoint(), data=data, timeout=OUTLOOK_TIMEOUT_SECONDS)
     if resp.status_code >= 400:
@@ -392,6 +419,7 @@ def request_device_code(client_id: str) -> Dict:
 
 
 def poll_device_code(device_flow: Dict, client_id: str) -> Dict:
+    """Handle poll device code."""
     interval = int(device_flow.get("interval", 5))
     expires_in = int(device_flow.get("expires_in", 900))
     deadline = time.time() + expires_in
@@ -428,6 +456,7 @@ def poll_device_code(device_flow: Dict, client_id: str) -> Dict:
 
 
 def get_outlook_access_token(token_path: str, force_reauth: bool = False, client_id: Optional[str] = None) -> Dict:
+    """Return outlook access token."""
     effective_client_id = resolve_outlook_client_id(client_id)
     if not effective_client_id:
         raise RuntimeError(
@@ -461,6 +490,7 @@ def get_outlook_access_token(token_path: str, force_reauth: bool = False, client
 
 
 def graph_get_json(path: str, access_token: str, params: Optional[Dict] = None) -> Dict:
+    """Handle graph get json."""
     url = f"{GRAPH_BASE}{path}"
     resp = requests.get(
         url,
@@ -474,6 +504,7 @@ def graph_get_json(path: str, access_token: str, params: Optional[Dict] = None) 
 
 
 def graph_get_bytes(path: str, access_token: str) -> bytes:
+    """Handle graph get bytes."""
     url = f"{GRAPH_BASE}{path}"
     resp = requests.get(
         url,
@@ -486,6 +517,7 @@ def graph_get_bytes(path: str, access_token: str) -> bytes:
 
 
 def fetch_outlook_profile(access_token: str) -> Dict:
+    """Fetch outlook profile."""
     data = graph_get_json("/me", access_token, params={"$select": "mail,userPrincipalName,displayName"})
     return {
         "email": data.get("mail") or data.get("userPrincipalName"),
@@ -494,6 +526,7 @@ def fetch_outlook_profile(access_token: str) -> Dict:
 
 
 def list_messages_since(access_token: str, after_seconds: int, max_pages: int = 8) -> List[Dict]:
+    """List messages since"""
     after_dt = datetime.fromtimestamp(after_seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     params = {
         "$select": "id,conversationId,receivedDateTime,sentDateTime,from,subject,bodyPreview,body,hasAttachments,internetMessageId,parentFolderId",
@@ -503,6 +536,7 @@ def list_messages_since(access_token: str, after_seconds: int, max_pages: int = 
     }
 
     def fetch_folder(folder_name: str) -> List[Dict]:
+        """Fetch folder."""
         rows = []
         next_url = f"{GRAPH_BASE}/me/mailFolders/{folder_name}/messages"
         page = 0
@@ -537,6 +571,7 @@ def list_messages_since(access_token: str, after_seconds: int, max_pages: int = 
 
 
 def list_message_attachments(access_token: str, message_id: str) -> List[Tuple[str, str, str]]:
+    """List message attachments"""
     data = graph_get_json(
         f"/me/messages/{message_id}/attachments",
         access_token,
@@ -564,6 +599,7 @@ def ingest_outlook(
     account_key: Optional[str] = None,
     client_id: Optional[str] = None,
 ) -> Dict[str, int]:
+    """Handle ingest outlook."""
     conn = open_sqlite_rw(out_db_path)
 
     token_data = get_outlook_access_token(token_path=token_path, force_reauth=force_reauth, client_id=client_id)
@@ -676,6 +712,7 @@ def ingest_outlook(
 
 
 def get_db_summary(db_path: str, account_key: Optional[str] = None) -> Dict[str, Optional[str]]:
+    """Return db summary."""
     conn = open_sqlite_rw(db_path)
     try:
         norm_key = normalize_user_key(account_key)
@@ -755,6 +792,7 @@ def get_db_summary(db_path: str, account_key: Optional[str] = None) -> Dict[str,
 
 
 def fetch_db_snapshot(db_path: str, limit: int = 20, account_key: Optional[str] = None) -> Dict[str, List[Dict]]:
+    """Fetch db snapshot."""
     conn = open_sqlite_rw(db_path)
     try:
         norm_key = normalize_user_key(account_key)
@@ -848,9 +886,11 @@ def fetch_db_snapshot(db_path: str, limit: int = 20, account_key: Optional[str] 
             ).fetchall()
 
         def rows_to_dict(rows):
+            """Handle rows to dict."""
             return [dict(r) for r in rows]
 
         def derive_subject(text_val: Optional[str]) -> Optional[str]:
+            """Handle derive subject."""
             if not text_val:
                 return None
             prefix = "Subject: "
@@ -891,6 +931,7 @@ def fetch_db_snapshot(db_path: str, limit: int = 20, account_key: Optional[str] 
 
 @app.route("/ingest", methods=["POST"])
 def ingest():
+    """Handle ingest."""
     try:
         payload = request.json or {}
         user_key = payload.get("user_key")
@@ -918,6 +959,7 @@ def ingest():
 
 @app.route("/summary", methods=["GET"])
 def summary():
+    """Handle summary."""
     try:
         user_key = request.args.get("user_key")
         db_path_raw = request.args.get("db_path")
@@ -937,6 +979,7 @@ def summary():
 
 @app.route("/lookup_message", methods=["GET"])
 def lookup_message():
+    """Look up message."""
     try:
         user_key = normalize_user_key(request.args.get("user_key"))
         db_path_raw = request.args.get("db_path")
@@ -992,6 +1035,7 @@ def lookup_message():
 
 @app.route("/attachment_preview", methods=["GET"])
 def attachment_preview():
+    """Handle attachment preview."""
     try:
         attachment_id_raw = (request.args.get("attachment_id") or "").strip()
         if not attachment_id_raw:
@@ -1066,6 +1110,7 @@ def attachment_preview():
 
 @app.route("/routes", methods=["GET"])
 def routes():
+    """Handle routes."""
     rows = []
     for rule in app.url_map.iter_rules():
         methods = sorted([m for m in rule.methods if m not in {"HEAD", "OPTIONS"}])

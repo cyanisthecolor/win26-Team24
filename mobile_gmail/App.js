@@ -68,6 +68,7 @@ const DATA = {
 // Set this to your backend URL if auto-detection fails (e.g., real device on LAN)
 const BASE_URL_OVERRIDE = '';
 const OUTLOOK_BASE_URL_OVERRIDE = '';
+const IMESSAGE_BASE_URL_OVERRIDE = '';
 const OUTLOOK_CLIENT_ID_OVERRIDE = '';
 
 const NOTIF_TIMINGS = ['30 min', '1 hour', '3 hours', '1 day'];
@@ -183,6 +184,15 @@ function getOutlookBaseUrl() {
   if (host) return `http://${host}:5002`;
   if (Platform.OS === 'android') return 'http://10.0.2.2:5002';
   return 'http://localhost:5002';
+}
+
+function getImessageBaseUrl() {
+  if (IMESSAGE_BASE_URL_OVERRIDE) return IMESSAGE_BASE_URL_OVERRIDE;
+  if (Platform.OS === 'web') return 'http://localhost:5003';
+  const host = Constants.expoConfig?.hostUri?.split(':')[0] || Constants.expoGoConfig?.debuggerHost?.split(':')[0];
+  if (host) return `http://${host}:5003`;
+  if (Platform.OS === 'android') return 'http://10.0.2.2:5003';
+  return 'http://localhost:5003';
 }
 
 function byNewest(items = []) {
@@ -580,7 +590,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
         body: (m.snippet || '').trim(),
         senderName: (m.sender_name || m.sender || '').trim(),
         source: (m?.source_service || 'email').toUpperCase(),
-        sourceIcon: m?.source_service === 'outlook' ? '📨' : '✉️',
+        sourceIcon: m?.source_service === 'outlook' ? '📨' : (m?.source_service === 'imessage' ? '💬' : '✉️'),
         timestamp: m.sent_at_utc ? new Date(m.sent_at_utc).getTime() : Date.now(),
       }))
       .filter(n => !isDeleted(n.junkKey));
@@ -1255,7 +1265,7 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
 }
 
 // ─── Dashboard: TODO Tab (links & attachments) ───────────────────────────────
-function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveToJunk, userKeys = { gmail: '', outlook: '' } }) {
+function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveToJunk, userKeys = { gmail: '', outlook: '', imessage: '' } }) {
   const links = ingestLinks.filter(l => !isDeleted(`link-${l.id}`)).slice(0, 3);
   const isAllowedDocAttachment = (a) => {
     const mime = String(a?.mime_type || '').trim().toLowerCase();
@@ -1308,12 +1318,14 @@ function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveTo
     Linking.openURL(target).catch(() => Alert.alert('Unable to open link', target));
   };
   const openAttachment = (a) => {
+    const sourceService = String(a?.source_service || '').trim().toLowerCase();
     const source = String(a?.original_path || '').trim();
-    const isOutlookAttachment = source.startsWith('outlook_attachment_id:');
-    const baseUrl = isOutlookAttachment ? getOutlookBaseUrl() : getBaseUrl();
+    const isOutlookAttachment = sourceService === 'outlook' || source.startsWith('outlook_attachment_id:');
+    const isImessageAttachment = sourceService === 'imessage';
+    const baseUrl = isOutlookAttachment ? getOutlookBaseUrl() : (isImessageAttachment ? getImessageBaseUrl() : getBaseUrl());
     const attachmentUserKey = isOutlookAttachment
       ? String(userKeys?.outlook || '').trim().toLowerCase()
-      : String(userKeys?.gmail || '').trim().toLowerCase();
+      : (isImessageAttachment ? String(userKeys?.imessage || '').trim().toLowerCase() : String(userKeys?.gmail || '').trim().toLowerCase());
     const clientIdSuffix = isOutlookAttachment && OUTLOOK_CLIENT_ID_OVERRIDE
       ? `&client_id=${encodeURIComponent(OUTLOOK_CLIENT_ID_OVERRIDE)}`
       : '';
@@ -1429,6 +1441,7 @@ function ThreadsTab({ ingestMessages = [], isDeleted, onMoveToJunk }) {
         snippet: msg.snippet || '',
         sentAt: msg.sent_at_utc || null,
         ts,
+        sourceService: String(msg?.source_service || 'gmail').toLowerCase(),
       };
 
       if (!bySender.has(sender)) bySender.set(sender, []);
@@ -1442,8 +1455,8 @@ function ThreadsTab({ ingestMessages = [], isDeleted, onMoveToJunk }) {
       out.push({
         id: `th-${sender}`,
         contact: sender,
-        source: 'Gmail',
-        sourceIcon: '✉️',
+        source: (latest?.sourceService || 'email').toUpperCase(),
+        sourceIcon: latest?.sourceService === 'outlook' ? '📨' : (latest?.sourceService === 'imessage' ? '💬' : '✉️'),
         timestamp: latest?.ts || 0,
         latestSubject: latest?.subject || 'No subject',
         latestSnippet: latest?.snippet || '',
@@ -1555,7 +1568,7 @@ const TABS = [
   { key: 'junk', label: 'Junk', icon: '🗑️' },
 ];
 
-function Dashboard({ ingestData, onBackToSetup, userKeys = { gmail: '', outlook: '', calendar: '' }, onRefreshCalendar }) {
+function Dashboard({ ingestData, onBackToSetup, userKeys = { gmail: '', outlook: '', calendar: '', imessage: '' }, onRefreshCalendar }) {
   const [notifItems, setNotifItems] = useState(DATA.notifications.map(n => ({ ...n, read: false })));
   const [deletedMap, setDeletedMap] = useState({});
   const [deletedItems, setDeletedItems] = useState([]);
@@ -1638,6 +1651,7 @@ export default function App() {
   const normalizedGmailUserKey = (appAccounts.gmail || '').trim().toLowerCase();
   const normalizedOutlookUserKey = (appAccounts.outlook || '').trim().toLowerCase();
   const normalizedCalendarUserKey = (appAccounts.calendar || '').trim().toLowerCase();
+  const normalizedImessageUserKey = (appAccounts.imessage || '').trim().toLowerCase();
 
   const fetchWithTimeout = async (url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) => {
     const controller = new AbortController();
@@ -1688,9 +1702,12 @@ export default function App() {
       // Ingest calendar whenever we have a Google account (same as Gmail)
       const calKey = normalizedCalendarUserKey || normalizedGmailUserKey;
       if (calKey) targets.push({ label: 'Calendar', service: 'calendar', baseUrl: getBaseUrl(), userKey: calKey });
+      if (selectedApps.includes('imessage')) {
+        targets.push({ label: 'iMessage', service: 'imessage', baseUrl: getImessageBaseUrl(), userKey: normalizedImessageUserKey || normalizedUserKey });
+      }
 
       if (targets.length === 0) {
-        if (showAlert) Alert.alert('Connect account', 'Enter your Google account and/or Outlook account in setup first.');
+        if (showAlert) Alert.alert('Connect account', 'Enter account details in setup first.');
         return;
       }
 
@@ -1746,6 +1763,7 @@ export default function App() {
         gmail: (overrideKeys?.gmail ?? normalizedGmailUserKey ?? '').trim().toLowerCase(),
         outlook: (overrideKeys?.outlook ?? normalizedOutlookUserKey ?? '').trim().toLowerCase(),
         calendar: (overrideKeys?.calendar ?? (normalizedCalendarUserKey || normalizedGmailUserKey) ?? '').trim().toLowerCase(),
+        imessage: (overrideKeys?.imessage ?? normalizedImessageUserKey ?? normalizedUserKey ?? '').trim().toLowerCase(),
       };
 
       const targets = [];
@@ -1758,6 +1776,9 @@ export default function App() {
       // Always fetch calendar when we have a Google account (same credentials as Gmail)
       if (keys.gmail) {
         targets.push({ service: 'calendar', baseUrl: getBaseUrl(), userKey: keys.gmail });
+  }
+      if (selectedApps.includes('imessage')) {
+        targets.push({ service: 'imessage', baseUrl: getImessageBaseUrl(), userKey: keys.imessage });
       }
       if (targets.length === 0) return;
 
@@ -1799,6 +1820,8 @@ export default function App() {
     const gmailAccount = (appAccounts.gmail || '').trim().toLowerCase();
     const outlookAccount = (appAccounts.outlook || '').trim().toLowerCase();
     const calendarAccount = (appAccounts.calendar || appAccounts.gmail || '').trim().toLowerCase();
+    const imessageSelected = selectedApps.includes('imessage');
+    const imessageAccount = (appAccounts.imessage || '').trim().toLowerCase();
 
     if ((gmailSelected || calendarSelected) && !(gmailAccount || calendarAccount)) {
       Alert.alert('Google account required', 'Please enter your Google account in the Sign in step.');
@@ -1811,8 +1834,7 @@ export default function App() {
     }
 
     // Outlook stays independent.
-
-    if (!gmailSelected && !outlookSelected && !calendarSelected) {
+  if (!gmailSelected && !outlookSelected && !calendarSelected && !imessageSelected) {
       setDone(true);
       return;
     }
@@ -1825,6 +1847,8 @@ export default function App() {
       if (gmailSelected) connectTargets.push({ label: 'Gmail', baseUrl: getBaseUrl(), userKey: gmailAccount });
       if (outlookSelected) connectTargets.push({ label: 'Outlook', baseUrl: getOutlookBaseUrl(), userKey: outlookAccount });
       if (calendarSelected) connectTargets.push({ label: 'Calendar', service: 'calendar', baseUrl: getBaseUrl(), userKey: calendarAccount });
+      if (calendarSelected) connectTargets.push({ label: 'Calendar', service: 'calendar', baseUrl: getBaseUrl(), userKey: calendarAccount });
+      if (imessageSelected) connectTargets.push({ label: 'iMessage', service: 'imessage', baseUrl: getImessageBaseUrl(), userKey: imessageAccount || normalizedUserKey });
 
       const connectErrors = [];
       for (const target of connectTargets) {
@@ -1853,7 +1877,7 @@ export default function App() {
         }
       }
 
-      await loadSummary({ gmail: gmailAccount, outlook: outlookAccount, calendar: calendarAccount });
+        await loadSummary({ gmail: gmailAccount, outlook: outlookAccount, calendar: calendarAccount, imessage: imessageAccount || normalizedUserKey });
       setDone(true);
 
       if (connectErrors.length > 0) {
@@ -1876,7 +1900,7 @@ export default function App() {
       loadSummary();
     }, 20000);
     return () => clearInterval(id);
-  }, [done, selectedApps, normalizedGmailUserKey, normalizedOutlookUserKey, normalizedCalendarUserKey]);
+  }, [done, selectedApps, normalizedGmailUserKey, normalizedOutlookUserKey, normalizedCalendarUserKey, normalizedImessageUserKey, normalizedUserKey]);
 
   useEffect(() => {
     if (done) {
@@ -1889,7 +1913,7 @@ export default function App() {
       <Dashboard
         ingestData={ingestData}
         onBackToSetup={() => setDone(false)}
-        userKeys={{ gmail: normalizedGmailUserKey, outlook: normalizedOutlookUserKey, calendar: normalizedCalendarUserKey || normalizedGmailUserKey }}
+        userKeys={{ gmail: normalizedGmailUserKey, outlook: normalizedOutlookUserKey, calendar: normalizedCalendarUserKey || normalizedGmailUserKey, imessage: normalizedImessageUserKey }}
         onRefreshCalendar={loadSummary}
       />
     </SafeAreaProvider>
