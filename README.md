@@ -24,7 +24,7 @@ npx expo start
 - Thread-based conversation organization  
 - Calendar integration for tracking important dates  
 - Links & Attachments aggregation  
-- Mobile-first design built with React Native and Expo  
+- Mobile-first design built with React Native and Expo, web support enabled
 
 ## Wiki
 
@@ -35,10 +35,15 @@ npx expo start
 - Natalie Shell  
 - Eugenie Shi  
 - Amanda Kay  
-- Jonathan Rodríguez  
+- Jonathan Rodríguez
 
-## ThreadSmith App QR Code
+
+## ThreadSmith App Link and QR Code
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/f9cf52b8-a3e1-4c3a-a4da-5087bf7169b3" width="200"/>
+  <a href="https://w3zmvgy-anonymous-8081.exp.direct/">Open ThreadSmith through Web Link</a>
+</p>
+
+<p align="center">
+  <img width="221" height="219" alt="ThreadSmith QR Code" src="https://github.com/user-attachments/assets/c1961e73-28a1-470c-9874-d3ecf3a585f4" />
 </p>
