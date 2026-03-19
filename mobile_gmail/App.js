@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, ScrollView,
+  View, Text, StyleSheet, TouchableOpacity, TouchableWithoutFeedback, ScrollView,
   Switch, TextInput, Animated, StatusBar, Modal, Alert, Linking, Platform,
 } from 'react-native';
 import Constants from 'expo-constants';
@@ -24,10 +24,10 @@ const C = {
 };
 
 const APPS = [
-  { id: 'gmail', label: 'Gmail', icon: '✉️', desc: 'Import threads, links, dates, and attachments.' },
-  { id: 'calendar', label: 'Calendar', icon: '📅', desc: 'Overlay extracted dates on your calendar.' },
-  { id: 'outlook', label: 'Outlook', icon: '📨', desc: 'Bring your Outlook mail and schedule context.' },
-  { id: 'imessage', label: 'iMessage', icon: '💬', desc: 'Include your iMessage conversations.' },
+  { id: 'gmail', label: 'Gmail', icon: '✉️', desc: 'Summarize emails, surface action items, and track what needs a reply.' },
+  { id: 'calendar', label: 'Calendar', icon: '📅', desc: 'See upcoming events, deadlines, and meeting prep — all in one place.' },
+  { id: 'outlook', label: 'Outlook', icon: '📨', desc: 'Pull in work emails and meetings from your Outlook account.' },
+  { id: 'imessage', label: 'iMessage', icon: '💬', desc: 'Include texts in your context so nothing slips through the cracks.' },
 ];
 
 const PRIVACY_SETTINGS = [
@@ -67,6 +67,8 @@ const DATA = {
 
 // Set this to your backend URL if auto-detection fails (e.g., real device on LAN)
 const BASE_URL_OVERRIDE = '';
+const OUTLOOK_BASE_URL_OVERRIDE = '';
+const OUTLOOK_CLIENT_ID_OVERRIDE = '';
 
 const NOTIF_TIMINGS = ['30 min', '1 hour', '3 hours', '1 day'];
 const ONBOARDING_STEPS = ['welcome', 'connect', 'accounts', 'whitelist', 'privacy', 'notifications', 'done'];
@@ -85,7 +87,7 @@ function timeAgo(ts) {
 function formatDate(dateStr) {
   const d = new Date(dateStr);
   if (Number.isNaN(d.getTime())) return dateStr;
-  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' });
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
 function priorityColor(p) {
@@ -165,12 +167,102 @@ async function fetchReplySuggestions(message) {
 
 function getBaseUrl() {
   if (BASE_URL_OVERRIDE) return BASE_URL_OVERRIDE;
+  if (Platform.OS === 'web') return 'http://localhost:5001';
   // Prefer Expo host when available (useful for real devices on LAN)
   const host = Constants.expoConfig?.hostUri?.split(':')[0] || Constants.expoGoConfig?.debuggerHost?.split(':')[0];
   if (host) return `http://${host}:5001`;
   // Emulators and local dev fallbacks
   if (Platform.OS === 'android') return 'http://10.0.2.2:5001';
   return 'http://localhost:5001';
+}
+
+function getOutlookBaseUrl() {
+  if (OUTLOOK_BASE_URL_OVERRIDE) return OUTLOOK_BASE_URL_OVERRIDE;
+  if (Platform.OS === 'web') return 'http://localhost:5002';
+  const host = Constants.expoConfig?.hostUri?.split(':')[0] || Constants.expoGoConfig?.debuggerHost?.split(':')[0];
+  if (host) return `http://${host}:5002`;
+  if (Platform.OS === 'android') return 'http://10.0.2.2:5002';
+  return 'http://localhost:5002';
+}
+
+function byNewest(items = []) {
+  return [...items].sort((a, b) => {
+    const ta = new Date(a?.sent_at_utc || a?.resolved_date || 0).getTime() || 0;
+    const tb = new Date(b?.sent_at_utc || b?.resolved_date || 0).getTime() || 0;
+    return tb - ta;
+  });
+}
+
+function mergeServiceData(parts = []) {
+  const merged = {
+    messages: [],
+    dates: [],
+    links: [],
+    attachments: [],
+    meta: { msgTotal: '0', datesTotal: '0', linksTotal: '0', latest: '' },
+  };
+
+  let msgTotal = 0;
+  let datesTotal = 0;
+  let linksTotal = 0;
+  let latestTs = 0;
+
+  parts.forEach((part) => {
+    const service = String(part?.service || 'mail').toLowerCase();
+    const summary = part?.summary || {};
+    const data = part?.data || {};
+
+    msgTotal += Number(summary.messages || 0);
+    datesTotal += Number(summary.dates || 0);
+    linksTotal += Number(summary.links || 0);
+
+    const latest = summary.latest_sent_at ? new Date(summary.latest_sent_at).getTime() : 0;
+    if (latest > latestTs) latestTs = latest;
+
+    const messages = (data.messages || []).map((m) => ({
+      ...m,
+      id: `${service}-${m?.id ?? 'msg'}`,
+      source_service: service,
+    }));
+
+    const dates = (data.dates || []).map((d) => ({
+      ...d,
+      id: `${service}-${d?.id ?? 'date'}`,
+      message_id: `${service}-${d?.message_id ?? 'msg'}`,
+      source_service: service,
+    }));
+
+    const links = (data.links || []).map((l) => ({
+      ...l,
+      id: `${service}-${l?.id ?? 'link'}`,
+      message_id: `${service}-${l?.message_id ?? 'msg'}`,
+      source_service: service,
+    }));
+
+    const attachments = (data.attachments || []).map((a) => ({
+      ...a,
+      id: `${service}-${a?.id ?? 'att'}`,
+      message_id: `${service}-${a?.message_id ?? 'msg'}`,
+      source_service: service,
+    }));
+
+    merged.messages.push(...messages);
+    merged.dates.push(...dates);
+    merged.links.push(...links);
+    merged.attachments.push(...attachments);
+  });
+
+  merged.messages = byNewest(merged.messages);
+  merged.dates = byNewest(merged.dates);
+  merged.links = byNewest(merged.links);
+  merged.attachments = byNewest(merged.attachments);
+  merged.meta = {
+    msgTotal: String(msgTotal),
+    datesTotal: String(datesTotal),
+    linksTotal: String(linksTotal),
+    latest: latestTs ? `Latest: ${new Date(latestTs).toISOString()}` : '',
+  };
+  return merged;
 }
 
 // ─── Shared Components ────────────────────────────────────────────────────────
@@ -237,50 +329,14 @@ function ConnectAppsScreen({ selected, onToggle }) {
   );
 }
 
-function AppAccountsScreen({ selectedApps, accountValues, onChangeAccount, outlookSignedIn, onOutlookSignedIn }) {
+function AppAccountsScreen({ selectedApps, accountValues, onChangeAccount }) {
   const selectedMeta = APPS.filter(app => selectedApps.includes(app.id));
+  const wantsGoogle = selectedApps.includes('gmail') || selectedApps.includes('calendar');
+  const wantsOutlook = selectedApps.includes('outlook');
+  const wantsImessage = selectedApps.includes('imessage');
 
-  const MICROSOFT_CLIENT_ID = 'fde8d6d4-cb6f-4ad5-862f-0ab740a0bec8';
-
-  const openMicrosoftSignIn = async () => {
-    if (outlookSignedIn) return;
-    try {
-      if (Platform.OS === 'web' && typeof window !== 'undefined') {
-        const redirectUri = window.location.origin;
-        const authUrl =
-          `https://login.microsoftonline.com/common/oauth2/v2.0/authorize` +
-          `?client_id=${encodeURIComponent(MICROSOFT_CLIENT_ID)}` +
-          `&response_type=token` +
-          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-          `&response_mode=fragment` +
-          `&scope=${encodeURIComponent('openid profile email https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Calendars.Read')}` +
-          `&prompt=select_account`;
-
-        const popup = window.open(authUrl, 'microsoft-sign-in', 'width=520,height=720,menubar=no,toolbar=no,location=yes,status=no,resizable=yes,scrollbars=yes');
-        if (!popup) { await Linking.openURL(authUrl); return; }
-
-        const timer = window.setInterval(() => {
-          try {
-            const href = popup.location?.href || '';
-            if (!href.startsWith(window.location.origin)) return;
-            const fragment = href.includes('#') ? href.split('#')[1] : '';
-            const params = new URLSearchParams(fragment);
-            const token = params.get('access_token');
-            if (token) {
-              window.clearInterval(timer);
-              popup.close();
-              onOutlookSignedIn(token);
-            }
-          } catch (_) { /* cross-origin until redirect completes */ }
-        }, 400);
-        return;
-      }
-      // Native: open in browser; token capture is not supported without a redirect scheme
-      await Linking.openURL(`https://login.microsoftonline.com/common/oauth2/v2.0/authorize`);
-    } catch (err) {
-      Alert.alert('Unable to open Microsoft sign-in');
-    }
-  };
+  const googleValue = accountValues?.gmail || accountValues?.calendar || '';
+  const googleIcon = wantsGoogle && selectedApps.includes('calendar') && !selectedApps.includes('gmail') ? '📅' : '✉️';
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 24 }}>
@@ -294,52 +350,67 @@ function AppAccountsScreen({ selectedApps, accountValues, onChangeAccount, outlo
         <Text style={{ color: C.textMuted, fontSize: 13 }}>Select apps first, then come back to connect accounts.</Text>
       )}
 
-      {selectedMeta.map((app) => {
-        if (app.id === 'outlook') {
-          return (
-            <View key={app.id} style={[s.appCard, { paddingVertical: 14 }]}> 
-              <Text style={{ fontSize: 24, marginRight: 12 }}>{app.icon}</Text>
-              <View style={{ flex: 1 }}>
-                <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 8 }}>{app.label} account</Text>
-                <TouchableOpacity
-                  style={[s.addBtn, {
-                    alignSelf: 'flex-start',
-                    paddingHorizontal: 14,
-                    paddingVertical: 10,
-                    backgroundColor: outlookSignedIn ? C.green : '#2563EB',
-                  }]}
-                  onPress={openMicrosoftSignIn}
-                  disabled={outlookSignedIn}
-                >
-                  <Text style={{ color: '#fff', fontWeight: '700', fontSize: 13 }}>
-                    {outlookSignedIn ? '✓ Microsoft connected' : 'Sign in with Microsoft'}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          );
-        }
-
-        return (
-          <View key={app.id} style={[s.appCard, { paddingVertical: 12 }]}> 
-            <Text style={{ fontSize: 24, marginRight: 12 }}>{app.icon}</Text>
-            <View style={{ flex: 1 }}>
-              <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 }}>{app.label} account</Text>
-              <TextInput
-                style={[s.textInput, { paddingVertical: 10 }]}
-                placeholder={app.id === 'gmail' || app.id === 'outlook' ? 'you@example.com' : 'Phone number or Apple ID'}
-                placeholderTextColor={C.textMuted}
-                autoCapitalize="none"
-                keyboardType={app.id === 'imessage' ? 'default' : 'email-address'}
-                value={accountValues[app.id] || ''}
-                onChangeText={(v) => onChangeAccount(app.id, v)}
-              />
-            </View>
+      {wantsGoogle && (
+        <View style={[s.appCard, { paddingVertical: 12 }]}>
+          <Text style={{ fontSize: 24, marginRight: 12 }}>{googleIcon}</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 }}>Google account</Text>
+            <TextInput
+              style={[s.textInput, { paddingVertical: 10 }]}
+              placeholder="you@example.com"
+              placeholderTextColor={C.textMuted}
+              autoCapitalize="none"
+              keyboardType="email-address"
+              value={googleValue}
+              onChangeText={(v) => {
+                onChangeAccount('gmail', v);
+                onChangeAccount('calendar', v);
+              }}
+            />
           </View>
-        );
-      })}
+        </View>
+      )}
 
-      <InfoBox icon="ℹ️" text="For Gmail, this value is used as your user key and sync source in the dashboard." />
+      {wantsOutlook && (
+        <View style={[s.appCard, { paddingVertical: 12 }]}>
+          <Text style={{ fontSize: 24, marginRight: 12 }}>📨</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 }}>Outlook account</Text>
+            <TextInput
+              style={[s.textInput, { paddingVertical: 10 }]}
+              placeholder="you@example.com"
+              placeholderTextColor={C.textMuted}
+              autoCapitalize="none"
+              keyboardType="email-address"
+              value={accountValues.outlook || ''}
+              onChangeText={(v) => onChangeAccount('outlook', v)}
+            />
+          </View>
+        </View>
+      )}
+
+      {wantsImessage && (
+        <View style={[s.appCard, { paddingVertical: 12 }]}>
+          <Text style={{ fontSize: 24, marginRight: 12 }}>💬</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 }}>iMessage</Text>
+            <TextInput
+              style={[s.textInput, { paddingVertical: 10 }]}
+              placeholder="Phone number or Apple ID"
+              placeholderTextColor={C.textMuted}
+              autoCapitalize="none"
+              keyboardType="default"
+              value={accountValues.imessage || ''}
+              onChangeText={(v) => onChangeAccount('imessage', v)}
+            />
+          </View>
+        </View>
+      )}
+
+      <InfoBox
+        icon="ℹ️"
+        text="For Google, this value is used as your user key and sync source for both Gmail and Calendar."
+      />
     </ScrollView>
   );
 }
@@ -460,13 +531,27 @@ function DoneScreen({ connectedCount, contactCount }) {
 }
 
 // ─── Dashboard: Notifications Tab ─────────────────────────────────────────────
-function NotificationsTab({ notifications, setNotifications, ingestMessages = [], ingestDates = [], isDeleted, onMoveToJunk }) {
+function NotificationsTab({ notifications, setNotifications, ingestMessages = [], ingestDates = [], isDeleted, onMoveToJunk, userKeys = {} }) {
+  const [sortMode, setSortMode] = useState('time'); // 'time' | 'priority'
+  const PRIORITY_ORDER = { high: 0, medium: 1, low: 2 };
+  const [replyInEdit, setReplyInEdit] = useState(null);
+  const [sendingReply, setSendingReply] = useState(false);
+  const [sendError, setSendError] = useState('');
+
+  function sortItems(items) {
+    if (sortMode === 'priority') {
+      return [...items].sort((a, b) => (PRIORITY_ORDER[a.priority] ?? 3) - (PRIORITY_ORDER[b.priority] ?? 3));
+    }
+    return [...items].sort((a, b) => b.timestamp - a.timestamp);
+  }
+
   const notifs = notifications;
   const [selectedMessage, setSelectedMessage] = useState(null);
   const [replySuggestions, setReplySuggestions] = useState([]);
   const [isLoadingSuggestions, setIsLoadingSuggestions] = useState(false);
   const [suggestionsError, setSuggestionsError] = useState('');
   const [gmailReadMap, setGmailReadMap] = useState({});
+  const modalScrollRef = useRef(null);
 
   const dateMessageIds = React.useMemo(() => {
     const ids = new Set();
@@ -476,34 +561,28 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
     return ids;
   }, [ingestDates]);
 
-  const inboxFromGmail = React.useMemo(() => {
+  const inboxFromEmail = React.useMemo(() => {
     const actionRe = /(verify your device|security alert|action required|please verify|confirm|password|login|sign-in|urgent)/i;
     return (ingestMessages || [])
       .filter(m => {
         const subject = `${m?.subject || ''}`;
         const snippet = `${m?.snippet || ''}`;
         const isActionLike = actionRe.test(subject) || actionRe.test(snippet);
-        const isSpam = typeof m.category === 'string' && m.category.toUpperCase() === 'SPAM';
-        return (!dateMessageIds.has(m?.id) || isActionLike) && !isSpam;
+        return !dateMessageIds.has(m?.id) || isActionLike;
       })
       .slice(0, 8)
-      .map(m => {
-        const isOutlook = m.source === 'outlook';
-        const p = m.priority ? m.priority.toLowerCase() : undefined;
-        return {
-          id: `ing-msg-${m.id}`,
-          junkKey: `${m.source || 'gmail'}-${m.id}`,
-          readKey: `${m.source || 'gmail'}-${m.id}`,
-          title: isOutlook ? (m.summary_phrase || m.subject || 'Outlook Message').trim() : (m.subject || 'Gmail Message').trim(),
-          body: isOutlook ? (m.description || m.snippet || '').trim() : (m.snippet || '').trim(),
-          senderName: (m.sender_name || m.sender || '').trim(),
-          source: isOutlook ? 'Outlook' : 'Gmail',
-          sourceIcon: isOutlook ? '📨' : '✉️',
-          category: m.category || '',
-          priority: p || 'low',
-          timestamp: m.sent_at_utc ? new Date(m.sent_at_utc).getTime() : Date.now(),
-        };
-      })
+      .map(m => ({
+        id: `ing-msg-${m.id}`,
+        messageId: m.id,
+        junkKey: `${m?.source_service || 'mail'}-${m.id}`,
+        readKey: `${m?.source_service || 'mail'}-${m.id}`,
+        title: (m.subject || 'Gmail Message').trim(),
+        body: (m.snippet || '').trim(),
+        senderName: (m.sender_name || m.sender || '').trim(),
+        source: (m?.source_service || 'email').toUpperCase(),
+        sourceIcon: m?.source_service === 'outlook' ? '📨' : '✉️',
+        timestamp: m.sent_at_utc ? new Date(m.sent_at_utc).getTime() : Date.now(),
+      }))
       .filter(n => !isDeleted(n.junkKey));
   }, [ingestMessages, dateMessageIds, isDeleted]);
 
@@ -516,19 +595,21 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
       }));
   }, [notifs, isDeleted]);
 
-  const unreadApp = appInbox.filter(n => !n.read);
-  const readApp = appInbox.filter(n => n.read);
-  const unreadGmail = inboxFromGmail.filter(n => !gmailReadMap[n.readKey]);
-  const readGmail = inboxFromGmail.filter(n => !!gmailReadMap[n.readKey]);
+  const unreadApp = sortItems(appInbox.filter(n => !n.read));
+  const readApp = sortItems(appInbox.filter(n => n.read));
+  const unreadGmail = sortItems(inboxFromEmail.filter(n => !gmailReadMap[n.readKey]));
+  const readGmail = sortItems(inboxFromEmail.filter(n => !!gmailReadMap[n.readKey]));
   const unreadCount = unreadApp.length + unreadGmail.length;
-  const totalCount = appInbox.length + inboxFromGmail.length;
+  const totalCount = appInbox.length + inboxFromEmail.length;
 
   function markRead(id) { setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n)); }
+  function markUnread(id) { setNotifications(p => p.map(n => n.id === id ? { ...n, read: false } : n)); }
+  function markGmailUnread(readKey) { setGmailReadMap(prev => { const next = { ...prev }; delete next[readKey]; return next; }); }
   function markAll() {
     setNotifications(p => p.map(n => ({ ...n, read: true })));
     setGmailReadMap(prev => {
       const next = { ...prev };
-      inboxFromGmail.forEach((item) => {
+      inboxFromEmail.forEach((item) => {
         next[item.readKey] = true;
       });
       return next;
@@ -539,13 +620,15 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
     if (readKey?.startsWith('notif-')) {
       markRead(readKey.replace('notif-', ''));
     }
-    if (readKey?.startsWith('gmail-')) {
+    if (readKey && !readKey.startsWith('notif-')) {
       setGmailReadMap(prev => ({ ...prev, [readKey]: true }));
     }
 
-    setSelectedMessage(message);
+    setSelectedMessage({ ...message, readKey });
     setReplySuggestions([]);
     setSuggestionsError('');
+    setReplyInEdit(null);
+    setSendError('');
     setIsLoadingSuggestions(true);
 
     try {
@@ -580,15 +663,18 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
             <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
               <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
               {!n.read && <View style={s.unreadDot} />}
+              {n.read && (
+                <TouchableOpacity onPress={() => markUnread(n.id)} style={{ marginLeft: 8 }}>
+                  <Text style={{ fontSize: 10, color: C.accent, fontWeight: '700' }}>MARK UNREAD</Text>
+                </TouchableOpacity>
+              )}
               <TouchableOpacity onPress={() => onMoveToJunk({ key: `notif-${n.id}`, from: 'Inbox', title: n.title, subtitle: n.body, timestamp: n.timestamp })}>
                 <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
               </TouchableOpacity>
             </View>
             <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }} numberOfLines={2}>{n.body}</Text>
-            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>
-              <View style={[s.badge, { backgroundColor: priorityBg(n.priority) }]}>
-                <Text style={[s.badgeText, { color: priorityColor(n.priority) }]}>{n.priority.toUpperCase()}</Text>
-              </View>
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, gap: 6 }}>
+              <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: priorityColor(n.priority) }} />
               <Text style={{ fontSize: 11, color: C.textMuted }}>{n.source} · {timeAgo(n.timestamp)}</Text>
             </View>
           </View>
@@ -604,18 +690,34 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
           <Text style={s.dashTitle}>Notifications</Text>
           <Text style={s.dashSubtitle}>{unreadCount} unread · {totalCount} total</Text>
         </View>
-        {unreadCount > 0 && (
-          <TouchableOpacity onPress={markAll} style={s.markAllBtn}>
-            <Text style={{ fontSize: 12, color: C.textSecondary, fontWeight: '600' }}>Mark all read</Text>
-          </TouchableOpacity>
-        )}
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <View style={{ flexDirection: 'row', backgroundColor: C.surfaceAlt, borderRadius: 10, borderWidth: 1, borderColor: C.border, overflow: 'hidden' }}>
+            <TouchableOpacity
+              onPress={() => setSortMode('time')}
+              style={{ paddingVertical: 6, paddingHorizontal: 10, backgroundColor: sortMode === 'time' ? C.accent : 'transparent' }}
+            >
+              <Text style={{ fontSize: 11, fontWeight: '700', color: sortMode === 'time' ? '#fff' : C.textMuted }}>⏱ Time</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => setSortMode('priority')}
+              style={{ paddingVertical: 6, paddingHorizontal: 10, backgroundColor: sortMode === 'priority' ? C.accent : 'transparent' }}
+            >
+              <Text style={{ fontSize: 11, fontWeight: '700', color: sortMode === 'priority' ? '#fff' : C.textMuted }}>🔺 Priority</Text>
+            </TouchableOpacity>
+          </View>
+          {unreadCount > 0 && (
+            <TouchableOpacity onPress={markAll} style={s.markAllBtn}>
+              <Text style={{ fontSize: 12, color: C.textSecondary, fontWeight: '600' }}>Mark all read</Text>
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
 
       {(unreadApp.length > 0 || unreadGmail.length > 0) && <>
         <Text style={s.groupLabel}>UNREAD</Text>
         {unreadApp.length > 0 && <Text style={[s.groupLabel, { marginTop: 8, fontSize: 11 }]}>FROM APPS</Text>}
         {unreadApp.map(n => <Card key={n.readKey} n={n} />)}
-        {unreadGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM OUTLOOK</Text>}
+        {unreadGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM CONNECTED EMAIL</Text>}
         {unreadGmail.map(n => (
           <TouchableOpacity
             key={n.id}
@@ -627,6 +729,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
               source: n.source,
               timestamp: n.timestamp,
               senderName: n.senderName || '',
+              messageId: n.messageId,
             }, n.readKey)}
           >
             <View style={{ flexDirection: 'row', gap: 12 }}>
@@ -640,23 +743,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
                   </TouchableOpacity>
                 </View>
                 {!!n.body && <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20, marginTop: 4 }} numberOfLines={2}>{n.body}</Text>}
-                <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, gap: 6, flexWrap: 'wrap' }}>
-                  {n.priority && (
-                    <View style={[s.badge, { backgroundColor: priorityBg(n.priority) }]}>
-                      <Text style={[s.badgeText, { color: priorityColor(n.priority) }]}>
-                        {n.priority.toUpperCase()}
-                      </Text>
-                    </View>
-                  )}
-                  {n.category && n.category !== 'NONE' && (
-                    <View style={[s.badge, { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border }]}>
-                      <Text style={[s.badgeText, { color: C.textMuted }]}>
-                        {n.category.toUpperCase()}
-                      </Text>
-                    </View>
-                  )}
-                  <Text style={{ fontSize: 11, color: C.textMuted }}>{n.source} · {timeAgo(n.timestamp)}</Text>
-                </View>
+                <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>{n.source} · {timeAgo(n.timestamp)}</Text>
               </View>
             </View>
           </TouchableOpacity>
@@ -667,7 +754,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
         <Text style={[s.groupLabel, { marginTop: 16 }]}>READ</Text>
         {readApp.length > 0 && <Text style={[s.groupLabel, { marginTop: 8, fontSize: 11 }]}>FROM APPS</Text>}
         {readApp.map(n => <Card key={n.readKey} n={n} />)}
-        {readGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM OUTLOOK</Text>}
+        {readGmail.length > 0 && <Text style={[s.groupLabel, { marginTop: 12, fontSize: 11 }]}>FROM CONNECTED EMAIL</Text>}
         {readGmail.map(n => (
           <TouchableOpacity
             key={n.id}
@@ -679,6 +766,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
               source: n.source,
               timestamp: n.timestamp,
               senderName: n.senderName || '',
+              messageId: n.messageId,
             }, n.readKey)}
           >
             <View style={{ flexDirection: 'row', gap: 12 }}>
@@ -686,28 +774,15 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
               <View style={{ flex: 1 }}>
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                   <Text style={s.notifTitle} numberOfLines={1}>{n.title}</Text>
+                  <TouchableOpacity onPress={() => markGmailUnread(n.readKey)} style={{ marginLeft: 8 }}>
+                    <Text style={{ fontSize: 10, color: C.accent, fontWeight: '700' }}>MARK UNREAD</Text>
+                  </TouchableOpacity>
                   <TouchableOpacity onPress={() => onMoveToJunk({ key: n.junkKey, from: 'Inbox', title: n.title, subtitle: n.body, timestamp: n.timestamp })}>
                     <Text style={{ color: C.textMuted, marginLeft: 8, fontSize: 18, fontWeight: '700' }}>×</Text>
                   </TouchableOpacity>
                 </View>
                 {!!n.body && <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20, marginTop: 4 }} numberOfLines={2}>{n.body}</Text>}
-                <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, gap: 6, flexWrap: 'wrap' }}>
-                  {n.priority && (
-                    <View style={[s.badge, { backgroundColor: priorityBg(n.priority) }]}>
-                      <Text style={[s.badgeText, { color: priorityColor(n.priority) }]}>
-                        {n.priority.toUpperCase()}
-                      </Text>
-                    </View>
-                  )}
-                  {n.category && n.category !== 'NONE' && (
-                    <View style={[s.badge, { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border }]}>
-                      <Text style={[s.badgeText, { color: C.textMuted }]}>
-                        {n.category.toUpperCase()}
-                      </Text>
-                    </View>
-                  )}
-                  <Text style={{ fontSize: 11, color: C.textMuted }}>{n.source} · {timeAgo(n.timestamp)}</Text>
-                </View>
+                <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 8 }}>{n.source} · {timeAgo(n.timestamp)}</Text>
               </View>
             </View>
           </TouchableOpacity>
@@ -716,39 +791,133 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
 
       <Modal visible={!!selectedMessage} transparent animationType="slide" onRequestClose={() => setSelectedMessage(null)}>
         <View style={s.modalOverlay}>
+          <TouchableWithoutFeedback onPress={() => setSelectedMessage(null)}>
+            <View style={{ flex: 1 }} />
+          </TouchableWithoutFeedback>
           <View style={s.modalSheet}>
-            {selectedMessage && <>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
-                <Text style={s.modalTitle}>{selectedMessage.title}</Text>
-                <TouchableOpacity onPress={() => setSelectedMessage(null)}>
-                  <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
-                </TouchableOpacity>
-              </View>
-              <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>
-                {selectedMessage.source} · {timeAgo(selectedMessage.timestamp)}
-              </Text>
-              <View style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12, marginBottom: 14 }}>
-                <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>
-                  {selectedMessage.body || 'No content preview available.'}
+            {selectedMessage && (
+              <ScrollView ref={modalScrollRef} showsVerticalScrollIndicator={true} keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: 24 }}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                  <Text style={s.modalTitle} numberOfLines={2}>{selectedMessage.title}</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                    <TouchableOpacity
+                      onPress={() => {
+                        if (selectedMessage.readKey?.startsWith('notif-')) {
+                          markUnread(selectedMessage.readKey.replace('notif-', ''));
+                        } else if (selectedMessage.readKey) {
+                          markGmailUnread(selectedMessage.readKey);
+                        }
+                        setSelectedMessage(null);
+                      }}
+                    >
+                      <Text style={{ fontSize: 11, color: C.accent, fontWeight: '700' }}>MARK UNREAD</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => setSelectedMessage(null)}>
+                      <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+                <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>
+                  {selectedMessage.source} · {timeAgo(selectedMessage.timestamp)}
                 </Text>
-              </View>
+                <View style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12, marginBottom: 14 }}>
+                  <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>
+                    {selectedMessage.body || 'No content preview available.'}
+                  </Text>
+                </View>
 
-              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>AI SUGGESTED REPLIES</Text>
-              {isLoadingSuggestions && (
-                <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>Generating suggestions...</Text>
-              )}
-              {!isLoadingSuggestions && !!suggestionsError && (
-                <Text style={{ color: C.red, fontSize: 13, marginBottom: 8 }}>{suggestionsError}</Text>
-              )}
-              {!isLoadingSuggestions && !suggestionsError && replySuggestions.length === 0 && (
-                <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>No suggestions available.</Text>
-              )}
-              {replySuggestions.map((reply, idx) => (
-                <TouchableOpacity key={`${idx}-${reply}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8 }}>
-                  <Text style={{ color: C.textPrimary, fontSize: 13, lineHeight: 19 }}>{reply}</Text>
-                </TouchableOpacity>
-              ))}
-            </>}
+                <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 12 }}>AI SUGGESTED REPLIES</Text>
+
+                {replySuggestions.map((reply, idx) => (
+                  <TouchableOpacity
+                    key={`${idx}-${reply}`}
+                    activeOpacity={0.7}
+                    style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}
+                    onPress={() => {
+                      setReplyInEdit(reply);
+                      setSendError('');
+                      setTimeout(() => modalScrollRef.current?.scrollToEnd?.({ animated: true }), 100);
+                    }}
+                  >
+                    <Text style={{ color: C.textPrimary, fontSize: 13, lineHeight: 19, flex: 1 }}>{reply}</Text>
+                    <Text style={{ color: C.textMuted, fontSize: 12, marginLeft: 8 }}>›</Text>
+                  </TouchableOpacity>
+                ))}
+
+                {replyInEdit != null && (
+                  <View style={{ marginTop: 12, marginBottom: 12 }}>
+                    <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>EDIT & SEND REPLY</Text>
+                    <TextInput
+                      style={[s.textInput, { minHeight: 80, textAlignVertical: 'top', paddingTop: 10 }]}
+                      placeholder="Edit your reply..."
+                      placeholderTextColor={C.textMuted}
+                      multiline
+                      value={replyInEdit}
+                      onChangeText={setReplyInEdit}
+                    />
+                    {!!sendError && <Text style={{ color: C.red, fontSize: 12, marginTop: 6 }}>{sendError}</Text>}
+                    {selectedMessage?.messageId && String(selectedMessage.messageId).startsWith('gmail-') ? null : (
+                      <Text style={{ color: C.textMuted, fontSize: 11, marginTop: 6 }}>Send is only available for Gmail messages.</Text>
+                    )}
+                    <View style={{ flexDirection: 'row', marginTop: 10, gap: 10 }}>
+                      <TouchableOpacity
+                        style={{ flex: 1, backgroundColor: (selectedMessage?.messageId && String(selectedMessage.messageId).startsWith('gmail-')) ? C.accent : C.border, borderRadius: 10, paddingVertical: 12, alignItems: 'center' }}
+                        onPress={async () => {
+                          if (!(selectedMessage?.messageId && String(selectedMessage.messageId).startsWith('gmail-'))) return;
+                          const userKey = (userKeys?.gmail || '').trim().toLowerCase();
+                          if (!userKey) { setSendError('No Gmail account'); return; }
+                          setSendingReply(true);
+                          setSendError('');
+                          try {
+                            const res = await fetch(`${getBaseUrl()}/send_reply`, {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                user_key: userKey,
+                                message_id: selectedMessage.messageId,
+                                body: replyInEdit,
+                                subject: selectedMessage.title,
+                              }),
+                            });
+                            const data = await res.json().catch(() => ({}));
+                            if (!res.ok) {
+                              setSendError(data?.message || `Send failed (${res.status})`);
+                              return;
+                            }
+                            setReplyInEdit(null);
+                            setSelectedMessage(null);
+                            Alert.alert('Sent', 'Reply sent in the same conversation.');
+                          } catch (e) {
+                            setSendError(e?.message || 'Request failed');
+                          } finally {
+                            setSendingReply(false);
+                          }
+                        }}
+                        disabled={sendingReply || !(selectedMessage?.messageId && String(selectedMessage.messageId).startsWith('gmail-'))}
+                      >
+                        <Text style={{ color: '#fff', fontWeight: '700', fontSize: 14 }}>{sendingReply ? 'Sending…' : 'Send reply'}</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={{ paddingVertical: 12, paddingHorizontal: 16, justifyContent: 'center' }}
+                        onPress={() => { setReplyInEdit(null); setSendError(''); }}
+                      >
+                        <Text style={{ color: C.textMuted, fontSize: 14, fontWeight: '600' }}>Cancel</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                )}
+
+                {isLoadingSuggestions && (
+                  <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>Generating suggestions...</Text>
+                )}
+                {!isLoadingSuggestions && !!suggestionsError && (
+                  <Text style={{ color: C.red, fontSize: 13, marginBottom: 8 }}>{suggestionsError}</Text>
+                )}
+                {!isLoadingSuggestions && !suggestionsError && replySuggestions.length === 0 && (
+                  <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>No suggestions available.</Text>
+                )}
+              </ScrollView>
+            )}
           </View>
         </View>
       </Modal>
@@ -779,14 +948,18 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
       if (!d.message_id || seenByMessage.has(d.message_id)) return null;
       seenByMessage.add(d.message_id);
 
-      const isoRaw = String(d.resolved_date || d.parsed_at_utc || '').trim();
-      let dateStr = '';
-      let timeStr = '';
-      if (isoRaw) {
-        const parts = isoRaw.split('T');
-        dateStr = parts[0].slice(0, 10);
-        timeStr = parts.length > 1 && parts[1].length >= 5 ? parts[1].slice(0, 5) : '';
-      }
+      const isoRaw = d.resolved_date || d.parsed_at_utc || '';
+      const dt = new Date(isoRaw);
+      const dateStr = Number.isNaN(dt.getTime())
+        ? (isoRaw.includes('T') ? isoRaw.split('T')[0] : isoRaw.slice(0, 10))
+        : dt.toISOString().slice(0, 10);
+      const timeStr = Number.isNaN(dt.getTime())
+        ? ''
+        : dt.toISOString().slice(11, 16);
+      const timeStrClean = timeStr === '00:00' ? '' : timeStr;
+      const sourceService = String(d?.source_service || 'gmail').toLowerCase();
+      const source = sourceService === 'calendar' ? 'Calendar' : (sourceService === 'outlook' ? 'Outlook' : 'Gmail');
+      const sourceIcon = sourceService === 'calendar' ? '📅' : (sourceService === 'outlook' ? '📨' : '✉️');
 
       const msg = msgById[d.message_id];
       if (msg && isDeleted(`${msg.source || 'gmail'}-${msg.id}`)) return null;
@@ -814,7 +987,7 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
         junkKey: `cal-${d.id}`,
         title,
         date: dateStr,
-        time: timeStr,
+        time: timeStrClean,
         duration: null,
         attendees: [],
         source: isOutlookCalEvent ? 'Outlook Calendar' : (isOutlook ? 'Outlook Email' : 'Gmail'),
@@ -929,49 +1102,49 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
         </View>
       )}
 
-      <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
-        <View style={s.modalOverlay}>
-          <View style={s.modalSheet}>
-            {selected && <>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
-                <Text style={s.modalTitle}>{selected.title}</Text>
-                <TouchableOpacity onPress={() => setSelected(null)} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-                  <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
-                </TouchableOpacity>
-              </View>
-              {[
-                ['🕐', `${selected.time}${selected.duration ? ` · ${selected.duration}` : ''}`],
-                ['📅', formatDate(selected.date)],
-                [selected.sourceIcon, selected.source],
-                selected.attendees.length > 0 ? ['👥', selected.attendees.join(', ')] : null,
-              ].filter(Boolean).map(([icon, text]) => (
-                <View key={text} style={s.modalRow}>
-                  <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>{icon}</Text>
-                  <Text style={{ fontSize: 14, color: C.textSecondary, flex: 1 }}>{text}</Text>
-                </View>
-              ))}
-              {selected.videoLink && (
-                <View style={[s.modalRow, { backgroundColor: C.accentSoft, borderRadius: 10, padding: 10, marginTop: 4 }]}>
-                  <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>🔗</Text>
-                  <Text style={{ fontSize: 13, color: C.accent, flex: 1 }} numberOfLines={1}>{selected.videoLink}</Text>
-                </View>
-              )}
-              {selected.notes && (
-                <View style={{ marginTop: 16, backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12 }}>
-                  <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 4 }}>NOTES</Text>
-                  <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>{selected.notes}</Text>
-                </View>
-              )}
-            </>}
+ <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
+    <TouchableOpacity style={s.modalOverlay} activeOpacity={1} onPress={() => setSelected(null)}>
+      <TouchableOpacity activeOpacity={1} onPress={() => {}} style={s.modalSheet}>
+        {selected && <>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 }}>
+            <Text style={s.modalTitle}>{selected.title}</Text>
+            <TouchableOpacity onPress={() => setSelected(null)} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+              <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
+            </TouchableOpacity>
           </View>
-        </View>
-      </Modal>
+          {[
+            selected.time ? ['🕐', `${selected.time}${selected.duration ? ` · ${selected.duration}` : ''}`] : null,
+            ['📅', formatDate(selected.date)],
+            [selected.sourceIcon, selected.source],
+            selected.attendees.length > 0 ? ['👥', selected.attendees.join(', ')] : null,
+          ].filter(Boolean).map(([icon, text]) => (
+            <View key={text} style={s.modalRow}>
+              <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>{icon}</Text>
+              <Text style={{ fontSize: 14, color: C.textSecondary, flex: 1 }}>{text}</Text>
+            </View>
+          ))}
+          {selected.videoLink && (
+            <View style={[s.modalRow, { backgroundColor: C.accentSoft, borderRadius: 10, padding: 10, marginTop: 4 }]}>
+              <Text style={{ fontSize: 16, width: 24, textAlign: 'center' }}>🔗</Text>
+              <Text style={{ fontSize: 13, color: C.accent, flex: 1 }} numberOfLines={1}>{selected.videoLink}</Text>
+            </View>
+          )}
+          {selected.notes && (
+            <View style={{ marginTop: 16, backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12 }}>
+              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 4 }}>NOTES</Text>
+              <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>{selected.notes}</Text>
+            </View>
+          )}
+        </>}
+      </TouchableOpacity>
+    </TouchableOpacity>
+  </Modal>
     </ScrollView>
   );
 }
 
 // ─── Dashboard: TODO Tab (links & attachments) ───────────────────────────────
-function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveToJunk, userKey = '' }) {
+function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveToJunk, userKeys = { gmail: '', outlook: '' } }) {
   const links = ingestLinks.filter(l => !isDeleted(`link-${l.id}`)).slice(0, 3);
   const isAllowedDocAttachment = (a) => {
     const mime = String(a?.mime_type || '').trim().toLowerCase();
@@ -1025,11 +1198,18 @@ function TodoTab({ ingestLinks = [], ingestAttachments = [], isDeleted, onMoveTo
   };
   const openAttachment = (a) => {
     const source = String(a?.original_path || '').trim();
+    const isOutlookAttachment = source.startsWith('outlook_attachment_id:');
+    const baseUrl = isOutlookAttachment ? getOutlookBaseUrl() : getBaseUrl();
+    const attachmentUserKey = isOutlookAttachment
+      ? String(userKeys?.outlook || '').trim().toLowerCase()
+      : String(userKeys?.gmail || '').trim().toLowerCase();
+    const clientIdSuffix = isOutlookAttachment && OUTLOOK_CLIENT_ID_OVERRIDE
+      ? `&client_id=${encodeURIComponent(OUTLOOK_CLIENT_ID_OVERRIDE)}`
+      : '';
 
     if (a?.id != null) {
-      const normalizedUser = String(userKey || '').trim().toLowerCase();
-      const qs = `attachment_id=${encodeURIComponent(String(a.id))}${normalizedUser ? `&user_key=${encodeURIComponent(normalizedUser)}` : ''}`;
-      const previewUrl = `${getBaseUrl()}/attachment_preview?${qs}`;
+      const qs = `attachment_id=${encodeURIComponent(String(a.id))}${attachmentUserKey ? `&user_key=${encodeURIComponent(attachmentUserKey)}` : ''}`;
+      const previewUrl = `${baseUrl}/attachment_preview?${qs}${clientIdSuffix}`;
       Linking.openURL(previewUrl).catch(() => Alert.alert('Unable to open attachment', previewUrl));
       return;
     }
@@ -1096,31 +1276,46 @@ function ThreadsTab({ ingestMessages = [], isDeleted, onMoveToJunk }) {
   const [selected, setSelected] = useState(null);
 
   const threads = React.useMemo(() => {
+    const isLikelySpam = (msg) => {
+      const subject = String(msg?.subject || '').toLowerCase();
+      const snippet = String(msg?.snippet || '').toLowerCase();
+      const sender = String(msg?.sender || msg?.sender_name || '').toLowerCase();
+      const text = `${subject} ${snippet} ${sender}`;
+
+      const spamPatterns = [
+        /unsubscribe/, /lottery|winner|won|prize|jackpot/, /crypto|bitcoin giveaway/, /gift\s*card/,
+        /claim\s*now|act\s*now|limited\s*time/, /urgent\s*action\s*required/, /congratulations\s*you\s*won/,
+        /viagra|casino|bet\s*now/, /free\s*money|work\s*from\s*home/, /click\s*here\s*to\s*verify/,
+        /million\s*dollar|\$\s*\d+[\.,]?\d*\s*(million|billion)/, /processing\s*fee|wire\s*transfer/,
+        /bank\s*account\s*number|mother\s*maiden|passport\s*id|driver\s*passport/,
+      ];
+      if (spamPatterns.some((re) => re.test(text))) return true;
+
+      const suspiciousSenderPatterns = [
+        /no-?reply@/, /mailer-daemon@/, /bounce@/, /noreply@/, /notification@/, /promo@/,
+      ];
+      if (suspiciousSenderPatterns.some((re) => re.test(sender))) {
+        if (/offer|deal|sale|discount|promo|verify|security alert/.test(text)) return true;
+      }
+
+      return false;
+    };
+
     const bySender = new Map();
 
-    (ingestMessages || []).forEach((msg) => {
-      if (isDeleted(`${msg.source || 'gmail'}-${msg.id}`)) return;
-      let sender = 'Unknown Sender';
-      let sName = (msg?.sender_name || '').trim();
-      let sEmail = (msg?.sender || '').trim();
-      
-      if (sName) {
-        if (sName.includes('<')) sName = sName.split('<')[0].trim();
-        sName = sName.replace(/^["']|["']$/g, '').trim();
-        sender = (sName !== sEmail && !sName.includes('@')) ? sName : sName.split('@')[0];
-      } else if (sEmail) {
-        if (sEmail.includes('<')) sEmail = sEmail.split('<')[0].trim();
-        sender = sEmail.split('@')[0];
-      }
+    (ingestMessages || []).filter(m => m?.source_service !== 'calendar').forEach((msg) => {
+      if (isLikelySpam(msg)) return;
+
+      const rawSender = `${msg?.sender_name || msg?.sender || ''}`.trim();
+      let sender = rawSender;
+      if (!sender) sender = 'Unknown Sender';
+      if (sender.includes('<')) sender = sender.split('<')[0].trim() || sender;
 
       const ts = msg?.sent_at_utc ? new Date(msg.sent_at_utc).getTime() : 0;
       const item = {
         id: msg.id,
-        source: msg.source,
         subject: msg.subject || 'No subject',
         snippet: msg.snippet || '',
-        summary_phrase: msg.summary_phrase || '',
-        description: msg.description || '',
         sentAt: msg.sent_at_utc || null,
         ts,
       };
@@ -1133,15 +1328,14 @@ function ThreadsTab({ ingestMessages = [], isDeleted, onMoveToJunk }) {
     bySender.forEach((items, sender) => {
       const sorted = items.sort((a, b) => b.ts - a.ts);
       const latest = sorted[0];
-      const isOutlook = latest?.source === 'outlook';
       out.push({
         id: `th-${sender}`,
         contact: sender,
-        source: isOutlook ? 'Outlook' : 'Gmail',
-        sourceIcon: isOutlook ? '📨' : '✉️',
+        source: 'Gmail',
+        sourceIcon: '✉️',
         timestamp: latest?.ts || 0,
-        latestSubject: isOutlook ? (latest?.summary_phrase || latest?.subject || 'No subject') : (latest?.subject || 'No subject'),
-        latestSnippet: isOutlook ? (latest?.description || latest?.snippet || '') : (latest?.snippet || ''),
+        latestSubject: latest?.subject || 'No subject',
+        latestSnippet: latest?.snippet || '',
         count: sorted.length,
         messages: sorted,
       });
@@ -1204,16 +1398,14 @@ function ThreadsTab({ ingestMessages = [], isDeleted, onMoveToJunk }) {
                   <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
                 </TouchableOpacity>
               </View>
-              <Text style={{ fontSize: 13, color: C.textPrimary, fontWeight: '700', marginBottom: 12, marginTop: 12, letterSpacing: 0.5, borderBottomWidth: 1, borderBottomColor: C.border, paddingBottom: 4 }}>Recent Dialogues</Text>
-              <ScrollView style={{ maxHeight: 400 }}>
-                {selected.messages.slice(0, 8).map(m => (
-                  <View key={`m-${m.id}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8 }}>
-                    <Text style={{ fontSize: 13, color: C.textPrimary, fontWeight: '700', marginBottom: 4 }} numberOfLines={1}>{m.summary_phrase || m.subject || 'No subject'}</Text>
-                    {!!(m.description || m.snippet) && <Text style={{ fontSize: 12, color: C.textSecondary, lineHeight: 18 }} numberOfLines={3}>{m.description || m.snippet}</Text>}
-                    <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 8, textAlign: 'right' }}>{m.sentAt ? new Date(m.sentAt).toLocaleString() : ''}</Text>
-                  </View>
-                ))}
-              </ScrollView>
+              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>RECENT EMAILS</Text>
+              {selected.messages.slice(0, 8).map(m => (
+                <View key={`m-${m.id}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8 }}>
+                  <Text style={{ fontSize: 13, color: C.textPrimary, fontWeight: '700' }} numberOfLines={1}>{m.subject}</Text>
+                  {!!m.snippet && <Text style={{ fontSize: 12, color: C.textSecondary, marginTop: 4 }} numberOfLines={2}>{m.snippet}</Text>}
+                  <Text style={{ fontSize: 11, color: C.textMuted, marginTop: 6 }}>{m.sentAt ? new Date(m.sentAt).toLocaleString() : ''}</Text>
+                </View>
+              ))}
             </>}
           </View>
         </View>
@@ -1248,11 +1440,11 @@ const TABS = [
   { key: 'notifications', label: 'Inbox', icon: '🔔' },
   { key: 'threads', label: 'Threads', icon: '🧵' },
   { key: 'calendar', label: 'Calendar', icon: '📅' },
-  { key: 'todo', label: 'Links & Attachments', icon: '📌' },
+  { key: 'todo', label: 'Files', icon: '📌' },
   { key: 'junk', label: 'Junk', icon: '🗑️' },
 ];
 
-function Dashboard({ ingestData, onBackToSetup, userKey = '' }) {
+function Dashboard({ ingestData, onBackToSetup, userKeys = { gmail: '', outlook: '' } }) {
   const [notifItems, setNotifItems] = useState(DATA.notifications.map(n => ({ ...n, read: false })));
   const [deletedMap, setDeletedMap] = useState({});
   const [deletedItems, setDeletedItems] = useState([]);
@@ -1285,11 +1477,12 @@ function Dashboard({ ingestData, onBackToSetup, userKey = '' }) {
             ingestDates={ingestData.dates}
             isDeleted={isDeleted}
             onMoveToJunk={onMoveToJunk}
+            userKeys={userKeys}
           />
         )}
         {tab === 'threads' && <ThreadsTab ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
         {tab === 'calendar' && <CalendarTab ingestDates={ingestData.dates} ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
-        {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} userKey={userKey} />}
+        {tab === 'todo' && <TodoTab ingestLinks={ingestData.links} ingestAttachments={ingestData.attachments} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} userKeys={userKeys} />}
         {tab === 'junk' && <JunkTab deletedItems={deletedItems} />}
       </View>
       <View style={s.tabBar}>
@@ -1328,37 +1521,20 @@ export default function App() {
   const [appAccounts, setAppAccounts] = useState({ gmail: '', calendar: '', outlook: '', imessage: '' });
   const [userKey, setUserKey] = useState('');
   const [isConnectingAccounts, setIsConnectingAccounts] = useState(false);
-
-  const [outlookSignedIn, setOutlookSignedIn] = useState(false);
-  const [outlookAccessToken, setOutlookAccessToken] = useState('');
+  const REQUEST_TIMEOUT_MS = 25000;
 
   const normalizedUserKey = (userKey || '').trim().toLowerCase();
+  const normalizedGmailUserKey = (appAccounts.gmail || '').trim().toLowerCase();
+  const normalizedOutlookUserKey = (appAccounts.outlook || '').trim().toLowerCase();
+  const normalizedCalendarUserKey = (appAccounts.calendar || '').trim().toLowerCase();
 
-  const handleOutlookSignedIn = async (token) => {
-    setOutlookAccessToken(token);
-    setOutlookSignedIn(true);
-
+  const fetchWithTimeout = async (url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(`${getBaseUrl()}/ingest_outlook`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ access_token: token }),
-      });
-
-      const raw = await response.text();
-      let data = null;
-      try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
-
-      if (!response.ok) {
-        const msg = data?.message || raw || `HTTP ${response.status}`;
-        throw new Error(msg);
-      }
-      
-      // Load summary to update UI with latest from extracted.db
-      await loadSummary();
-      Alert.alert('Success', 'Outlook connected and data ingested.');
-    } catch (e) {
-      Alert.alert('Outlook Ingest Error', e.message);
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      clearTimeout(timeoutId);
     }
   };
 
@@ -1379,7 +1555,7 @@ export default function App() {
     switch (current) {
       case 'welcome': return <WelcomeScreen />;
       case 'connect': return <ConnectAppsScreen selected={selectedApps} onToggle={id => setSelectedApps(p => p.includes(id) ? p.filter(a => a !== id) : [...p, id])} />;
-      case 'accounts': return <AppAccountsScreen selectedApps={selectedApps} accountValues={appAccounts} onChangeAccount={(appId, value) => setAppAccounts(prev => ({ ...prev, [appId]: value }))} outlookSignedIn={outlookSignedIn} onOutlookSignedIn={handleOutlookSignedIn} />;
+      case 'accounts': return <AppAccountsScreen selectedApps={selectedApps} accountValues={appAccounts} onChangeAccount={(appId, value) => setAppAccounts(prev => ({ ...prev, [appId]: value }))} />;
       case 'whitelist': return <WhitelistScreen contacts={contacts} inputValue={contactInput} onChangeInput={setContactInput}
         onAdd={() => { const t = contactInput.trim(); if (t && !contacts.includes(t)) setContacts(p => [...p, t]); setContactInput(''); }}
         onRemove={name => setContacts(p => p.filter(c => c !== name))} />;
@@ -1391,77 +1567,114 @@ export default function App() {
 
   const triggerIngestion = async (showAlert = true) => {
     try {
-      if (!normalizedUserKey) {
-        if (showAlert) Alert.alert('Connect account', 'Enter your email first.');
+      const targets = [];
+      if (selectedApps.includes('gmail') && normalizedGmailUserKey) {
+        targets.push({ label: 'Gmail', service: 'gmail', baseUrl: getBaseUrl(), userKey: normalizedGmailUserKey });
+      }
+      if (selectedApps.includes('outlook') && normalizedOutlookUserKey) {
+        targets.push({ label: 'Outlook', service: 'outlook', baseUrl: getOutlookBaseUrl(), userKey: normalizedOutlookUserKey });
+      }
+      // Ingest calendar whenever we have a Google account (same as Gmail)
+      const calKey = normalizedCalendarUserKey || normalizedGmailUserKey;
+      if (calKey) targets.push({ label: 'Calendar', service: 'calendar', baseUrl: getBaseUrl(), userKey: calKey });
+
+      if (targets.length === 0) {
+        if (showAlert) Alert.alert('Connect account', 'Enter your Google account and/or Outlook account in setup first.');
         return;
       }
-      const response = await fetch(`${getBaseUrl()}/ingest`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_key: normalizedUserKey }),
-      });
 
-      // Read body even on error to surface backend message
-      const raw = await response.text();
-      let data = null;
-      try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+      const lines = [];
+      for (const target of targets) {
+        const body = { user_key: target.userKey, service: target.service || 'gmail' };
+        if (target.label === 'Outlook' && OUTLOOK_CLIENT_ID_OVERRIDE) {
+          body.client_id = OUTLOOK_CLIENT_ID_OVERRIDE;
+        }
 
-      if (!response.ok) {
-        const msg = data?.message || `HTTP ${response.status} ${response.statusText}`;
-        throw new Error(msg);
+        const response = await fetchWithTimeout(`${target.baseUrl}/ingest`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        const raw = await response.text();
+        let data = null;
+        try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+
+        if (!response.ok) {
+          const msg = data?.message || `HTTP ${response.status} ${response.statusText}`;
+          throw new Error(`${target.label}: ${msg}`);
+        }
+
+        const result = data || {};
+        const ingest = result.ingest || {};
+        const summary = result.summary || {};
+        const processed = ingest.processed ?? '—';
+        const inserted = ingest.inserted ?? '—';
+        const msgTotal = summary.messages ?? '—';
+        const datesTotal = summary.dates ?? '—';
+        const linksTotal = summary.links ?? '—';
+
+        lines.push(`${target.label}: Inserted ${inserted} / Processed ${processed}`);
+        lines.push(`${target.label} totals — Messages: ${msgTotal}, Dates: ${datesTotal}, Links: ${linksTotal}`);
       }
-
-      const result = data || {};
-      const ingest = result.ingest || {};
-      const summary = result.summary || {};
-      const processed = ingest.processed ?? '—';
-      const inserted = ingest.inserted ?? '—';
-      const msgTotal = summary.messages ?? '—';
-      const datesTotal = summary.dates ?? '—';
-      const linksTotal = summary.links ?? '—';
-      const latest = summary.latest_sent_at ? `Latest email: ${summary.latest_sent_at}` : '';
-
-      const lines = [
-        result.message || 'Emails ingested successfully.',
-        `Inserted ${inserted} / Processed ${processed}`,
-        `Totals — Messages: ${msgTotal}, Dates: ${datesTotal}, Links: ${linksTotal}`,
-        latest,
-      ].filter(Boolean);
 
       if (showAlert) Alert.alert('Success', lines.join('\n'));
     } catch (error) {
-      if (showAlert) Alert.alert('Error', error.message || 'Failed to trigger ingestion');
+      const msg = error.message || 'Failed to trigger ingestion';
+      if (showAlert) {
+        const isReauth = /re-authorization|invalid_scope|invalid_grant/i.test(msg);
+        Alert.alert(isReauth ? 'Re-sign in required' : 'Error', isReauth ? 'Your Google sign-in is missing permissions (e.g. Calendar). In the folder where the backend runs, delete the token file (token.json or token_<your-email>.json), then open the app again and sign in when prompted.' : msg);
+      }
       console.error(error);
     }
   };
 
-  const loadSummary = async (overrideUserKey = null) => {
+  const loadSummary = async (overrideKeys = null) => {
     try {
-      const effectiveUserKey = (overrideUserKey || normalizedUserKey || 'outlook_user').trim().toLowerCase();
-      const response = await fetch(`${getBaseUrl()}/summary?user_key=${encodeURIComponent(effectiveUserKey)}`);
-      const raw = await response.text();
-      let data = null;
-      try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+      const keys = {
+        gmail: (overrideKeys?.gmail ?? normalizedGmailUserKey ?? '').trim().toLowerCase(),
+        outlook: (overrideKeys?.outlook ?? normalizedOutlookUserKey ?? '').trim().toLowerCase(),
+        calendar: (overrideKeys?.calendar ?? (normalizedCalendarUserKey || normalizedGmailUserKey) ?? '').trim().toLowerCase(),
+      };
 
-      if (!response.ok) {
-        const msg = data?.message || `HTTP ${response.status} ${response.statusText}`;
-        throw new Error(msg);
+      const targets = [];
+      if (selectedApps.includes('gmail') && keys.gmail) {
+        targets.push({ service: 'gmail', baseUrl: getBaseUrl(), userKey: keys.gmail });
+      }
+      if (selectedApps.includes('outlook') && keys.outlook) {
+        targets.push({ service: 'outlook', baseUrl: getOutlookBaseUrl(), userKey: keys.outlook });
+      }
+      // Always fetch calendar when we have a Google account (same credentials as Gmail)
+      if (keys.gmail) {
+        targets.push({ service: 'calendar', baseUrl: getBaseUrl(), userKey: keys.gmail });
+      }
+      if (targets.length === 0) return;
+
+      const parts = [];
+      const errors = [];
+      for (const target of targets) {
+        try {
+          const limit = target.service === 'calendar' ? 80 : 20;
+          const response = await fetchWithTimeout(`${target.baseUrl}/summary?user_key=${encodeURIComponent(target.userKey)}&service=${encodeURIComponent(target.service || 'gmail')}&limit=${limit}`);
+          const raw = await response.text();
+          let data = null;
+          try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+
+          if (!response.ok) {
+            const msg = data?.message || `HTTP ${response.status} ${response.statusText}`;
+            throw new Error(msg);
+          }
+          parts.push({ service: target.service, summary: data?.summary || {}, data: data?.data || {} });
+        } catch (err) {
+          errors.push(`${target.service.toUpperCase()}: ${err?.name === 'AbortError' ? 'Request timed out' : (err?.message || 'Request failed')}`);
+        }
       }
 
-      const summary = data?.summary || {};
-      const snap = data?.data || {};
-      const msgTotal = summary.messages ?? '—';
-      const datesTotal = summary.dates ?? '—';
-      const linksTotal = summary.links ?? '—';
-      const latest = summary.latest_sent_at ? `Latest: ${summary.latest_sent_at}` : '';
-
-      setIngestData({
-        messages: snap.messages || [],
-        dates: snap.dates || [],
-        links: snap.links || [],
-        attachments: snap.attachments || [],
-        meta: { msgTotal, datesTotal, linksTotal, latest },
-      });
+      if (parts.length > 0) {
+        setIngestData(mergeServiceData(parts));
+      } else if (errors.length > 0) {
+        throw new Error(errors.join('\n'));
+      }
     } catch (error) {
       Alert.alert('Error', error.message || 'Failed to load summary');
       console.error(error);
@@ -1470,36 +1683,71 @@ export default function App() {
 
   const finishSetupAndConnect = async () => {
     const gmailSelected = selectedApps.includes('gmail');
+    const outlookSelected = selectedApps.includes('outlook');
+    const calendarSelected = selectedApps.includes('calendar');
     const gmailAccount = (appAccounts.gmail || '').trim().toLowerCase();
+    const outlookAccount = (appAccounts.outlook || '').trim().toLowerCase();
+    const calendarAccount = (appAccounts.calendar || appAccounts.gmail || '').trim().toLowerCase();
 
-    if (!gmailSelected) {
-      // For pure non-gmail setups (like Outlook only)
-      await loadSummary();
+    if ((gmailSelected || calendarSelected) && !(gmailAccount || calendarAccount)) {
+      Alert.alert('Google account required', 'Please enter your Google account in the Sign in step.');
+      return;
+    }
+
+    if (outlookSelected && !outlookAccount) {
+      Alert.alert('Outlook account required', 'Please add your Outlook account in the Sign in step.');
+      return;
+    }
+
+    // Outlook stays independent.
+
+    if (!gmailSelected && !outlookSelected && !calendarSelected) {
       setDone(true);
       return;
     }
 
     setIsConnectingAccounts(true);
     try {
-      setUserKey(gmailAccount);
+      setUserKey(gmailAccount || outlookAccount || calendarAccount || '');
 
-      const response = await fetch(`${getBaseUrl()}/ingest`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_key: gmailAccount, force_reauth: false, reset_cursor: true }),
-      });
+      const connectTargets = [];
+      if (gmailSelected) connectTargets.push({ label: 'Gmail', baseUrl: getBaseUrl(), userKey: gmailAccount });
+      if (outlookSelected) connectTargets.push({ label: 'Outlook', baseUrl: getOutlookBaseUrl(), userKey: outlookAccount });
+      if (calendarSelected) connectTargets.push({ label: 'Calendar', service: 'calendar', baseUrl: getBaseUrl(), userKey: calendarAccount });
 
-      const raw = await response.text();
-      let data = null;
-      try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+      const connectErrors = [];
+      for (const target of connectTargets) {
+        const body = { user_key: target.userKey, service: target.service || 'gmail', force_reauth: false, reset_cursor: true };
+        if (target.label === 'Outlook' && OUTLOOK_CLIENT_ID_OVERRIDE) {
+          body.client_id = OUTLOOK_CLIENT_ID_OVERRIDE;
+        }
 
-      if (!response.ok) {
-        const msg = data?.message || `HTTP ${response.status} ${response.statusText}`;
-        throw new Error(msg);
+        try {
+          const response = await fetchWithTimeout(`${target.baseUrl}/ingest`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+
+          const raw = await response.text();
+          let data = null;
+          try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+
+          if (!response.ok) {
+            const msg = data?.message || `HTTP ${response.status} ${response.statusText}`;
+            connectErrors.push(`${target.label}: ${msg}`);
+          }
+        } catch (err) {
+          connectErrors.push(`${target.label}: ${err?.name === 'AbortError' ? 'Request timed out while connecting' : (err?.message || 'Connection failed')}`);
+        }
       }
 
-      await loadSummary(gmailAccount);
+      await loadSummary({ gmail: gmailAccount, outlook: outlookAccount, calendar: calendarAccount });
       setDone(true);
+
+      if (connectErrors.length > 0) {
+        Alert.alert('Opened dashboard with warnings', connectErrors.join('\n'));
+      }
     } catch (error) {
       Alert.alert('Connect failed', error?.message || 'Unable to connect selected Gmail account. Continuing to dashboard anyway.');
       console.error(error);
@@ -1515,17 +1763,25 @@ export default function App() {
     if (!done) return;
     loadSummary();
     const id = setInterval(() => {
-      if (normalizedUserKey) {
-        triggerIngestion(false);
-      }
+      triggerIngestion(false);
       loadSummary();
     }, 20000);
     return () => clearInterval(id);
-  }, [done, normalizedUserKey]);
+  }, [done, selectedApps, normalizedGmailUserKey, normalizedOutlookUserKey, normalizedCalendarUserKey]);
+
+  useEffect(() => {
+    if (done) {
+      loadSummary();
+    }
+  }, [done]);
 
   if (done) return (
     <SafeAreaProvider>
-      <Dashboard ingestData={ingestData} onBackToSetup={() => setDone(false)} userKey={normalizedUserKey} />
+      <Dashboard
+        ingestData={ingestData}
+        onBackToSetup={() => setDone(false)}
+        userKeys={{ gmail: normalizedGmailUserKey, outlook: normalizedOutlookUserKey }}
+      />
     </SafeAreaProvider>
   );
 
