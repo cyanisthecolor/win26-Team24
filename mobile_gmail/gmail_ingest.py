@@ -7,8 +7,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from email.mime.text import MIMEText
 from email.utils import parseaddr
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from dateparser.search import search_dates
@@ -20,7 +21,11 @@ from googleapiclient.discovery import build
 from flask import Flask, request, jsonify, Response
 import logging
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/calendar.readonly",
+]
 
 URL_RE = re.compile(
     r"""(?xi)
@@ -84,6 +89,29 @@ def resolve_user_paths(user_key: Optional[str], db_path: Optional[str] = None) -
         token_path = "token.json"
         resolved_db_path = db_path or "extracted.db"
     return token_path, resolved_db_path
+
+
+def datetime_to_rfc3339_utc(dt: datetime) -> str:
+    """Convert a datetime into RFC3339 UTC form (e.g. 2026-01-01T12:00:00Z)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def parse_iso_datetime_to_utc(value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO/RFC3339 datetime string into a timezone-aware UTC datetime."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # datetime.fromisoformat doesn't handle trailing "Z" well.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def fallback_reply_suggestions(subject: str, body: str) -> List[str]:
@@ -441,64 +469,67 @@ def is_allowed_document_attachment(filename: Optional[str], mime_type: Optional[
     return ext in ALLOWED_ATTACHMENT_EXTENSIONS
 
 
-def get_db_summary(db_path: str, account_key: Optional[str] = None) -> Dict[str, Optional[str]]:
+def get_db_summary(
+    db_path: str,
+    account_key: Optional[str] = None,
+    service: Optional[str] = None,
+) -> Dict[str, Optional[str]]:
     """Return high-level counts from the ingestion database."""
     conn = open_sqlite_rw(db_path)
     try:
         norm_key = normalize_user_key(account_key)
+        norm_service = (service or "").strip().lower() or None
+
+        def service_suffix(prefix_alias: str, include_service_filter: bool) -> str:
+            if include_service_filter:
+                return f" AND {prefix_alias}.source = ?"
+            return ""
 
         if norm_key:
-            messages = conn.execute("SELECT COUNT(*) AS c FROM messages WHERE account_key = ?", (norm_key,)).fetchone()["c"]
-            dates = conn.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM extracted_dates d
-                JOIN messages m ON m.id = d.message_id
-                WHERE m.account_key = ?
-                """,
-                (norm_key,),
-            ).fetchone()["c"]
-            links = conn.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM extracted_links l
-                JOIN messages m ON m.id = l.message_id
-                WHERE m.account_key = ?
-                """,
-                (norm_key,),
-            ).fetchone()["c"]
-            attachments = conn.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM extracted_attachments a
-                JOIN messages m ON m.id = a.message_id
-                                WHERE m.account_key = ?
-                                    AND (
-                                        LOWER(COALESCE(a.mime_type, '')) IN (
-                                            'application/pdf',
-                                            'application/msword',
-                                            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-                                        )
-                                        OR LOWER(COALESCE(a.filename, '')) LIKE '%.pdf'
-                                        OR LOWER(COALESCE(a.filename, '')) LIKE '%.doc'
-                                        OR LOWER(COALESCE(a.filename, '')) LIKE '%.docx'
-                                    )
-                """,
-                (norm_key,),
-            ).fetchone()["c"]
-            latest_row = conn.execute(
-                "SELECT sent_at_utc FROM messages WHERE account_key = ? ORDER BY source_rowid DESC LIMIT 1",
-                (norm_key,),
-            ).fetchone()
-        else:
-            messages = conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"]
-            dates = conn.execute("SELECT COUNT(*) AS c FROM extracted_dates").fetchone()["c"]
-            links = conn.execute("SELECT COUNT(*) AS c FROM extracted_links").fetchone()["c"]
-            attachments = conn.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM extracted_attachments a
-                WHERE
+            # Messages
+            msg_sql = "SELECT COUNT(*) AS c FROM messages WHERE account_key = ?"
+            msg_params = [norm_key]
+            if norm_service:
+                msg_sql += " AND source = ?"
+                msg_params.append(norm_service)
+            messages = conn.execute(msg_sql, tuple(msg_params)).fetchone()["c"]
+
+            # Dates
+            dates_sql = (
+                "SELECT COUNT(*) AS c FROM extracted_dates d "
+                "JOIN messages m ON m.id = d.message_id "
+                "WHERE m.account_key = ?"
+            )
+            dates_params = [norm_key]
+            if norm_service:
+                dates_sql += " AND m.source = ?"
+                dates_params.append(norm_service)
+            dates = conn.execute(dates_sql, tuple(dates_params)).fetchone()["c"]
+
+            # Links
+            links_sql = (
+                "SELECT COUNT(*) AS c FROM extracted_links l "
+                "JOIN messages m ON m.id = l.message_id "
+                "WHERE m.account_key = ?"
+            )
+            links_params = [norm_key]
+            if norm_service:
+                links_sql += " AND m.source = ?"
+                links_params.append(norm_service)
+            links = conn.execute(links_sql, tuple(links_params)).fetchone()["c"]
+
+            # Attachments (documents only)
+            attachments_sql = (
+                "SELECT COUNT(*) AS c FROM extracted_attachments a "
+                "JOIN messages m ON m.id = a.message_id "
+                "WHERE m.account_key = ?"
+            )
+            attachments_params = [norm_key]
+            if norm_service:
+                attachments_sql += " AND m.source = ?"
+                attachments_params.append(norm_service)
+            attachments_sql += """
+                AND (
                     LOWER(COALESCE(a.mime_type, '')) IN (
                         'application/pdf',
                         'application/msword',
@@ -507,11 +538,65 @@ def get_db_summary(db_path: str, account_key: Optional[str] = None) -> Dict[str,
                     OR LOWER(COALESCE(a.filename, '')) LIKE '%.pdf'
                     OR LOWER(COALESCE(a.filename, '')) LIKE '%.doc'
                     OR LOWER(COALESCE(a.filename, '')) LIKE '%.docx'
-                """
-            ).fetchone()["c"]
-            latest_row = conn.execute(
-                "SELECT sent_at_utc FROM messages ORDER BY source_rowid DESC LIMIT 1"
-            ).fetchone()
+                )
+            """
+            attachments = conn.execute(attachments_sql, tuple(attachments_params)).fetchone()["c"]
+
+            # Latest
+            latest_sql = "SELECT sent_at_utc FROM messages WHERE account_key = ?"
+            latest_params = [norm_key]
+            if norm_service:
+                latest_sql += " AND source = ?"
+                latest_params.append(norm_service)
+            latest_sql += " ORDER BY source_rowid DESC LIMIT 1"
+            latest_row = conn.execute(latest_sql, tuple(latest_params)).fetchone()
+        else:
+            # Global counts (not used by the app, but keep functional).
+            messages_sql = "SELECT COUNT(*) AS c FROM messages"
+            params: List[str] = []
+            if norm_service:
+                messages_sql += " WHERE source = ?"
+                params.append(norm_service)
+            messages = conn.execute(messages_sql, tuple(params)).fetchone()["c"]
+
+            dates_sql = "SELECT COUNT(*) AS c FROM extracted_dates d"
+            dates_params = []
+            if norm_service:
+                dates_sql = (
+                    "SELECT COUNT(*) AS c FROM extracted_dates d "
+                    "JOIN messages m ON m.id = d.message_id "
+                    "WHERE m.source = ?"
+                )
+                dates_params = [norm_service]
+            dates = conn.execute(dates_sql, tuple(dates_params)).fetchone()["c"]
+
+            links_sql = "SELECT COUNT(*) AS c FROM extracted_links l"
+            links_params = []
+            if norm_service:
+                links_sql = (
+                    "SELECT COUNT(*) AS c FROM extracted_links l "
+                    "JOIN messages m ON m.id = l.message_id "
+                    "WHERE m.source = ?"
+                )
+                links_params = [norm_service]
+            links = conn.execute(links_sql, tuple(links_params)).fetchone()["c"]
+
+            # Attachment counting uses extracted_attachments only.
+            attachments_sql = """
+                SELECT COUNT(*) AS c
+                FROM extracted_attachments a
+            """
+            attachments = conn.execute(attachments_sql).fetchone()["c"]
+
+            if norm_service:
+                latest_row = conn.execute(
+                    "SELECT sent_at_utc FROM messages WHERE source = ? ORDER BY source_rowid DESC LIMIT 1",
+                    (norm_service,),
+                ).fetchone()
+            else:
+                latest_row = conn.execute(
+                    "SELECT sent_at_utc FROM messages ORDER BY source_rowid DESC LIMIT 1"
+                ).fetchone()
 
         latest_sent_at = latest_row["sent_at_utc"] if latest_row else None
         return {
@@ -525,30 +610,98 @@ def get_db_summary(db_path: str, account_key: Optional[str] = None) -> Dict[str,
         conn.close()
 
 
-def fetch_db_snapshot(db_path: str, limit: int = 20, account_key: Optional[str] = None) -> Dict[str, List[Dict]]:
+def fetch_db_snapshot(
+    db_path: str,
+    limit: int = 20,
+    account_key: Optional[str] = None,
+    service: Optional[str] = None,
+) -> Dict[str, List[Dict]]:
     """Return recent rows from messages, extracted_dates, extracted_links, and attachments."""
     conn = open_sqlite_rw(db_path)
     try:
         norm_key = normalize_user_key(account_key)
+        norm_service = (service or "").strip().lower() or None
 
         if norm_key:
-            msgs = conn.execute(
-                """
-                SELECT id, sender, sender_name, sent_at_utc, text, substr(text, 1, 200) AS snippet
-                FROM messages
-                WHERE account_key = ?
-                ORDER BY source_rowid DESC
-                LIMIT ?
-                """,
-                (norm_key, limit),
-            ).fetchall()
+            if norm_service:
+                msgs = conn.execute(
+                    """
+                    SELECT id, sender, sender_name, sent_at_utc, text, substr(text, 1, 200) AS snippet
+                    FROM messages
+                    WHERE account_key = ?
+                      AND source = ?
+                    ORDER BY source_rowid DESC
+                    LIMIT ?
+                    """,
+                    (norm_key, norm_service, limit),
+                ).fetchall()
 
-            attachments = conn.execute(
-                """
-                SELECT a.id, a.message_id, a.filename, a.mime_type, a.original_path
-                FROM extracted_attachments a
-                JOIN messages m ON m.id = a.message_id
-                                WHERE m.account_key = ?
+                attachments = conn.execute(
+                    """
+                    SELECT a.id, a.message_id, a.filename, a.mime_type, a.original_path
+                    FROM extracted_attachments a
+                    JOIN messages m ON m.id = a.message_id
+                                    WHERE m.account_key = ?
+                                      AND m.source = ?
+                                      AND (
+                                          LOWER(COALESCE(a.mime_type, '')) IN (
+                                              'application/pdf',
+                                              'application/msword',
+                                              'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                                          )
+                                          OR LOWER(COALESCE(a.filename, '')) LIKE '%.pdf'
+                                          OR LOWER(COALESCE(a.filename, '')) LIKE '%.doc'
+                                          OR LOWER(COALESCE(a.filename, '')) LIKE '%.docx'
+                                      )
+                    ORDER BY a.id DESC
+                    LIMIT ?
+                    """,
+                    (norm_key, norm_service, limit),
+                ).fetchall()
+
+                dates = conn.execute(
+                    """
+                    SELECT d.id, d.message_id, d.raw_span, d.resolved_date, d.parsed_at_utc
+                    FROM extracted_dates d
+                    JOIN messages m ON m.id = d.message_id
+                    WHERE m.account_key = ?
+                      AND m.source = ?
+                    ORDER BY d.id DESC
+                    LIMIT ?
+                    """,
+                    (norm_key, norm_service, limit),
+                ).fetchall()
+
+                links = conn.execute(
+                    """
+                    SELECT l.id, l.message_id, l.url, m.sender_name, m.sender, m.text
+                    FROM extracted_links l
+                    JOIN messages m ON m.id = l.message_id
+                    WHERE m.account_key = ?
+                      AND m.source = ?
+                    ORDER BY l.id DESC
+                    LIMIT ?
+                    """,
+                    (norm_key, norm_service, limit),
+                ).fetchall()
+            else:
+                msgs = conn.execute(
+                    """
+                    SELECT id, sender, sender_name, sent_at_utc, text, substr(text, 1, 200) AS snippet
+                    FROM messages
+                    WHERE account_key = ?
+                    ORDER BY source_rowid DESC
+                    LIMIT ?
+                    """,
+                    (norm_key, limit),
+                ).fetchall()
+
+                attachments = conn.execute(
+                    """
+                    SELECT a.id, a.message_id, a.filename, a.mime_type, a.original_path
+                    FROM extracted_attachments a
+                    JOIN messages m ON m.id = a.message_id
+                                    WHERE m.account_key = ?
                                     AND (
                                         LOWER(COALESCE(a.mime_type, '')) IN (
                                             'application/pdf',
@@ -559,35 +712,35 @@ def fetch_db_snapshot(db_path: str, limit: int = 20, account_key: Optional[str] 
                                         OR LOWER(COALESCE(a.filename, '')) LIKE '%.doc'
                                         OR LOWER(COALESCE(a.filename, '')) LIKE '%.docx'
                                     )
-                ORDER BY a.id DESC
-                LIMIT ?
-                """,
-                (norm_key, limit),
-            ).fetchall()
+                    ORDER BY a.id DESC
+                    LIMIT ?
+                    """,
+                    (norm_key, limit),
+                ).fetchall()
 
-            dates = conn.execute(
-                """
-                SELECT d.id, d.message_id, d.raw_span, d.resolved_date, d.parsed_at_utc
-                FROM extracted_dates d
-                JOIN messages m ON m.id = d.message_id
-                WHERE m.account_key = ?
-                ORDER BY d.id DESC
-                LIMIT ?
-                """,
-                (norm_key, limit),
-            ).fetchall()
+                dates = conn.execute(
+                    """
+                    SELECT d.id, d.message_id, d.raw_span, d.resolved_date, d.parsed_at_utc
+                    FROM extracted_dates d
+                    JOIN messages m ON m.id = d.message_id
+                    WHERE m.account_key = ?
+                    ORDER BY d.id DESC
+                    LIMIT ?
+                    """,
+                    (norm_key, limit),
+                ).fetchall()
 
-            links = conn.execute(
-                """
-                SELECT l.id, l.message_id, l.url, m.sender_name, m.sender, m.text
-                FROM extracted_links l
-                JOIN messages m ON m.id = l.message_id
-                WHERE m.account_key = ?
-                ORDER BY l.id DESC
-                LIMIT ?
-                """,
-                (norm_key, limit),
-            ).fetchall()
+                links = conn.execute(
+                    """
+                    SELECT l.id, l.message_id, l.url, m.sender_name, m.sender, m.text
+                    FROM extracted_links l
+                    JOIN messages m ON m.id = l.message_id
+                    WHERE m.account_key = ?
+                    ORDER BY l.id DESC
+                    LIMIT ?
+                    """,
+                    (norm_key, limit),
+                ).fetchall()
         else:
             msgs = conn.execute(
                 """
@@ -703,6 +856,29 @@ def gmail_auth(creds_path: str = "credentials.json", token_path: str = "token.js
             f.write(creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
+
+
+def calendar_auth(creds_path: str = "credentials.json", token_path: str = "token.json", force_reauth: bool = False):
+    """Authenticate and return a Google Calendar v3 service client."""
+    # Reauth only when explicitly requested.
+    if force_reauth and os.path.exists(token_path):
+        os.remove(token_path)
+
+    creds = None
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
+            creds = flow.run_local_server(port=0)
+
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
+
+    return build("calendar", "v3", credentials=creds)
 
 
 def header_map(headers: List[Dict[str, str]]) -> Dict[str, str]:
@@ -934,6 +1110,204 @@ def ingest_gmail(
         conn.close()
 
 
+def ingest_calendar_events(
+    out_db_path: str,
+    source: str = "calendar",
+    calendar_id: str = "primary",
+    reset_cursor_flag: bool = False,
+    force_reauth: bool = False,
+    token_path: str = "token.json",
+    account_key: Optional[str] = None,
+    time_min_days_past: int = 14,
+    time_max_days_future: int = 365,
+    page_size: int = 250,
+    max_pages: int = 8,
+) -> Dict[str, int]:
+    """
+    Ingest upcoming Google Calendar events into the SQLite DB.
+
+    We store each event as a synthetic "message" row so the existing UI can
+    reuse `extracted_dates` + `CalendarTab` logic.
+    """
+    conn = open_sqlite_rw(out_db_path)
+    calendar_service = calendar_auth(token_path=token_path, force_reauth=force_reauth)
+
+    norm_account_key = normalize_user_key(account_key)
+    processed = 0
+    inserted = 0
+    max_updated_ms_seen = 0
+
+    try:
+        if reset_cursor_flag:
+            reset_cursor(conn, source)
+            conn.commit()
+
+        last_ms = get_last_cursor(conn, source)
+        now = datetime.now(tz=timezone.utc)
+
+        time_min_dt = now - timedelta(days=time_min_days_past)
+        time_max_dt = now + timedelta(days=time_max_days_future)
+
+        # Use updatedMin so we only fetch events changed since the last sync.
+        if last_ms and last_ms > 0:
+            updated_min_dt = datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc)
+        else:
+            updated_min_dt = time_min_dt
+
+        # Guard: ensure updatedMin isn't older than timeMin.
+        if updated_min_dt < time_min_dt:
+            updated_min_dt = time_min_dt
+
+        time_min_rfc = datetime_to_rfc3339_utc(time_min_dt)
+        time_max_rfc = datetime_to_rfc3339_utc(time_max_dt)
+        updated_min_rfc = datetime_to_rfc3339_utc(updated_min_dt)
+
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN")
+
+        page_token = None
+        pages = 0
+        while True:
+            pages += 1
+            if pages > max_pages:
+                break
+
+            params = {
+                "calendarId": calendar_id,
+                "singleEvents": True,
+                "orderBy": "updated",
+                "timeMin": time_min_rfc,
+                "timeMax": time_max_rfc,
+                "updatedMin": updated_min_rfc,
+                "maxResults": page_size,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+
+            resp = calendar_service.events().list(**params).execute()
+            items = resp.get("items", []) or []
+
+            for event in items:
+                status = (event.get("status") or "").strip().lower()
+                if status == "cancelled":
+                    continue
+
+                event_id = event.get("id")
+                if not event_id:
+                    continue
+
+                summary = (event.get("summary") or "").strip() or "Event"
+                description = event.get("description") or ""
+                location = (event.get("location") or "").strip()
+
+                start = event.get("start") or {}
+                end = event.get("end") or {}
+
+                start_dt = None
+                end_dt = None
+
+                if start.get("dateTime"):
+                    start_dt = parse_iso_datetime_to_utc(start.get("dateTime"))
+                    end_dt = parse_iso_datetime_to_utc(end.get("dateTime")) if end.get("dateTime") else start_dt
+                elif start.get("date"):
+                    # All-day events come back as YYYY-MM-DD (treated as midnight UTC).
+                    start_dt = datetime.fromisoformat(str(start.get("date"))).replace(tzinfo=timezone.utc)
+                    if end.get("date"):
+                        end_dt = datetime.fromisoformat(str(end.get("date"))).replace(tzinfo=timezone.utc)
+                    else:
+                        end_dt = start_dt
+
+                if not start_dt:
+                    continue
+                if not end_dt:
+                    end_dt = start_dt
+
+                updated_dt = (
+                    parse_iso_datetime_to_utc(event.get("updated"))
+                    or parse_iso_datetime_to_utc(event.get("created"))
+                    or now
+                )
+
+                updated_ms = int(updated_dt.timestamp() * 1000)
+                max_updated_ms_seen = max(max_updated_ms_seen, updated_ms)
+
+                sent_at_utc = datetime_to_rfc3339_utc(updated_dt)
+                start_utc_rfc = datetime_to_rfc3339_utc(start_dt)
+                end_utc_rfc = datetime_to_rfc3339_utc(end_dt)
+
+                source_rowid = int(start_dt.timestamp() * 1000)
+
+                conv_id = upsert_conversation(
+                    conn,
+                    source=source,
+                    thread_key=str(event_id),
+                    display_name=summary,
+                )
+
+                text = f"Subject: {summary}\n"
+                if description.strip():
+                    text += f"\n{description.strip()}\n"
+                text += f"\nStart: {start_utc_rfc}\nEnd: {end_utc_rfc}\n"
+                if location:
+                    text += f"Location: {location}\n"
+
+                inserted_msg_id = insert_message(
+                    conn,
+                    source=source,
+                    source_msg_key=str(event_id),
+                    source_rowid=source_rowid,
+                    conversation_id=conv_id,
+                    sender=None,
+                    sender_name=None,
+                    account_key=norm_account_key,
+                    account_email=norm_account_key,
+                    sent_at_utc=sent_at_utc,
+                    text=text,
+                )
+
+                message_id_db = inserted_msg_id
+
+                if message_id_db is None:
+                    row = conn.execute(
+                        "SELECT id FROM messages WHERE source=? AND source_msg_key=?",
+                        (source, str(event_id)),
+                    ).fetchone()
+                    message_id_db = int(row["id"]) if row else None
+
+                if message_id_db is None:
+                    continue
+
+                # Replace any existing extracted date for this event/message.
+                conn.execute("DELETE FROM extracted_dates WHERE message_id = ?", (message_id_db,))
+                conn.execute(
+                    """
+                    INSERT INTO extracted_dates(message_id, raw_span, parsed_at_utc, resolved_date, confidence)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (message_id_db, summary, sent_at_utc, start_utc_rfc, 1.0),
+                )
+
+                processed += 1
+                if inserted_msg_id is not None:
+                    inserted += 1
+
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        if max_updated_ms_seen > 0:
+            set_last_cursor(conn, source, max_updated_ms_seen)
+        conn.commit()
+
+        return {
+            "processed": processed,
+            "inserted": inserted,
+        }
+    finally:
+        conn.close()
+
+
 def start_auto_ingest_worker(db_path: str = "extracted.db", interval_seconds: int = AUTO_INGEST_INTERVAL_SECONDS) -> None:
     def _worker() -> None:
         while True:
@@ -993,10 +1367,14 @@ def process_email(
 
 @app.route('/ingest', methods=['POST'])
 def ingest():
-    """API endpoint to trigger Gmail ingestion."""
+    """API endpoint to trigger ingestion for a given `service` (gmail/calendar)."""
     try:
         payload = request.json or {}
         user_key = payload.get('user_key')
+        service_raw = (payload.get('service') or payload.get('source') or 'gmail').strip().lower()
+        service = 'calendar' if service_raw in {'calendar', 'gcal'} else 'gmail'
+        if service_raw in {'gmail', 'mail', 'email'}:
+            service = 'gmail'
         db_path_payload = payload.get('db_path')
         token_path, db_path = resolve_user_paths(user_key=user_key, db_path=db_path_payload)
         reset_flag = bool(payload.get('reset_cursor'))
@@ -1006,32 +1384,59 @@ def ingest():
             force_reauth_flag = False
         else:
             force_reauth_flag = bool(force_reauth_flag)
-        logger.info(f"Starting Gmail ingestion for database: {db_path} token_path={token_path} reset_cursor={reset_flag} force_reauth={force_reauth_flag}")
-        ingest_stats = ingest_gmail(
-            db_path,
-            reset_cursor_flag=reset_flag,
-            force_reauth=force_reauth_flag,
-            token_path=token_path,
-            account_key=user_key,
+
+        logger.info(
+            f"Starting ingestion(service={service}) for database: {db_path} token_path={token_path} "
+            f"reset_cursor={reset_flag} force_reauth={force_reauth_flag}"
         )
-        summary = get_db_summary(db_path, account_key=user_key)
-        logger.info("Gmail ingestion completed successfully.")
+
+        if service == 'calendar':
+            ingest_stats = ingest_calendar_events(
+                db_path,
+                reset_cursor_flag=reset_flag,
+                force_reauth=force_reauth_flag,
+                token_path=token_path,
+                account_key=user_key,
+            )
+            summary = get_db_summary(db_path, account_key=user_key, service=service)
+            logger.info("Calendar ingestion completed successfully.")
+            msg = "Calendar events ingested successfully."
+        else:
+            ingest_stats = ingest_gmail(
+                db_path,
+                reset_cursor_flag=reset_flag,
+                force_reauth=force_reauth_flag,
+                token_path=token_path,
+                account_key=user_key,
+            )
+            summary = get_db_summary(db_path, account_key=user_key, service='gmail')
+            logger.info("Gmail ingestion completed successfully.")
+            msg = "Emails ingested successfully."
+
         return jsonify({
             "status": "success",
-            "message": "Emails ingested successfully.",
+            "message": msg,
             "ingest": ingest_stats,
             "summary": summary,
         })
     except Exception as e:
-        logger.error(f"Error during Gmail ingestion: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        logger.error(f"Error during ingestion: {e}")
+        msg = str(e)
+        if "invalid_scope" in msg.lower() or "invalid_grant" in msg.lower():
+            msg = (
+                "Re-authorization required: your saved sign-in is missing permissions. "
+                "Delete the token file (token.json or token_<your-email>.json in the backend folder) and sign in again when the app asks."
+            )
+        return jsonify({"status": "error", "message": msg}), 500
 
 
 @app.route('/summary', methods=['GET'])
 def summary():
-    """Return recent messages, dates, and links from the ingestion DB."""
+    """Return recent messages/dates/links from the ingestion DB (optionally filtered by `service`)."""
     try:
         user_key = request.args.get('user_key')
+        service_raw = (request.args.get('service') or '').strip().lower()
+        service = 'calendar' if service_raw in {'calendar', 'gcal'} else ('gmail' if service_raw in {'gmail', 'mail', 'email'} else None)
         db_path_raw = request.args.get('db_path')
         _, db_path = resolve_user_paths(user_key=user_key, db_path=db_path_raw)
         limit_raw = request.args.get('limit', '20')
@@ -1039,8 +1444,8 @@ def summary():
             limit = max(1, min(500, int(limit_raw)))
         except ValueError:
             limit = 20
-        snap = fetch_db_snapshot(db_path, limit=limit, account_key=user_key)
-        stats = get_db_summary(db_path, account_key=user_key)
+        snap = fetch_db_snapshot(db_path, limit=limit, account_key=user_key, service=service)
+        stats = get_db_summary(db_path, account_key=user_key, service=service)
         return jsonify({"status": "success", "summary": stats, "data": snap})
     except Exception as e:
         logger.error(f"Error during summary fetch: {e}")
@@ -1226,6 +1631,99 @@ def suggest_reply():
         return jsonify({"status": "success", "suggestions": suggestions})
     except Exception as e:
         logger.error(f"Error during suggest_reply: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/send_reply', methods=['POST'])
+@app.route('/api/send_reply', methods=['POST'])
+def send_reply():
+    """Send an email reply in the same Gmail thread. Requires message_id (e.g. gmail-123), user_key, body, optional subject."""
+    try:
+        payload = request.json or {}
+        user_key = (payload.get('user_key') or '').strip()
+        message_id_composite = (payload.get('message_id') or '').strip()
+        body = (payload.get('body') or '').strip()
+        subject = (payload.get('subject') or '').strip()
+
+        if not user_key or not message_id_composite:
+            return jsonify({"status": "error", "message": "user_key and message_id are required"}), 400
+        if not body:
+            return jsonify({"status": "error", "message": "body is required"}), 400
+
+        parts = message_id_composite.split("-", 1)
+        if len(parts) != 2:
+            return jsonify({"status": "error", "message": "message_id must be like gmail-123"}), 400
+        source, db_id_str = parts[0].strip().lower(), parts[1].strip()
+        if source != "gmail":
+            return jsonify({"status": "error", "message": "Only Gmail replies are supported"}), 400
+        try:
+            db_id = int(db_id_str)
+        except ValueError:
+            return jsonify({"status": "error", "message": "message_id must be like gmail-123"}), 400
+
+        token_path, db_path = resolve_user_paths(user_key=user_key, db_path=payload.get('db_path'))
+        norm_key = normalize_user_key(user_key)
+
+        conn = open_sqlite_rw(db_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT m.source_msg_key, m.sender, m.text, m.conversation_id
+                FROM messages m
+                WHERE m.id = ? AND m.source = 'gmail' AND m.account_key = ?
+                LIMIT 1
+                """,
+                (db_id, norm_key),
+            ).fetchone()
+            if not row:
+                return jsonify({"status": "error", "message": "Message not found"}), 404
+            thread_row = conn.execute(
+                "SELECT thread_key FROM conversations WHERE id = ? LIMIT 1",
+                (row["conversation_id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if not thread_row:
+            return jsonify({"status": "error", "message": "Conversation not found"}), 404
+
+        thread_id = (thread_row["thread_key"] or "").strip()
+        to_raw = (row["sender"] or "").strip()
+        _, to_addr = parseaddr(to_raw)
+        to_addr = (to_addr or to_raw or "").strip()
+        if not to_addr:
+            return jsonify({"status": "error", "message": "Could not determine reply-to address"}), 400
+
+        if not subject:
+            text = (row["text"] or "") or ""
+            for line in text.splitlines():
+                if line.lower().startswith("subject:"):
+                    subject = line[8:].strip()
+                    break
+        subject = (subject or "Re: (no subject)").strip()
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+
+        service = gmail_auth(token_path=token_path, force_reauth=False)
+        profile = service.users().getProfile(userId="me").execute()
+        from_addr = (profile.get("emailAddress") or "").strip()
+        if not from_addr:
+            return jsonify({"status": "error", "message": "Could not determine sender address"}), 500
+
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["To"] = to_addr
+        msg["From"] = from_addr
+        msg["Subject"] = subject
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii").rstrip("=")
+
+        service.users().messages().send(
+            userId="me",
+            body={"raw": raw, "threadId": thread_id},
+        ).execute()
+        logger.info(f"Sent reply in thread {thread_id} to {to_addr}")
+        return jsonify({"status": "success", "message": "Reply sent"})
+    except Exception as e:
+        logger.error(f"Error during send_reply: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 

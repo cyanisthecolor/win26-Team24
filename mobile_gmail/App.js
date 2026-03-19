@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, ScrollView,
+  View, Text, StyleSheet, TouchableOpacity, TouchableWithoutFeedback, ScrollView,
   Switch, TextInput, Animated, StatusBar, Modal, Alert, Linking, Platform,
 } from 'react-native';
 import Constants from 'expo-constants';
@@ -331,6 +331,12 @@ function ConnectAppsScreen({ selected, onToggle }) {
 
 function AppAccountsScreen({ selectedApps, accountValues, onChangeAccount }) {
   const selectedMeta = APPS.filter(app => selectedApps.includes(app.id));
+  const wantsGoogle = selectedApps.includes('gmail') || selectedApps.includes('calendar');
+  const wantsOutlook = selectedApps.includes('outlook');
+  const wantsImessage = selectedApps.includes('imessage');
+
+  const googleValue = accountValues?.gmail || accountValues?.calendar || '';
+  const googleIcon = wantsGoogle && selectedApps.includes('calendar') && !selectedApps.includes('gmail') ? '📅' : '✉️';
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 24 }}>
@@ -344,25 +350,67 @@ function AppAccountsScreen({ selectedApps, accountValues, onChangeAccount }) {
         <Text style={{ color: C.textMuted, fontSize: 13 }}>Select apps first, then come back to connect accounts.</Text>
       )}
 
-      {selectedMeta.map((app) => (
-        <View key={app.id} style={[s.appCard, { paddingVertical: 12 }]}> 
-          <Text style={{ fontSize: 24, marginRight: 12 }}>{app.icon}</Text>
+      {wantsGoogle && (
+        <View style={[s.appCard, { paddingVertical: 12 }]}>
+          <Text style={{ fontSize: 24, marginRight: 12 }}>{googleIcon}</Text>
           <View style={{ flex: 1 }}>
-            <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 }}>{app.label} account</Text>
+            <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 }}>Google account</Text>
             <TextInput
               style={[s.textInput, { paddingVertical: 10 }]}
-              placeholder={app.id === 'gmail' || app.id === 'outlook' ? 'you@example.com' : 'Phone number or Apple ID'}
+              placeholder="you@example.com"
               placeholderTextColor={C.textMuted}
               autoCapitalize="none"
-              keyboardType={app.id === 'imessage' ? 'default' : 'email-address'}
-              value={accountValues[app.id] || ''}
-              onChangeText={(v) => onChangeAccount(app.id, v)}
+              keyboardType="email-address"
+              value={googleValue}
+              onChangeText={(v) => {
+                onChangeAccount('gmail', v);
+                onChangeAccount('calendar', v);
+              }}
             />
           </View>
         </View>
-      ))}
+      )}
 
-      <InfoBox icon="ℹ️" text="For Gmail, this value is used as your user key and sync source in the dashboard." />
+      {wantsOutlook && (
+        <View style={[s.appCard, { paddingVertical: 12 }]}>
+          <Text style={{ fontSize: 24, marginRight: 12 }}>📨</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 }}>Outlook account</Text>
+            <TextInput
+              style={[s.textInput, { paddingVertical: 10 }]}
+              placeholder="you@example.com"
+              placeholderTextColor={C.textMuted}
+              autoCapitalize="none"
+              keyboardType="email-address"
+              value={accountValues.outlook || ''}
+              onChangeText={(v) => onChangeAccount('outlook', v)}
+            />
+          </View>
+        </View>
+      )}
+
+      {wantsImessage && (
+        <View style={[s.appCard, { paddingVertical: 12 }]}>
+          <Text style={{ fontSize: 24, marginRight: 12 }}>💬</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: C.textPrimary, fontSize: 14, fontWeight: '700', marginBottom: 6 }}>iMessage</Text>
+            <TextInput
+              style={[s.textInput, { paddingVertical: 10 }]}
+              placeholder="Phone number or Apple ID"
+              placeholderTextColor={C.textMuted}
+              autoCapitalize="none"
+              keyboardType="default"
+              value={accountValues.imessage || ''}
+              onChangeText={(v) => onChangeAccount('imessage', v)}
+            />
+          </View>
+        </View>
+      )}
+
+      <InfoBox
+        icon="ℹ️"
+        text="For Google, this value is used as your user key and sync source for both Gmail and Calendar."
+      />
     </ScrollView>
   );
 }
@@ -483,9 +531,12 @@ function DoneScreen({ connectedCount, contactCount }) {
 }
 
 // ─── Dashboard: Notifications Tab ─────────────────────────────────────────────
-function NotificationsTab({ notifications, setNotifications, ingestMessages = [], ingestDates = [], isDeleted, onMoveToJunk }) {
+function NotificationsTab({ notifications, setNotifications, ingestMessages = [], ingestDates = [], isDeleted, onMoveToJunk, userKeys = {} }) {
   const [sortMode, setSortMode] = useState('time'); // 'time' | 'priority'
   const PRIORITY_ORDER = { high: 0, medium: 1, low: 2 };
+  const [replyInEdit, setReplyInEdit] = useState(null);
+  const [sendingReply, setSendingReply] = useState(false);
+  const [sendError, setSendError] = useState('');
 
   function sortItems(items) {
     if (sortMode === 'priority') {
@@ -500,6 +551,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
   const [isLoadingSuggestions, setIsLoadingSuggestions] = useState(false);
   const [suggestionsError, setSuggestionsError] = useState('');
   const [gmailReadMap, setGmailReadMap] = useState({});
+  const modalScrollRef = useRef(null);
 
   const dateMessageIds = React.useMemo(() => {
     const ids = new Set();
@@ -521,6 +573,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
       .slice(0, 8)
       .map(m => ({
         id: `ing-msg-${m.id}`,
+        messageId: m.id,
         junkKey: `${m?.source_service || 'mail'}-${m.id}`,
         readKey: `${m?.source_service || 'mail'}-${m.id}`,
         title: (m.subject || 'Gmail Message').trim(),
@@ -574,6 +627,8 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
     setSelectedMessage({ ...message, readKey });
     setReplySuggestions([]);
     setSuggestionsError('');
+    setReplyInEdit(null);
+    setSendError('');
     setIsLoadingSuggestions(true);
 
     try {
@@ -674,6 +729,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
               source: n.source,
               timestamp: n.timestamp,
               senderName: n.senderName || '',
+              messageId: n.messageId,
             }, n.readKey)}
           >
             <View style={{ flexDirection: 'row', gap: 12 }}>
@@ -710,6 +766,7 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
               source: n.source,
               timestamp: n.timestamp,
               senderName: n.senderName || '',
+              messageId: n.messageId,
             }, n.readKey)}
           >
             <View style={{ flexDirection: 'row', gap: 12 }}>
@@ -733,60 +790,136 @@ function NotificationsTab({ notifications, setNotifications, ingestMessages = []
       </>}
 
       <Modal visible={!!selectedMessage} transparent animationType="slide" onRequestClose={() => setSelectedMessage(null)}>
-        
-        <TouchableOpacity style={s.modalOverlay} activeOpacity={1} onPress={() => setSelectedMessage(null)}>
-
+        <View style={s.modalOverlay}>
+          <TouchableWithoutFeedback onPress={() => setSelectedMessage(null)}>
+            <View style={{ flex: 1 }} />
+          </TouchableWithoutFeedback>
           <View style={s.modalSheet}>
-            {selectedMessage && <>
-             <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-              <Text style={s.modalTitle}>{selectedMessage.title}</Text>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-                <TouchableOpacity
-                  onPress={() => {
-                    if (selectedMessage.readKey?.startsWith('notif-')) {
-                      markUnread(selectedMessage.readKey.replace('notif-', ''));
-                    } else if (selectedMessage.readKey) {
-                      markGmailUnread(selectedMessage.readKey);
-                    }
-                    setSelectedMessage(null);
-                  }}
-                >
-                  <Text style={{ fontSize: 11, color: C.accent, fontWeight: '700' }}>MARK UNREAD</Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={() => setSelectedMessage(null)}>
-                  <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-              <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>
-                {selectedMessage.source} · {timeAgo(selectedMessage.timestamp)}
-              </Text>
-              <View style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12, marginBottom: 14 }}>
-                <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>
-                  {selectedMessage.body || 'No content preview available.'}
+            {selectedMessage && (
+              <ScrollView ref={modalScrollRef} showsVerticalScrollIndicator={true} keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: 24 }}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                  <Text style={s.modalTitle} numberOfLines={2}>{selectedMessage.title}</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                    <TouchableOpacity
+                      onPress={() => {
+                        if (selectedMessage.readKey?.startsWith('notif-')) {
+                          markUnread(selectedMessage.readKey.replace('notif-', ''));
+                        } else if (selectedMessage.readKey) {
+                          markGmailUnread(selectedMessage.readKey);
+                        }
+                        setSelectedMessage(null);
+                      }}
+                    >
+                      <Text style={{ fontSize: 11, color: C.accent, fontWeight: '700' }}>MARK UNREAD</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => setSelectedMessage(null)}>
+                      <Text style={{ fontSize: 22, color: C.textMuted }}>×</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+                <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 10 }}>
+                  {selectedMessage.source} · {timeAgo(selectedMessage.timestamp)}
                 </Text>
-              </View>
+                <View style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 12, marginBottom: 14 }}>
+                  <Text style={{ fontSize: 13, color: C.textSecondary, lineHeight: 20 }}>
+                    {selectedMessage.body || 'No content preview available.'}
+                  </Text>
+                </View>
 
-              <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 12 }}>AI SUGGESTED REPLIES</Text>
+                <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 12 }}>AI SUGGESTED REPLIES</Text>
 
-              {replySuggestions.map((reply, idx) => (
-                <TouchableOpacity key={`${idx}-${reply}`} style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <Text style={{ color: C.textPrimary, fontSize: 13, lineHeight: 19, flex: 1 }}>{reply}</Text>
-                  <Text style={{ color: C.textMuted, fontSize: 12, marginLeft: 8 }}>›</Text>
-                </TouchableOpacity>
-              ))}
-              {isLoadingSuggestions && (
-                <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>Generating suggestions...</Text>
-              )}
-              {!isLoadingSuggestions && !!suggestionsError && (
-                <Text style={{ color: C.red, fontSize: 13, marginBottom: 8 }}>{suggestionsError}</Text>
-              )}
-              {!isLoadingSuggestions && !suggestionsError && replySuggestions.length === 0 && (
-                <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>No suggestions available.</Text>
-              )}
-            </>}
+                {replySuggestions.map((reply, idx) => (
+                  <TouchableOpacity
+                    key={`${idx}-${reply}`}
+                    activeOpacity={0.7}
+                    style={{ backgroundColor: C.surfaceAlt, borderRadius: 10, padding: 10, marginBottom: 8, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}
+                    onPress={() => {
+                      setReplyInEdit(reply);
+                      setSendError('');
+                      setTimeout(() => modalScrollRef.current?.scrollToEnd?.({ animated: true }), 100);
+                    }}
+                  >
+                    <Text style={{ color: C.textPrimary, fontSize: 13, lineHeight: 19, flex: 1 }}>{reply}</Text>
+                    <Text style={{ color: C.textMuted, fontSize: 12, marginLeft: 8 }}>›</Text>
+                  </TouchableOpacity>
+                ))}
+
+                {replyInEdit != null && (
+                  <View style={{ marginTop: 12, marginBottom: 12 }}>
+                    <Text style={{ fontSize: 12, color: C.textMuted, fontWeight: '600', marginBottom: 8 }}>EDIT & SEND REPLY</Text>
+                    <TextInput
+                      style={[s.textInput, { minHeight: 80, textAlignVertical: 'top', paddingTop: 10 }]}
+                      placeholder="Edit your reply..."
+                      placeholderTextColor={C.textMuted}
+                      multiline
+                      value={replyInEdit}
+                      onChangeText={setReplyInEdit}
+                    />
+                    {!!sendError && <Text style={{ color: C.red, fontSize: 12, marginTop: 6 }}>{sendError}</Text>}
+                    {selectedMessage?.messageId && String(selectedMessage.messageId).startsWith('gmail-') ? null : (
+                      <Text style={{ color: C.textMuted, fontSize: 11, marginTop: 6 }}>Send is only available for Gmail messages.</Text>
+                    )}
+                    <View style={{ flexDirection: 'row', marginTop: 10, gap: 10 }}>
+                      <TouchableOpacity
+                        style={{ flex: 1, backgroundColor: (selectedMessage?.messageId && String(selectedMessage.messageId).startsWith('gmail-')) ? C.accent : C.border, borderRadius: 10, paddingVertical: 12, alignItems: 'center' }}
+                        onPress={async () => {
+                          if (!(selectedMessage?.messageId && String(selectedMessage.messageId).startsWith('gmail-'))) return;
+                          const userKey = (userKeys?.gmail || '').trim().toLowerCase();
+                          if (!userKey) { setSendError('No Gmail account'); return; }
+                          setSendingReply(true);
+                          setSendError('');
+                          try {
+                            const res = await fetch(`${getBaseUrl()}/send_reply`, {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                user_key: userKey,
+                                message_id: selectedMessage.messageId,
+                                body: replyInEdit,
+                                subject: selectedMessage.title,
+                              }),
+                            });
+                            const data = await res.json().catch(() => ({}));
+                            if (!res.ok) {
+                              setSendError(data?.message || `Send failed (${res.status})`);
+                              return;
+                            }
+                            setReplyInEdit(null);
+                            setSelectedMessage(null);
+                            Alert.alert('Sent', 'Reply sent in the same conversation.');
+                          } catch (e) {
+                            setSendError(e?.message || 'Request failed');
+                          } finally {
+                            setSendingReply(false);
+                          }
+                        }}
+                        disabled={sendingReply || !(selectedMessage?.messageId && String(selectedMessage.messageId).startsWith('gmail-'))}
+                      >
+                        <Text style={{ color: '#fff', fontWeight: '700', fontSize: 14 }}>{sendingReply ? 'Sending…' : 'Send reply'}</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={{ paddingVertical: 12, paddingHorizontal: 16, justifyContent: 'center' }}
+                        onPress={() => { setReplyInEdit(null); setSendError(''); }}
+                      >
+                        <Text style={{ color: C.textMuted, fontSize: 14, fontWeight: '600' }}>Cancel</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                )}
+
+                {isLoadingSuggestions && (
+                  <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>Generating suggestions...</Text>
+                )}
+                {!isLoadingSuggestions && !!suggestionsError && (
+                  <Text style={{ color: C.red, fontSize: 13, marginBottom: 8 }}>{suggestionsError}</Text>
+                )}
+                {!isLoadingSuggestions && !suggestionsError && replySuggestions.length === 0 && (
+                  <Text style={{ color: C.textSecondary, fontSize: 13, marginBottom: 8 }}>No suggestions available.</Text>
+                )}
+              </ScrollView>
+            )}
           </View>
-        </TouchableOpacity>
+        </View>
       </Modal>
     </ScrollView>
   );
@@ -823,6 +956,10 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
       const timeStr = Number.isNaN(dt.getTime())
         ? ''
         : dt.toISOString().slice(11, 16);
+      const timeStrClean = timeStr === '00:00' ? '' : timeStr;
+      const sourceService = String(d?.source_service || 'gmail').toLowerCase();
+      const source = sourceService === 'calendar' ? 'Calendar' : (sourceService === 'outlook' ? 'Outlook' : 'Gmail');
+      const sourceIcon = sourceService === 'calendar' ? '📅' : (sourceService === 'outlook' ? '📨' : '✉️');
 
       const msg = msgById[d.message_id];
       const title = (msg?.subject && msg.subject.trim()) || (msg?.snippet && msg.snippet.trim()) || (d.raw_span && d.raw_span.trim()) || 'Event';
@@ -834,11 +971,11 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
         junkKey: `cal-${d.id}`,
         title,
         date: dateStr,
-        time: timeStr,
+        time: timeStrClean,
         duration: null,
         attendees: [],
-        source: 'Gmail',
-        sourceIcon: '✉️',
+        source,
+        sourceIcon,
         videoLink: null,
         notes: note,
       };
@@ -960,7 +1097,7 @@ function CalendarTab({ ingestDates = [], ingestMessages = [], isDeleted, onMoveT
             </TouchableOpacity>
           </View>
           {[
-            ['🕐', `${selected.time}${selected.duration ? ` · ${selected.duration}` : ''}`],
+            selected.time ? ['🕐', `${selected.time}${selected.duration ? ` · ${selected.duration}` : ''}`] : null,
             ['📅', formatDate(selected.date)],
             [selected.sourceIcon, selected.source],
             selected.attendees.length > 0 ? ['👥', selected.attendees.join(', ')] : null,
@@ -1150,7 +1287,7 @@ function ThreadsTab({ ingestMessages = [], isDeleted, onMoveToJunk }) {
 
     const bySender = new Map();
 
-    (ingestMessages || []).forEach((msg) => {
+    (ingestMessages || []).filter(m => m?.source_service !== 'calendar').forEach((msg) => {
       if (isLikelySpam(msg)) return;
 
       const rawSender = `${msg?.sender_name || msg?.sender || ''}`.trim();
@@ -1324,6 +1461,7 @@ function Dashboard({ ingestData, onBackToSetup, userKeys = { gmail: '', outlook:
             ingestDates={ingestData.dates}
             isDeleted={isDeleted}
             onMoveToJunk={onMoveToJunk}
+            userKeys={userKeys}
           />
         )}
         {tab === 'threads' && <ThreadsTab ingestMessages={ingestData.messages} isDeleted={isDeleted} onMoveToJunk={onMoveToJunk} />}
@@ -1372,6 +1510,7 @@ export default function App() {
   const normalizedUserKey = (userKey || '').trim().toLowerCase();
   const normalizedGmailUserKey = (appAccounts.gmail || '').trim().toLowerCase();
   const normalizedOutlookUserKey = (appAccounts.outlook || '').trim().toLowerCase();
+  const normalizedCalendarUserKey = (appAccounts.calendar || '').trim().toLowerCase();
 
   const fetchWithTimeout = async (url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) => {
     const controller = new AbortController();
@@ -1414,20 +1553,23 @@ export default function App() {
     try {
       const targets = [];
       if (selectedApps.includes('gmail') && normalizedGmailUserKey) {
-        targets.push({ label: 'Gmail', baseUrl: getBaseUrl(), userKey: normalizedGmailUserKey });
+        targets.push({ label: 'Gmail', service: 'gmail', baseUrl: getBaseUrl(), userKey: normalizedGmailUserKey });
       }
       if (selectedApps.includes('outlook') && normalizedOutlookUserKey) {
-        targets.push({ label: 'Outlook', baseUrl: getOutlookBaseUrl(), userKey: normalizedOutlookUserKey });
+        targets.push({ label: 'Outlook', service: 'outlook', baseUrl: getOutlookBaseUrl(), userKey: normalizedOutlookUserKey });
       }
+      // Ingest calendar whenever we have a Google account (same as Gmail)
+      const calKey = normalizedCalendarUserKey || normalizedGmailUserKey;
+      if (calKey) targets.push({ label: 'Calendar', service: 'calendar', baseUrl: getBaseUrl(), userKey: calKey });
 
       if (targets.length === 0) {
-        if (showAlert) Alert.alert('Connect account', 'Enter Gmail and/or Outlook account in setup first.');
+        if (showAlert) Alert.alert('Connect account', 'Enter your Google account and/or Outlook account in setup first.');
         return;
       }
 
       const lines = [];
       for (const target of targets) {
-        const body = { user_key: target.userKey };
+        const body = { user_key: target.userKey, service: target.service || 'gmail' };
         if (target.label === 'Outlook' && OUTLOOK_CLIENT_ID_OVERRIDE) {
           body.client_id = OUTLOOK_CLIENT_ID_OVERRIDE;
         }
@@ -1462,7 +1604,11 @@ export default function App() {
 
       if (showAlert) Alert.alert('Success', lines.join('\n'));
     } catch (error) {
-      if (showAlert) Alert.alert('Error', error.message || 'Failed to trigger ingestion');
+      const msg = error.message || 'Failed to trigger ingestion';
+      if (showAlert) {
+        const isReauth = /re-authorization|invalid_scope|invalid_grant/i.test(msg);
+        Alert.alert(isReauth ? 'Re-sign in required' : 'Error', isReauth ? 'Your Google sign-in is missing permissions (e.g. Calendar). In the folder where the backend runs, delete the token file (token.json or token_<your-email>.json), then open the app again and sign in when prompted.' : msg);
+      }
       console.error(error);
     }
   };
@@ -1472,6 +1618,7 @@ export default function App() {
       const keys = {
         gmail: (overrideKeys?.gmail ?? normalizedGmailUserKey ?? '').trim().toLowerCase(),
         outlook: (overrideKeys?.outlook ?? normalizedOutlookUserKey ?? '').trim().toLowerCase(),
+        calendar: (overrideKeys?.calendar ?? (normalizedCalendarUserKey || normalizedGmailUserKey) ?? '').trim().toLowerCase(),
       };
 
       const targets = [];
@@ -1481,13 +1628,18 @@ export default function App() {
       if (selectedApps.includes('outlook') && keys.outlook) {
         targets.push({ service: 'outlook', baseUrl: getOutlookBaseUrl(), userKey: keys.outlook });
       }
+      // Always fetch calendar when we have a Google account (same credentials as Gmail)
+      if (keys.gmail) {
+        targets.push({ service: 'calendar', baseUrl: getBaseUrl(), userKey: keys.gmail });
+      }
       if (targets.length === 0) return;
 
       const parts = [];
       const errors = [];
       for (const target of targets) {
         try {
-          const response = await fetchWithTimeout(`${target.baseUrl}/summary?user_key=${encodeURIComponent(target.userKey)}`);
+          const limit = target.service === 'calendar' ? 80 : 20;
+          const response = await fetchWithTimeout(`${target.baseUrl}/summary?user_key=${encodeURIComponent(target.userKey)}&service=${encodeURIComponent(target.service || 'gmail')}&limit=${limit}`);
           const raw = await response.text();
           let data = null;
           try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
@@ -1516,11 +1668,13 @@ export default function App() {
   const finishSetupAndConnect = async () => {
     const gmailSelected = selectedApps.includes('gmail');
     const outlookSelected = selectedApps.includes('outlook');
+    const calendarSelected = selectedApps.includes('calendar');
     const gmailAccount = (appAccounts.gmail || '').trim().toLowerCase();
     const outlookAccount = (appAccounts.outlook || '').trim().toLowerCase();
+    const calendarAccount = (appAccounts.calendar || appAccounts.gmail || '').trim().toLowerCase();
 
-    if (gmailSelected && !gmailAccount) {
-      Alert.alert('Gmail account required', 'Please add your Gmail account in the Sign in step.');
+    if ((gmailSelected || calendarSelected) && !(gmailAccount || calendarAccount)) {
+      Alert.alert('Google account required', 'Please enter your Google account in the Sign in step.');
       return;
     }
 
@@ -1529,22 +1683,25 @@ export default function App() {
       return;
     }
 
-    if (!gmailSelected && !outlookSelected) {
+    // Outlook stays independent.
+
+    if (!gmailSelected && !outlookSelected && !calendarSelected) {
       setDone(true);
       return;
     }
 
     setIsConnectingAccounts(true);
     try {
-      setUserKey(gmailAccount || outlookAccount || '');
+      setUserKey(gmailAccount || outlookAccount || calendarAccount || '');
 
       const connectTargets = [];
       if (gmailSelected) connectTargets.push({ label: 'Gmail', baseUrl: getBaseUrl(), userKey: gmailAccount });
       if (outlookSelected) connectTargets.push({ label: 'Outlook', baseUrl: getOutlookBaseUrl(), userKey: outlookAccount });
+      if (calendarSelected) connectTargets.push({ label: 'Calendar', service: 'calendar', baseUrl: getBaseUrl(), userKey: calendarAccount });
 
       const connectErrors = [];
       for (const target of connectTargets) {
-        const body = { user_key: target.userKey, force_reauth: false, reset_cursor: true };
+        const body = { user_key: target.userKey, service: target.service || 'gmail', force_reauth: false, reset_cursor: true };
         if (target.label === 'Outlook' && OUTLOOK_CLIENT_ID_OVERRIDE) {
           body.client_id = OUTLOOK_CLIENT_ID_OVERRIDE;
         }
@@ -1569,7 +1726,7 @@ export default function App() {
         }
       }
 
-      await loadSummary({ gmail: gmailAccount, outlook: outlookAccount });
+      await loadSummary({ gmail: gmailAccount, outlook: outlookAccount, calendar: calendarAccount });
       setDone(true);
 
       if (connectErrors.length > 0) {
@@ -1592,7 +1749,7 @@ export default function App() {
       loadSummary();
     }, 20000);
     return () => clearInterval(id);
-  }, [done, selectedApps, normalizedGmailUserKey, normalizedOutlookUserKey]);
+  }, [done, selectedApps, normalizedGmailUserKey, normalizedOutlookUserKey, normalizedCalendarUserKey]);
 
   useEffect(() => {
     if (done) {
